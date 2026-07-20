@@ -43,7 +43,9 @@ case "$ACTION" in
     mkdir -p "$(dirname "$MAP_PREFIX")"
     echo "Saving map to ${MAP_PREFIX}.yaml / ${MAP_PREFIX}.pgm"
 
-    if ! ros2 topic list | grep -qx "$MAP_TOPIC"; then
+    # Capture output before grepping; piping directly into `grep -q` can close
+    # the pipe before `ros2 topic list` finishes writing, causing a BrokenPipeError.
+    if ! grep -qx "$MAP_TOPIC" <<< "$(ros2 topic list)"; then
       echo "Map topic not found: $MAP_TOPIC"
       echo "Run mapping first: ./scripts/tb3_collect_map.sh start"
       exit 1

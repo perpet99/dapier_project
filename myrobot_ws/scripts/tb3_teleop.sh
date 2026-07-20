@@ -20,7 +20,11 @@ export TURTLEBOT3_MODEL="${TURTLEBOT3_MODEL:-waffle}"
 
 echo "Running teleop with TURTLEBOT3_MODEL=${TURTLEBOT3_MODEL}"
 
-if ! ros2 topic list | grep -qx "/cmd_vel"; then
+# Capture output before grepping; piping directly into `grep -q` can close
+# the pipe before `ros2 topic list` finishes writing, causing a BrokenPipeError.
+TOPIC_LIST="$(ros2 topic list)"
+
+if ! grep -qx "/cmd_vel" <<< "$TOPIC_LIST"; then
   echo "[WARN] /cmd_vel topic is not visible yet."
   echo "       Start simulation first: ./scripts/tb3_collect_map.sh start"
 else
@@ -31,7 +35,7 @@ else
   fi
 fi
 
-if ros2 topic list | grep -qx "/clock"; then
+if grep -qx "/clock" <<< "$TOPIC_LIST"; then
   if ! timeout 3s ros2 topic echo /clock --once >/dev/null 2>&1; then
     echo "[WARN] /clock topic exists but no messages received."
     echo "       Gazebo might be paused. Press Play in Gazebo."
@@ -39,4 +43,11 @@ if ros2 topic list | grep -qx "/clock"; then
 fi
 
 echo "Tip: click this terminal before pressing keys."
-ros2 run turtlebot3_teleop teleop_keyboard
+
+# turtlebot3_teleop's teleop_keyboard publishes TwistStamped on /cmd_vel unless
+# ROS_DISTRO is exactly "humble" (it then publishes plain Twist). This Nav2/Gazebo
+# simulation's bridge subscribes to /cmd_vel as plain Twist, so a TwistStamped
+# publisher never connects to it and key presses silently do nothing. Overriding
+# ROS_DISTRO here only affects this one process's message-type branch; the ROS
+# environment was already sourced above from the real ROS_DISTRO.
+ROS_DISTRO=humble ros2 run turtlebot3_teleop teleop_keyboard

@@ -129,12 +129,22 @@ goals:
     yaw: 1.57
 ```
 
-## 5) WSL GUI 참고
+## 5) 실행 중인 프로세스 종료
+
+시뮬레이션/Nav2/teleop 등을 백그라운드로 여러 터미널에서 띄운 뒤 한 번에 정리하려면 아래 스크립트를 사용합니다.
+
+```bash
+./scripts/tb3_kill.sh
+```
+
+`gzserver`, `gzclient`, `rviz2`, `nav2_*`, `slam_toolbox`, `turtlebot3_teleop`, `nav_goal_runner.py` 등 관련 프로세스를 찾아 먼저 SIGINT로 정상 종료를 시도하고, 2초 후에도 남아있으면 SIGKILL로 강제 종료합니다.
+
+## 6) WSL GUI 참고
 
 - Windows 11 + WSLg면 Gazebo/RViz GUI가 기본적으로 표시됩니다.
 - GUI가 안 뜨면 X 서버/WSLg 설정 상태를 먼저 확인하세요.
 
-## 6) 트러블슈팅
+## 7) 트러블슈팅
 
 `Failed to spin map subscription` 오류가 나오면 아래 순서로 점검하세요.
 
@@ -198,6 +208,14 @@ ros2 topic info /cmd_vel
 
 ```bash
 ./scripts/tb3_collect_map.sh start
+```
+
+4. Subscriber count가 0이 아닌데도 안 움직이면 메시지 타입 불일치를 의심하세요.
+
+`turtlebot3_teleop`의 `teleop_keyboard`는 `ROS_DISTRO`가 정확히 `humble`이 아니면 `/cmd_vel`에 `TwistStamped`를 발행합니다. 이 Nav2/Gazebo 시뮬레이션의 브리지는 `/cmd_vel`을 순수 `Twist` 타입으로 구독하므로, 타입이 다르면 연결 자체가 안 되어 키를 눌러도 로봇이 조용히 움직이지 않습니다. `tb3_teleop.sh`는 이를 우회하기 위해 teleop 실행 시에만 `ROS_DISTRO=humble`로 오버라이드해서 `Twist` 타입으로 발행하도록 되어 있습니다. 직접 `ros2 run turtlebot3_teleop teleop_keyboard`로 실행했다면 아래처럼 실행하세요.
+
+```bash
+ROS_DISTRO=humble ros2 run turtlebot3_teleop teleop_keyboard
 ```
 
 간단 점검 + teleop 실행은 helper 스크립트를 권장합니다.
