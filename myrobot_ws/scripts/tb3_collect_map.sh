@@ -8,6 +8,7 @@ set -euo pipefail
 # Optional env vars:
 #   MAP_TOPIC=/map
 #   USE_SIM_TIME=True
+#   SAVE_MAP_TIMEOUT=10.0
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 {start|save} [map_output_prefix]"
@@ -57,10 +58,15 @@ case "$ACTION" in
       exit 1
     fi
 
+    # map_saver_cli's default save_map_timeout (2s) is often shorter than
+    # SLAM Toolbox's map publish interval, causing "Failed to spin map
+    # subscription" even though the topic is alive. Give it more headroom.
     ros2 run nav2_map_server map_saver_cli \
       -f "$MAP_PREFIX" \
       --ros-args \
       -p use_sim_time:="$USE_SIM_TIME" \
+      -p save_map_timeout:="${SAVE_MAP_TIMEOUT:-10.0}" \
+      -p map_subscribe_transient_local:=true \
       -r map:="$MAP_TOPIC"
     ;;
   *)

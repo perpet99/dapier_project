@@ -15,6 +15,7 @@ PATTERNS=(
   "turtlebot3_teleop"
   "teleop_keyboard"
   "nav_goal_runner.py"
+  "go_to_pose_service"
   "slam_toolbox"
   "nav2_"
 )

@@ -110,6 +110,48 @@ source /opt/ros/$ROS_DISTRO/setup.bash
 ./scripts/tb3_navigate_map.sh run-goals config/nav_goals.yaml
 ```
 
+## 3-1) 목표 위치 이동 서비스 (go_to_pose)
+
+`x, y, yaw`를 파라미터로 받아 Nav2로 해당 위치까지 이동시키는 ROS 2 서비스 노드입니다.
+`myrobot_interfaces` (커스텀 `GoToPose.srv`)와 `myrobot_nav_service` (서비스 노드) 두 패키지로 구성되어 있으며,
+다른 스크립트들과 달리 최초 1회 colcon build가 필요합니다.
+
+### 빌드 (최초 1회, 또는 코드 변경 후)
+
+```bash
+cd ~/.../myrobot_ws
+export ROS_DISTRO=jazzy
+./scripts/build_ws.sh
+```
+
+### 서비스 노드 실행
+
+Nav2가 이미 실행 중이어야 합니다 (`./scripts/tb3_navigate_map.sh start maps/tb3_map.yaml`).
+
+터미널 D:
+
+```bash
+cd ~/.../myrobot_ws
+export ROS_DISTRO=jazzy
+./scripts/tb3_goto_pose_service.sh
+```
+
+### 목표 위치로 이동 요청
+
+터미널 E:
+
+```bash
+cd ~/.../myrobot_ws
+export ROS_DISTRO=jazzy
+./scripts/tb3_goto_pose.sh 1.0 0.5 1.57
+```
+
+`ros2 service call`로 직접 호출할 수도 있습니다.
+
+```bash
+ros2 service call /go_to_pose myrobot_interfaces/srv/GoToPose "{x: 1.0, y: 0.5, yaw: 1.57}"
+```
+
 ## 4) 목표점 파일 형식
 
 `config/nav_goals.yaml` 예시:
