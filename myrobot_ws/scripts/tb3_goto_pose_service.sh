@@ -6,6 +6,8 @@ set -euo pipefail
 # ./scripts/tb3_navigate_map.sh start maps/tb3_map.yaml).
 # Usage:
 #   ./scripts/tb3_goto_pose_service.sh
+#   ./scripts/tb3_goto_pose_service.sh --ros-args -p initial_pose_x:=1.0 -p initial_pose_y:=0.5 -p initial_pose_yaw:=1.57
+#   ./scripts/tb3_goto_pose_service.sh --ros-args -p set_initial_pose:=false
 
 if [[ -z "${ROS_DISTRO:-}" ]]; then
   echo "ROS_DISTRO is not set. Example: export ROS_DISTRO=jazzy"
@@ -25,4 +27,4 @@ source "/opt/ros/${ROS_DISTRO}/setup.bash"
 source "${WS_DIR}/install/setup.bash"
 set -u
 
-ros2 run myrobot_nav_service go_to_pose_service
+ros2 run myrobot_nav_service go_to_pose_service "$@"

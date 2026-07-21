@@ -128,12 +128,26 @@ export ROS_DISTRO=jazzy
 
 Nav2가 이미 실행 중이어야 합니다 (`./scripts/tb3_navigate_map.sh start maps/tb3_map.yaml`).
 
+`go_to_pose_service`는 시작할 때 AMCL 초기 위치(`/initialpose`)를 자동으로 퍼블리시합니다
+(기본값 `x=0.0, y=0.0, yaw=0.0`, 0.5초 간격 3회 재전송). 초기 위치를 설정하지 않으면
+`map → base_link` TF를 구할 수 없어 `go_to_pose` 호출 시
+`success=False message=Goal rejected by navigate_to_pose`가 반환되므로, 로봇의 실제 시작 위치가
+기본값과 다르면 파라미터로 지정하세요.
+
 터미널 D:
 
 ```bash
 cd ~/.../myrobot_ws
 export ROS_DISTRO=jazzy
 ./scripts/tb3_goto_pose_service.sh
+# 로봇 시작 위치가 원점이 아니면:
+# ./scripts/tb3_goto_pose_service.sh --ros-args -p initial_pose_x:=1.0 -p initial_pose_y:=0.5 -p initial_pose_yaw:=1.57
+```
+
+이미 RViz "2D Pose Estimate"로 초기 위치를 맞췄다면 자동 퍼블리시를 꺼도 됩니다.
+
+```bash
+./scripts/tb3_goto_pose_service.sh --ros-args -p set_initial_pose:=false
 ```
 
 ### 목표 위치로 이동 요청
@@ -265,4 +279,13 @@ ROS_DISTRO=humble ros2 run turtlebot3_teleop teleop_keyboard
 ```bash
 export ROS_DISTRO=jazzy
 ./scripts/tb3_teleop.sh
+```
+
+`./scripts/tb3_goto_pose.sh` 실행 시 `success=False message=Goal rejected by navigate_to_pose`가 나오면,
+AMCL 초기 위치가 로봇의 실제 시작 위치와 맞지 않아 `map → base_link` TF를 구하지 못해 Nav2가 목표를 즉시 거부한 것입니다.
+`go_to_pose_service`는 시작 시 `initial_pose_x/y/yaw` 파라미터(기본 0,0,0)로 `/initialpose`를 자동 퍼블리시하므로,
+로봇 시작 위치가 원점이 아니라면 서비스 노드 실행 시 파라미터로 맞는 값을 넘기거나 RViz "2D Pose Estimate"로 다시 지정한 뒤 재시도하세요.
+
+```bash
+./scripts/tb3_goto_pose_service.sh --ros-args -p initial_pose_x:=1.0 -p initial_pose_y:=0.5 -p initial_pose_yaw:=1.57
 ```
