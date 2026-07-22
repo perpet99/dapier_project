@@ -15,7 +15,7 @@ long targetCount = 0;
 bool isMoving = false;
 
 const int MAX_SPEED = 200;      // 최대 PWM (0~255)
-const int MIN_SPEED = 70;       // 최소 기동 PWM (스틱션 보정)
+const int MIN_SPEED = 150;       // 최소 기동 PWM (스틱션 보정)
 const int SLOWDOWN_RANGE = 50;  // 목표까지 이 카운트 이내로 들어오면 감속 시작
 
 unsigned long lastLogTime = 0;

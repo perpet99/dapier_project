@@ -289,3 +289,11 @@ AMCL 초기 위치가 로봇의 실제 시작 위치와 맞지 않아 `map → b
 ```bash
 ./scripts/tb3_goto_pose_service.sh --ros-args -p initial_pose_x:=1.0 -p initial_pose_y:=0.5 -p initial_pose_yaw:=1.57
 ```
+
+#다음할일
+
+
+장소명과 위치 라벨링하기
+로봇팔 붙이기 ,
+opencv 사용해서 로봇팔로 pick and place
+llm 붙이기
