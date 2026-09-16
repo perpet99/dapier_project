@@ -292,6 +292,7 @@ AMCL 초기 위치가 로봇의 실제 시작 위치와 맞지 않아 `map → b
 
 #다음할일
 
+D:\perpet\git\perpet\dapier_project\ros2_ws_src\rosbot_xl_manipulation_ros\rosbot_xl_manipulation_description\urdf
 
 장소명과 위치 라벨링하기
 로봇팔 붙이기 ,
