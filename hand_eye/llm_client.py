@@ -29,7 +29,8 @@ pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고,
 다시 할지 묻는다(--auto 를 주면 그것도 묻지 않고 그냥 넘어간다).
 
 사용:
-  $env:GEMINI_API_KEY='...'
+  hand_eye/.env 에 GEMINI_API_KEY=... 한 줄 (hand_eye/.env.example 참고)
+  또는 $env:GEMINI_API_KEY='...'
   python hand_eye/llm_client.py                      # 웹 UI 로 지시
   python hand_eye/llm_client.py "주황색 통을 상자에 넣어"   # 첫 지시만 미리 주기
   python hand_eye/llm_client.py --cli                # 터미널로 지시
@@ -708,6 +709,24 @@ def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
     ui.log("[bye]")
 
 
+
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def load_api_key() -> str:
+    """환경변수 GEMINI_API_KEY 가 우선, 없으면 이 파일 옆의 .env 에서 읽는다.
+    .env 는 git 에 올라가지 않는다 (.gitignore)."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if key or not os.path.exists(ENV_FILE):
+        return key
+    with open(ENV_FILE, encoding="utf-8") as f:
+        for line in f:
+            name, sep, value = line.strip().partition("=")
+            if sep and name.strip() == "GEMINI_API_KEY":
+                return value.strip().strip("'\"")
+    return ""
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Gemini + test4.py REST 로봇 조종")
     ap.add_argument("order", nargs="*", help="첫 지시 (없으면 웹/터미널에서 받는다)")
@@ -723,10 +742,10 @@ def main() -> None:
                     help="브라우저를 자동으로 열지 않는다")
     args = ap.parse_args()
 
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-
+    key = load_api_key()
     if not key:
-        print("GEMINI_API_KEY 가 없다. $env:GEMINI_API_KEY='...' 로 설정할 것 "
+        print(f"GEMINI_API_KEY 가 없다. {ENV_FILE} 에 GEMINI_API_KEY=... 를 적거나 "
+              "$env:GEMINI_API_KEY='...' 로 설정할 것 "
               "(이 저장소의 test3.py 가 쓰는 키와 같은 것을 쓰면 된다)")
         return
 
