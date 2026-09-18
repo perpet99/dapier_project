@@ -2,14 +2,11 @@
 test4.py - Depth 기반 클릭 Pick & Place (SO-101)
 
 동작:
-  1) Depth 카메라(또는 파일/합성) 스트림을 브라우저로 출력한다 (http://<이 PC IP>:8765/).
-  2) 화면을 클릭하면 -> 그 지점을 SO-101이 집어서 들어올린다.
+  1) Depth 카메라(또는 파일/합성) 스트림을 UI로 출력한다.
+  2) 마우스로 물체를 클릭하면 -> 그 지점을 SO-101이 집어서 들어올린다.
   3) 다음 위치를 클릭하면 -> 집고 있던 물건을 그 자리에 내려놓는다.
 
-  화면은 cv2 GUI(Qt) 없이 MJPEG 스트림으로 브라우저에 뜬다. 헤드리스 환경에서도
-  동작하고, 조작도 그 브라우저 탭에서 한다 - 별도 창이 뜨지 않는다.
-
-키 (브라우저 탭에 포커스가 있어야 함):
+키:
   q  종료          h  홈 자세        o/c  그리퍼 열기/닫기
   r  상태 리셋     d  보기 전환(센서/depth/일반카메라)   s  현재 프레임 저장
   w  집기 가능 영역 표시 ON/OFF (붉은색 = 도달 불가)
@@ -24,36 +21,30 @@ test4.py - Depth 기반 클릭 Pick & Place (SO-101)
           화면으로 쓴다. 정렬이 안 되면 IR 로 되돌아간다 - IR 은 depth 와 같은
           센서라 픽셀이 1:1 대응한다.
   로봇    SO-101, Feetech STS3215 x6, COM18 @ 1Mbps, 12.2V
-          arm_calib.json 의 관절 리밋으로 목표값을 하드 클램프한다.
+          lerobot 캘리브레이션의 관절 리밋으로 목표값을 하드 클램프한다.
 
 실행 전제:
-    1/2  arm_calib.json  - 서보 영점 + 관절 리밋 + 기준자세(부호/영점).
-                           calibrate_arm.py 로 만든다. 없으면 mock 으로 내려간다.
-    2/2  handeye.json    - 카메라->로봇 변환. 실행 시 다시 잡을지 묻고, 없으면 탁상 위
-                           집을 수 있는 위치를 4곳 이상 등록하는 모드로 바로 들어간다.
+  실행하면 캘리브레이션 상태부터 확인한다. 없으면 지금 잡을지, 있으면 다시 잡을지
+  물어본다. 따로 스크립트를 먼저 돌릴 필요가 없다.
+    1/2  arm_calib.json  - 관절 min/max 리밋 + 기준자세(부호/영점). 없으면 mock 으로 내려간다.
+    2/2  handeye.json    - 카메라->로봇 변환. 없으면 탁상 위 집을 수 있는 위치를
+                           4곳 이상 등록하는 모드로 바로 들어간다.
   $env:SO101_PORT='COM18' 을 설정하면 포트 자동검출을 건너뛴다.
-  팔 TCP 만 확인하려면: python calibrate_arm.py --tcp
+  팔 TCP 만 확인하려면: python test4.py --tcp
 
-웹 UI / 원격 제어 (같은 HTTP 서버, 기본 0.0.0.0:8765 - 같은 네트워크에서 접속 가능):
-  GET /            브라우저용 조작 페이지 (스트림 + 클릭 + 키보드)
-  GET /stream      MJPEG 영상 스트림
-  GET|POST /click  x,y       화면 클릭과 동일 (pick/place/캘리브 점/버튼 히트테스트)
-  GET|POST /hover  x,y       마우스 이동(호버 좌표 표시)
-  GET|POST /key    code      키보드 단축키 1개 전달 (q,h,o,c,r,d,w,k,t,s)
-  GET|POST /pick   x,y       GET|POST /place  x,y      GET /status
-  인증이 없으므로 내부망에서만 쓸 것. 이 PC 에서만 열려면 PICK_API_HOST=127.0.0.1,
-  끄려면 PICK_API_PORT=0.
+원격 제어 (REST):
+  화면 픽셀 좌표로 마우스 클릭과 똑같이 집고 놓는다. 기본은 127.0.0.1:8765.
+    GET|POST /pick   x,y      GET|POST /place  x,y      GET /status
+  다른 PC 에서 부르려면 $env:PICK_API_HOST='0.0.0.0', 끄려면 PICK_API_PORT='0'.
 """
 
 from __future__ import annotations
 
 import atexit
-import ctypes
 import json
 import math
 import os
 import queue
-import socket
 import subprocess
 import sys
 import threading
@@ -65,6 +56,11 @@ from typing import Callable, Optional, Sequence
 
 import cv2
 import numpy as np
+
+try:
+    import msvcrt          # Windows 콘솔에서 논블로킹 키 입력 (없으면 시간제한으로 대체)
+except ImportError:
+    msvcrt = None
 
 # Windows 콘솔 기본 코드페이지(cp949/cp1252)에서 한글 print 가 깨지지 않게 한다.
 for _stream in (sys.stdout, sys.stderr):
@@ -108,6 +104,15 @@ L3_WRIST = 0.15942       # wrist_flex -> 그리퍼 파지점(TCP), 평면 성분
 A1_ZERO = math.radians(90.0)    # 위팔 (shoulder_lift -> elbow_flex)
 A2_ZERO = math.radians(0.0)     # 아래팔 (elbow_flex -> wrist_flex)
 A3_ZERO = math.radians(0.0)     # 손목+그리퍼 (wrist_flex -> TCP)
+
+# 서보 가동범위의 한가운데는 위 자세가 아니다. 공식 URDF(so101_new_calib)의
+# 영자세 = 범위 중앙이고, 그 자세의 링크각은 76.03 / 2.21 / -2.84 도다.
+# 범위 중앙으로 영점을 잡을 때는 우리 0도와의 차이를 빼줘야 한다.
+MIDRANGE_Q = {"shoulder_pan": 0.0,
+              "shoulder_lift": math.radians(-13.9677),
+              "elbow_flex": math.radians(16.1752),
+              "wrist_flex": math.radians(-5.0480),
+              "wrist_roll": 0.0}
 
 REACH = L1_UPPER + L2_FORE   # 어깨에서 손목중심까지의 최대 거리 = 0.2509 m
 IK_MARGIN = 0.008            # 완전신전(특이점) 근처를 피하기 위한 여유
@@ -301,70 +306,25 @@ class OpenNI2Source(DepthSource):
       나오므로 픽셀이 1:1로 대응한다. 즉 화면에서 클릭한 픽셀의 depth 가
       바로 그 지점의 깊이다 - 별도 정렬이 필요 없다.
 
-    OpenNI2 런타임이 필요하다. 환경변수로 위치를 알려준다:
-      Windows  $env:OPENNI2_REDIST='C:\\path\\to\\OpenNI2\\Redist'
-      Linux    export OPENNI2_REDIST=/opt/openni2-orbbec
-
-    Linux 에서 중요한 점:
-      배포판 패키지(libopenni2-0)의 PS1080 드라이버는 PrimeSense(VID 0x1D27) 만
-      알고 Orbbec(0x2BC5) 은 모른다 - 장치가 0개로 나온다. Orbbec 이 배포하는
-      liborbbec.so 가 든 런타임이어야 한다. orbbec/ros_astra_camera 저장소의
-      include/openni2_redist/<arch>/ 가 그것이다.
+    OpenNI2 런타임 DLL 이 필요하다. 환경변수로 위치를 알려준다:
+      $env:OPENNI2_REDIST='C:\\path\\to\\OpenNI2\\Redist'
     """
 
-    # OpenNI2 런타임(libOpenNI2.so + OpenNI2/Drivers/liborbbec.so)을 찾을 위치
+    # OpenNI2 런타임(OpenNI2.dll + OpenNI2/Drivers/orbbec.dll)을 찾을 위치
     REDIST_CANDIDATES = ("D:/OpenNI2/Redist", "C:/OpenNI2/Redist",
-                         "C:/Program Files/OpenNI2/Redist",
-                         "/opt/openni2-orbbec", "/usr/local/lib/openni2-orbbec")
-
-    # 런타임 라이브러리 파일명은 OS 마다 다르다. 둘 다 받아준다.
-    RUNTIME_NAMES = ("OpenNI2.dll", "libOpenNI2.so", "libOpenNI2.dylib")
+                         "C:/Program Files/OpenNI2/Redist")
 
     @classmethod
     def find_redist(cls) -> Optional[str]:
         env = os.environ.get("OPENNI2_REDIST")
         for p in ((env,) if env else ()) + cls.REDIST_CANDIDATES:
-            if p and any(os.path.exists(os.path.join(p, n)) for n in cls.RUNTIME_NAMES):
+            if p and os.path.exists(os.path.join(p, "OpenNI2.dll")):
                 return p
         return None
-
-    @staticmethod
-    def _patch_device_info_struct(openni2, c_api) -> None:
-        """Orbbec 런타임의 OniDeviceInfo 는 primesense 가 아는 것보다 256바이트 크다.
-
-        primesense(2015년, OpenNI 2.2 기준)는 이 구조체를 772바이트로 잡는데,
-        Orbbec OpenNI 2.3.0.88 이 실제로 쓰는 크기는 1028바이트다(끝에 char[256]
-        이 하나 더 있다). 그대로 두면 oniDeviceGetInfo 가 호출될 때마다 힙을
-        256바이트씩 넘어 쓰고, 한참 뒤 엉뚱한 malloc 에서
-        'malloc(): invalid size' 로 프로세스가 죽는다. 실제로 Device.open_any()
-        직후 create_depth_stream() 에서 터졌다.
-
-        _fields_ 는 한 번 정해지면 못 바꾸므로, 크기가 맞는 구조체로 갈아끼우고
-        이 구조체를 쓰는 함수들의 argtypes 도 같이 바꾼다.
-        """
-        if ctypes.sizeof(c_api.OniDeviceInfo) >= 1028:
-            return                                   # 이미 맞는 바인딩이면 둔다
-
-        class OniDeviceInfoFixed(ctypes.Structure):
-            _fields_ = [('uri', ctypes.c_char * 256),
-                        ('vendor', ctypes.c_char * 256),
-                        ('name', ctypes.c_char * 256),
-                        ('usbVendorId', ctypes.c_ushort),
-                        ('usbProductId', ctypes.c_ushort),
-                        ('_orbbec_extra', ctypes.c_char * 256)]
-
-        p_info = ctypes.POINTER(OniDeviceInfoFixed)
-        c_api.OniDeviceInfo = OniDeviceInfoFixed
-        openni2.DeviceInfo = OniDeviceInfoFixed
-        c_api._oniGetDeviceList.argtypes = [ctypes.POINTER(p_info),
-                                            ctypes.POINTER(ctypes.c_int)]
-        c_api._oniReleaseDeviceList.argtypes = [p_info]
-        c_api._oniDeviceGetInfo.argtypes = [c_api.OniDeviceHandle, p_info]
 
     def __init__(self, width: int = 640, height: int = 480, fps: int = 30,
                  depth_align: bool = DEPTH_ALIGN):
         from primesense import openni2
-        from primesense import _openni2 as c_api
 
         redist = self.find_redist()
         if redist is None:
@@ -372,7 +332,6 @@ class OpenNI2Source(DepthSource):
                 "OpenNI2 런타임을 찾을 수 없다. OPENNI2_REDIST 로 경로를 지정하거나 "
                 f"다음 중 하나에 설치할 것: {', '.join(self.REDIST_CANDIDATES)}")
         openni2.initialize(redist)
-        self._patch_device_info_struct(openni2, c_api)   # 반드시 initialize 뒤에
         self._openni2 = openni2
 
         self.dev = openni2.Device.open_any()
@@ -1448,10 +1407,6 @@ def plan_pose(x: float, y: float, z: float,
 
 JOINT_ORDER = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 
-# 로그용 관절 약칭
-SHORT_NAME = {"shoulder_pan": "pan", "shoulder_lift": "lift", "elbow_flex": "elbow",
-              "wrist_flex": "wflex", "wrist_roll": "wroll"}
-
 # 관절을 한 개씩 움직일 때의 순서.
 # 나갈 때는 베이스부터(pan -> lift -> elbow -> wrist) 펴고, 돌아올 때는 반대로 접는다.
 # 손끝이 직선으로 가지는 않지만, 어느 관절이 언제 움직이는지가 눈에 보인다.
@@ -1593,7 +1548,7 @@ ARM_CALIB_PATH = os.path.join(_HERE, "arm_calib.json")
 
 STS_ADDR = {"torque_enable": 40, "acceleration": 41, "goal_position": 42,
             "goal_speed": 46, "present_position": 56, "present_load": 60, "present_voltage": 62,
-            "present_temp": 63, "homing_offset": 31, "lock": 55}
+            "present_temp": 63, "homing_offset": 31}
 
 SERVO_IDS = {"shoulder_pan": 1, "shoulder_lift": 2, "elbow_flex": 3,
              "wrist_flex": 4, "wrist_roll": 5, "gripper": 6}
@@ -1677,7 +1632,7 @@ class ArmCalibration:
 
     lerobot 의 homing offset 은 이미 서보 레지스터에 기록되어 있어서 서보가
     보고하는 위치는 '캘리브레이션 좌표계'다. 하지만 그 좌표계의 0도가 우리 IK
-    convention(모든 관절 0 = 위팔 수직 / 아래팔 수평)의 0도와 같다는 보장은
+    convention(모든 관절 0 = 팔이 수평으로 쭉 뻗은 자세)의 0도와 같다는 보장은
     없다. 그 차이를 실측으로 구한 값이 이 파일이다.
     """
 
@@ -1861,12 +1816,7 @@ class FeetechSO101Arm(RobotArm):
             if self.load_limit:
                 who, mag = self.worst_load()
                 if mag > self.load_limit:
-                    # read_counts() 는 관절 '이름' 으로, sync_write_positions 는 서보
-                    # 'ID' 로 키를 받는다. 그대로 넘기면 패킷에 문자열이 섞여 체크섬
-                    # 계산에서 TypeError 가 나고, 정작 멈춰야 할 때 정지 명령이
-                    # 나가지 않은 채 아래 RuntimeError 도 못 띄운다.
-                    self.bus.sync_write_positions(
-                        {SERVO_IDS[n]: c for n, c in self.read_counts().items()})
+                    self.bus.sync_write_positions(self.read_counts())  # 그 자리에 정지
                     raise RuntimeError(
                         f"{who} 부하 {mag} > {self.load_limit} - 충돌 의심, 정지했다")
 
@@ -1975,7 +1925,491 @@ def find_so101_port() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 시작: 팔 캘리브레이션을 읽고, 카메라-로봇 캘리브레이션을 할지 묻는다
+# 5b. 팔 캘리브레이션 (관절 리밋 + 기준자세). calibrate_arm.py 가 이걸 부른다.
+# ---------------------------------------------------------------------------
+
+COUNT_MIN, COUNT_MAX = 0, 4095
+SAFETY_MARGIN_DEG = 2.0     # 실측한 끝단에서 안쪽으로 물러설 여유
+MIN_SPAN_DEG = 10.0         # 이보다 좁으면 측정이 잘못된 것으로 본다
+SWEEP_SECONDS = 12.0        # msvcrt 가 없을 때의 고정 시간
+
+POSITIVE_HINT = {
+    "shoulder_pan":  "베이스를 위에서 봤을 때 반시계 방향(로봇 기준 왼쪽)으로",
+    "shoulder_lift": "위팔을 위로 들어올리는 방향으로",
+    "elbow_flex":    "아래팔을 위로 펴올리는 방향으로",
+    "wrist_flex":    "손목을 위로 젖히는 방향으로",
+    "wrist_roll":    "그리퍼를 반시계 방향으로 회전",
+}
+
+# ---------------------------------------------------------------------------
+# 유틸
+# ---------------------------------------------------------------------------
+
+def c2d(count: float) -> float:
+    """서보 카운트 -> 각도[deg] (캘리브레이션 좌표계)"""
+    return (count - CENTER_COUNT) / COUNTS_PER_DEG
+
+
+def d2c(deg: float) -> int:
+    return int(round(CENTER_COUNT + deg * COUNTS_PER_DEG))
+
+
+def read_pos(bus: FeetechBus, sid: int, name: str = "") -> int:
+    raw = bus.read_u16(sid, STS_ADDR["present_position"])
+    if raw is None:
+        raise RuntimeError(f"{name}(ID{sid}) 위치 읽기 실패")
+    return raw
+
+
+def read_servo_deg(bus: FeetechBus) -> dict[str, float]:
+    return {n: c2d(read_pos(bus, sid, n)) for n, sid in SERVO_IDS.items()}
+
+
+def read_homing_offset(bus: FeetechBus, sid: int) -> int:
+    v = bus.read_u16(sid, STS_ADDR["homing_offset"])
+    if v is None:
+        return 0
+    return -(v & 0x7FF) if (v & 0x800) else v
+
+
+class CalibAborted(RuntimeError):
+    """캘리브레이션을 계속할 수 없다 (입력 불가 등). 저장하지 않고 빠져나간다."""
+
+
+def ask(prompt: str, default: str = "") -> str:
+    try:
+        s = input(prompt).strip()
+    except EOFError:
+        return default
+    return s or default
+
+
+def wait_enter(prompt: str) -> None:
+    """Enter 를 기다린다. 입력을 받을 수 없는 환경이면 중단한다.
+
+    파이프로 돌리는 등 stdin 이 없을 때 EOFError 로 죽으면 팔이 토크 OFF 인 채
+    프로그램만 사라진다. 정상 경로로 빠져나가 토크 정리까지 하게 만든다.
+    """
+    try:
+        input(prompt)
+    except EOFError:
+        raise CalibAborted("입력을 받을 수 없는 환경입니다")
+
+
+# ---------------------------------------------------------------------------
+# 리밋 측정
+# ---------------------------------------------------------------------------
+
+def sweep_joint(bus: FeetechBus, name: str, sid: int) -> tuple[int, int]:
+    """관절을 손으로 끝에서 끝까지 움직이는 동안 최소/최대 카운트를 기록한다.
+
+    토크가 꺼져 있으므로 사람이 미는 대로만 움직인다. 기계적 스토퍼에 살짝
+    닿을 때까지 양쪽 끝을 훑으면 된다.
+    """
+    lo = hi = read_pos(bus, sid, name)
+    print(f"    지금부터 [{name}] 을 양쪽 끝까지 천천히 움직이세요.")
+    if msvcrt is not None:
+        print("    다 하면 Enter. (실시간으로 최소/최대를 기록합니다)")
+    else:
+        print(f"    {SWEEP_SECONDS:.0f}초 동안 기록합니다.")
+
+    t0 = time.time()
+    last = 0.0
+    while True:
+        p = read_pos(bus, sid, name)
+        lo, hi = min(lo, p), max(hi, p)
+
+        now = time.time()
+        if now - last > 0.08:
+            last = now
+            print(f"\r      현재 {p:>4} ({c2d(p):+7.2f}deg)   "
+                  f"측정범위 [{lo:>4}, {hi:>4}] = [{c2d(lo):+7.2f}, {c2d(hi):+7.2f}]deg "
+                  f"폭 {c2d(hi)-c2d(lo):6.2f}deg   ", end="", flush=True)
+
+        if msvcrt is not None:
+            if msvcrt.kbhit() and msvcrt.getch() in (b"\r", b"\n"):
+                break
+        elif now - t0 > SWEEP_SECONDS:
+            break
+        time.sleep(0.01)
+
+    print()
+    return lo, hi
+
+
+def apply_margin(lo: int, hi: int) -> tuple[int, int]:
+    m = SAFETY_MARGIN_DEG * COUNTS_PER_DEG
+    a, b = int(round(lo + m)), int(round(hi - m))
+    if b <= a:                      # 범위가 너무 좁으면 여유를 포기한다
+        a, b = lo, hi
+    return max(COUNT_MIN, a), min(COUNT_MAX, b)
+
+
+def set_ranges(bus: FeetechBus, base: dict) -> dict:
+    """관절별로 리밋을 유지/측정/직접입력 중에 고른다."""
+    print("\n" + "=" * 66)
+    print("1단계: 관절 min/max 리밋")
+    print("=" * 66)
+    print("  이 값이 test4.py 의 하드 클램프가 됩니다. 팔은 절대 이 범위를 넘지 않습니다.")
+    print("  관절마다: [k]유지  [s]손으로 훑어 측정  [t]각도 직접입력\n")
+
+    out: dict[str, dict] = {}
+    for name, sid in SERVO_IDS.items():
+        cur = base.get(name, {})
+        lo = cur.get("range_min", COUNT_MIN)
+        hi = cur.get("range_max", COUNT_MAX)
+        pos = read_pos(bus, sid, name)
+        print(f"[{name}] ID{sid}  현재 {pos} ({c2d(pos):+.2f}deg)")
+        print(f"    기존 리밋 [{lo}, {hi}] = [{c2d(lo):+.2f}, {c2d(hi):+.2f}]deg "
+              f"(폭 {c2d(hi)-c2d(lo):.1f}deg)")
+
+        while True:
+            m = ask("    선택 [k/s/t] (기본 k) > ", "k").lower()
+            if m == "k":
+                nlo, nhi = lo, hi
+                break
+            if m == "s":
+                rlo, rhi = sweep_joint(bus, name, sid)
+                span = c2d(rhi) - c2d(rlo)
+                if span < MIN_SPAN_DEG:
+                    print(f"    측정 폭이 {span:.1f}deg 로 너무 좁습니다. 다시 하세요.")
+                    continue
+                nlo, nhi = apply_margin(rlo, rhi)
+                print(f"    실측 [{rlo}, {rhi}] -> 여유 {SAFETY_MARGIN_DEG}deg 적용 "
+                      f"[{nlo}, {nhi}] = [{c2d(nlo):+.2f}, {c2d(nhi):+.2f}]deg")
+                break
+            if m == "t":
+                s = ask("    min max [deg] 를 공백으로 구분해 입력 > ")
+                try:
+                    a, b = (float(v) for v in s.replace(",", " ").split())
+                except ValueError:
+                    print("    숫자 두 개를 입력하세요.")
+                    continue
+                if b <= a:
+                    print("    max 가 min 보다 커야 합니다.")
+                    continue
+                nlo, nhi = max(COUNT_MIN, d2c(a)), min(COUNT_MAX, d2c(b))
+                print(f"    -> [{nlo}, {nhi}] 카운트")
+                break
+            print("    k, s, t 중에 고르세요.")
+
+        if not (nlo <= pos <= nhi):
+            print(f"    주의: 현재 위치 {pos} 가 새 리밋 밖입니다. "
+                  f"이 관절은 클램프 때문에 즉시 끌려갑니다.")
+
+        out[name] = {"id": sid,
+                     "drive_mode": cur.get("drive_mode", 0),
+                     "homing_offset": read_homing_offset(bus, sid),
+                     "range_min": int(nlo), "range_max": int(nhi)}
+        print()
+    return out
+
+ZERO_POSE_DESC = """
+[영자세] 모든 관절 0도 = lift 90도 / elbow 90도 / wrist 0도
+
+  - 위팔(shoulder_lift -> elbow)  : 수직으로 곧게 선다
+  - 아래팔(elbow -> wrist)        : 수평. 위팔과 직각
+  - 손목+그리퍼(wrist -> TCP)     : 아래팔과 일직선, 그대로 수평
+  - 팔은 정면(pan 중앙), 손목 회전(wrist_roll)은 중립
+
+  직각자를 위팔에 대고 아래팔이 직각인지 보면 된다. 링크를 앞으로 쭉 편
+  수평 자세가 아니다 - 그렇게 잡으면 관절마다 70도 넘게 어긋난다.
+  이 자세의 TCP 는 pan 축에서 324.8mm 앞, 테이블에서 232.6mm 위다.
+"""
+
+
+def set_mapping(bus: FeetechBus, ranges: dict) -> dict:
+    """관절별 부호와 영점(offset_deg)을 정한다.
+
+    부호를 먼저 잡는다. 범위 중앙으로 영점을 계산하려면 부호가 있어야 하고,
+    자세를 손으로 잡는 경우에도 부호 확인 중에 팔을 흔들게 되므로 자세는
+    맨 마지막에 잡는 편이 낫다.
+
+    영점 방식:
+      [r] 가동범위의 한가운데에서 계산 - 사람이 자세를 잡지 않는다. 대신
+          1단계에서 관절을 양쪽 끝까지 제대로 훑었어야 한다.
+      [p] 영자세를 손으로 잡아 실측 - 범위를 다 훑지 못했을 때의 대안.
+    """
+    print("\n" + "=" * 66)
+    print("2단계: 부호 + 영점")
+    print("=" * 66)
+    print(ZERO_POSE_DESC)
+
+    while True:
+        how = ask("  영점 [r]가동범위 중앙에서 계산(권장) / [p]자세를 손으로 잡아 측정 > ",
+                  "r").lower()
+        if how in ("r", "p"):
+            break
+        print("  r 또는 p 를 고르세요.")
+
+    print("\n  먼저 관절별 '+방향'을 확인합니다. 안내 방향으로 15도 이상 움직인 뒤 Enter.\n")
+    sign: dict[str, float] = {}
+    for n in JOINT_ORDER:
+        base = read_servo_deg(bus)[n]
+        while True:
+            wait_enter(f"  [{n}] {POSITIVE_HINT[n]} 움직이고 Enter > ")
+            delta = read_servo_deg(bus)[n] - base
+            if abs(delta) >= 5.0:
+                break
+            print(f"    변화가 {delta:+.1f}도로 너무 작습니다. 더 크게 움직여 주세요.")
+        sign[n] = 1.0 if delta > 0 else -1.0
+        print(f"    delta={delta:+7.2f}deg -> sign={sign[n]:+.0f}")
+
+    print()
+    zero: dict[str, float] = {}
+    if how == "r":
+        for n in JOINT_ORDER:
+            rg = ranges[n]
+            mid = (rg["range_min"] + rg["range_max"]) / 2.0
+            # 범위 중앙은 URDF 영자세다. 우리 0도(90/90/0)와의 차이를 빼준다.
+            zero[n] = c2d(mid) - sign[n] * math.degrees(MIDRANGE_Q[n])
+            span = c2d(rg["range_max"]) - c2d(rg["range_min"])
+            warn = "  <-- 범위가 좁다. 1단계를 다시 훑을 것" if span < 60 else ""
+            print(f"    {n:<15} 중앙 {mid:7.1f}카운트 = {c2d(mid):+7.2f}deg"
+                  f"  -> 영점 {zero[n]:+7.2f}deg  (폭 {span:.1f}deg){warn}")
+    else:
+        wait_enter("  팔을 영자세(위팔 수직 / 아래팔 수평)로 잡은 채로 Enter > ")
+        zero = read_servo_deg(bus)
+        print("\n  영자세 서보각:")
+        for n in JOINT_ORDER:
+            print(f"    {n:<15}{zero[n]:+8.2f} deg")
+
+    return {n: {"sign": sign[n], "offset_deg": zero[n]} for n in JOINT_ORDER}
+
+
+# ---------------------------------------------------------------------------
+# TCP 확인
+# ---------------------------------------------------------------------------
+#
+# 영점(offset_deg)이 맞았는지는 서보각만 봐서는 알 수 없다. 링크 길이까지
+# 통과한 TCP 좌표라야 "그리퍼가 테이블에 닿아 있는데 z 가 -116mm 라고 한다"
+# 같은 모순이 눈에 보인다. 그 모순을 여기서 못 잡으면 hand-eye 캘리브레이션까지
+# 끌고 가서, 카메라 탓을 하며 몇 시간을 버리게 된다.
+
+TABLE_Z_TOL = 0.010     # 테이블에 댔을 때 TCP z 가 0 에서 벗어나도 되는 폭 [m]
+
+
+def read_all_counts(bus: FeetechBus) -> dict[str, int]:
+    return {n: read_pos(bus, sid, n) for n, sid in SERVO_IDS.items()}
+
+
+def tcp_of(calib: ArmCalibration, counts: dict[str, int]):
+    """카운트 -> (IK 관절각[rad], TCP[m])"""
+    q = calib.counts_to_ik(counts)
+    return q, so101_fk(q)
+
+
+SHORT_NAME = {"shoulder_pan": "pan", "shoulder_lift": "lift", "elbow_flex": "elbow",
+              "wrist_flex": "wflex", "wrist_roll": "wroll"}
+
+
+def tcp_text(calib: ArmCalibration, counts: dict[str, int]) -> str:
+    q, p = tcp_of(calib, counts)
+    r = math.hypot(p[0], p[1])
+    joints = "  ".join(f"{SHORT_NAME[n]} {math.degrees(q[n]):+6.1f}" for n in JOINT_ORDER)
+    return (f"TCP  x{p[0]*1000:+7.1f}  y{p[1]*1000:+7.1f}  z{p[2]*1000:+7.1f} mm"
+            f"   반경 {r*1000:6.1f}   |  {joints}")
+
+
+def watch_tcp(bus: FeetechBus, calib: ArmCalibration, note: str = "") -> dict[str, int]:
+    """Enter 를 누를 때까지 TCP 를 실시간으로 보여주고, 그 순간의 카운트를 돌려준다."""
+    if note:
+        print(f"  {note}")
+    if msvcrt is not None:
+        print("  움직여 보면서 값을 확인하세요. 다 보면 Enter.")
+    else:
+        print(f"  {SWEEP_SECONDS:.0f}초 동안 표시합니다.")
+
+    counts = read_all_counts(bus)
+    t0 = last = time.time()
+    while True:
+        counts = read_all_counts(bus)
+        now = time.time()
+        if now - last > 0.1:
+            last = now
+            print("\r  " + tcp_text(calib, counts) + "   ", end="", flush=True)
+        if msvcrt is not None:
+            if msvcrt.kbhit() and msvcrt.getch() in (b"\r", b"\n"):
+                break
+        elif now - t0 > SWEEP_SECONDS:
+            break
+        time.sleep(0.02)
+    print()
+    return counts
+
+
+def table_check(bus: FeetechBus, calib: ArmCalibration) -> None:
+    """그리퍼 끝을 테이블에 댄 자세에서 TCP z 가 0 인지 본다.
+
+    팔이 테이블 위에 놓여 있다면 이건 자를 대지 않고도 쓸 수 있는 유일한
+    절대 기준이다. 여기서 z 가 0 이 아니면 그만큼 기준자세가 틀린 것이고,
+    그 오차는 자세마다 다르게 나타나서 나중에 어떤 보정으로도 흡수되지 않는다.
+    """
+    print("\n" + "=" * 66)
+    print("4단계: 테이블 접촉 검사 (영점이 실제로 맞는지)")
+    print("=" * 66)
+    print("  그리퍼 끝을 테이블면에 살짝 대세요. 팔이 테이블 위에 놓여 있다면")
+    print("  그 순간 TCP z 는 0 근처여야 합니다.")
+    counts = watch_tcp(bus, calib, "그리퍼 끝을 테이블에 댄 채로 Enter")
+
+    q, p = tcp_of(calib, counts)
+    z, r = float(p[2]), math.hypot(p[0], p[1])
+    print(f"\n  접촉 지점의 TCP: z = {z*1000:+.1f}mm  (반경 {r*1000:.1f}mm)")
+    if abs(z) <= TABLE_Z_TOL:
+        print(f"  -> 정상. 영점이 맞습니다 (허용 +-{TABLE_Z_TOL*1000:.0f}mm)")
+        return
+
+    print(f"  -> 어긋남 {z*1000:+.1f}mm. 기준자세(2단계)가 그만큼 틀렸습니다.")
+    if r > 1e-3:
+        deg = math.degrees(math.atan2(-z, r))
+        print(f"     이 반경에서는 팔 전체가 약 {deg:+.1f}도 기울어진 것과 같습니다.")
+        print(f"     (shoulder_lift offset_deg 를 {deg*(-calib.mapping['shoulder_lift']['sign']):+.1f}도 "
+              f"움직이면 이 자세에서는 z 가 0 이 됩니다. 다만 한 자세만 맞춘 것이라")
+        print("      다른 자세에서 또 틀어집니다 - 되도록 2단계를 다시 하세요.)")
+    print("     기준자세는 세 링크가 한 직선이 되게 펴고 그 직선이 바닥과 평행해야 합니다.")
+    print("     자나 테이블 모서리에 대고 맞추면 눈대중보다 훨씬 정확합니다.")
+
+
+# ---------------------------------------------------------------------------
+
+def verify_home_reach(calib: ArmCalibration) -> bool:
+    print("\n" + "=" * 66)
+    print("5단계: 검증 (전송하지 않고 계산만)")
+    print("=" * 66)
+    q = so101_ik(*HOME_POSE)
+    ok = True
+    counts = {}
+    for n in JOINT_ORDER:
+        r = calib.ranges[n]
+        m = calib.mapping[n]
+        servo_deg = math.degrees(q[n]) * m["sign"] + m["offset_deg"]
+        raw = CENTER_COUNT + servo_deg * COUNTS_PER_DEG
+        clamped = calib.ik_to_count(n, q[n])
+        counts[n] = clamped
+        hit = "" if abs(raw - clamped) < 1 else "  <-- 리밋에 걸림"
+        if hit:
+            ok = False
+        print(f"  {n:<15} ik={math.degrees(q[n]):+7.2f}deg  servo={servo_deg:+7.2f}deg  "
+              f"count={raw:7.0f}  범위[{r['range_min']},{r['range_max']}]{hit}")
+
+    # 왕복 검사: 목표 -> 카운트 -> 다시 TCP. 리밋에 걸리면 여기서 어긋난다.
+    reached = so101_fk(calib.counts_to_ik(counts))
+    want = HOME_POSE
+    d = math.dist(reached, want)
+    print(f"\n  HOME 목표    x{want[0]*1000:+7.1f} y{want[1]*1000:+7.1f} z{want[2]*1000:+7.1f} mm")
+    print(f"  클램프 후 TCP x{reached[0]*1000:+7.1f} y{reached[1]*1000:+7.1f} "
+          f"z{reached[2]*1000:+7.1f} mm   차이 {d*1000:.1f}mm")
+    if d > 0.002:
+        print("  -> 리밋 때문에 목표에 못 간다. 리밋이나 기준자세를 다시 볼 것")
+        ok = False
+    return ok
+
+
+def zero_pose_tcp():
+    """기준자세(모든 관절 0도)에서 나와야 하는 TCP. 화면에서 바로 대조할 기준값."""
+    return so101_fk({n: 0.0 for n in JOINT_ORDER})
+
+
+def monitor_tcp(port: str) -> None:
+    """저장된 arm_calib.json 으로 TCP 만 실시간으로 본다. 아무것도 바꾸지 않는다.
+
+    영점이 의심스러울 때 캘리브레이션 전체를 다시 하지 않고 확인만 하는 길.
+    """
+    calib = ArmCalibration.load()
+    if calib is None:
+        print(f"[calib] {ARM_CALIB_PATH} 가 없다 - 먼저 캘리브레이션할 것")
+        return
+    bus = FeetechBus(port)
+    try:
+        missing = [n for n, sid in SERVO_IDS.items() if not bus.ping(sid)]
+        if missing:
+            print(f"[calib] 응답 없는 서보: {missing}")
+            return
+        for sid in SERVO_IDS.values():
+            bus.write_u8(sid, STS_ADDR["torque_enable"], 0)
+        z = zero_pose_tcp()
+        print(f"[calib] {port} 연결, 토크 OFF (손으로 움직입니다)")
+        print(f"        기준자세라면 TCP 는 x{z[0]*1000:+.0f} y{z[1]*1000:+.0f} "
+              f"z{z[2]*1000:+.0f}mm 여야 합니다.")
+        watch_tcp(bus, calib)
+        table_check(bus, calib)
+    except KeyboardInterrupt:
+        print("\n[calib] 중단")
+    finally:
+        for sid in SERVO_IDS.values():
+            try:
+                bus.write_u8(sid, STS_ADDR["torque_enable"], 0)
+            except Exception:
+                pass
+        bus.close()
+
+
+def run_arm_calibration(port: str) -> Optional[ArmCalibration]:
+    """관절 리밋 -> 기준자세 -> TCP 확인 -> 테이블 검사 -> 저장. 실패/중단이면 None.
+
+    전 과정 토크 OFF 다. 서보에 목표위치를 쓰지 않으므로 팔은 스스로 움직이지
+    않는다. 사람이 손으로 자세를 잡는 방식이고, 팔은 중력으로 처지니 받쳐야 한다.
+    """
+    try:
+        base = load_lerobot_calibration(LEROBOT_CALIB)
+        print(f"[calib] 기존 리밋 로드: {LEROBOT_CALIB}")
+    except Exception as e:
+        print(f"[calib] 기존 리밋 없음 ({e.__class__.__name__}) - 전부 새로 측정해야 한다")
+        base = {}
+
+    bus = FeetechBus(port)
+    try:
+        missing = [n for n, sid in SERVO_IDS.items() if not bus.ping(sid)]
+        if missing:
+            print(f"[calib] 응답 없는 서보: {missing} - 캘리브레이션 중단")
+            return None
+
+        for sid in SERVO_IDS.values():          # 안전: 전 관절 토크 OFF 보장
+            bus.write_u8(sid, STS_ADDR["torque_enable"], 0)
+        print(f"[calib] {port} 연결, 전 관절 토크 OFF (팔이 손으로 움직입니다)")
+
+        ranges = set_ranges(bus, base)
+        mapping = set_mapping(bus, ranges)
+        calib = ArmCalibration(mapping, ranges)
+
+        print("\n" + "=" * 66)
+        print("3단계: 실시간 TCP 확인")
+        print("=" * 66)
+        z = zero_pose_tcp()
+        print("  이제 팔을 손으로 움직이면 그 자세의 TCP 가 실시간으로 보입니다.")
+        print(f"  기준자세로 되돌리면 x{z[0]*1000:+.0f} y{z[1]*1000:+.0f} z{z[2]*1000:+.0f}mm "
+              "근처여야 합니다.")
+        watch_tcp(bus, calib)
+
+        table_check(bus, calib)
+
+        if not verify_home_reach(calib):
+            print("\n[calib] 경고: HOME 자세가 리밋에 걸립니다.")
+            print("        기준자세가 부정확했거나 리밋이 너무 좁습니다.")
+            if ask("        그래도 저장할까요? (y/N) > ").lower() != "y":
+                print("[calib] 저장하지 않고 종료")
+                return None
+
+        calib.save(ARM_CALIB_PATH)
+        print(f"[calib] 완료. 이제 {ARM_CALIB_PATH} 로 실기를 제어합니다.")
+        return calib
+    except KeyboardInterrupt:
+        print("\n[calib] 사용자 중단 - 저장하지 않음")
+        return None
+    except CalibAborted as e:
+        print(f"[calib] 중단: {e} - 저장하지 않음")
+        return None
+    finally:
+        for sid in SERVO_IDS.values():
+            try:
+                bus.write_u8(sid, STS_ADDR["torque_enable"], 0)
+            except Exception:
+                pass
+        bus.close()
+
+
+# ---------------------------------------------------------------------------
+# 시작 마법사: 없는 캘리브레이션은 만들고, 있는 것은 다시 할지 묻는다
 # ---------------------------------------------------------------------------
 
 def ask_yes(question: str, default: bool = True) -> bool:
@@ -1992,10 +2426,11 @@ def ask_yes(question: str, default: bool = True) -> bool:
 
 
 def setup_arm() -> RobotArm:
-    """arm_calib.json 을 읽어 실기(또는 mock)를 돌려준다.
+    """팔 캘리브레이션을 확인/실행한 뒤 실기(또는 mock)를 돌려준다.
 
-    캘리브레이션은 calibrate_arm.py 가 만든다. 파일이 없으면 실기를 움직이지
-    않는다 - 리밋과 부호를 모르는 채로 명령하면 팔이 테이블로 내리꽂힌다.
+    파일이 없으면 지금 만들지 묻고, 있으면 다시 잡을지 묻는다. 캘리브레이션
+    없이는 실기를 움직이지 않는다 - 리밋과 부호를 모르는 채로 명령하면
+    팔이 테이블로 내리꽂힌다.
     """
     port = os.environ.get("SO101_PORT") or find_so101_port()
     if not port:
@@ -2009,11 +2444,16 @@ def setup_arm() -> RobotArm:
     print()
     if calib is None:
         print(f"[1/2] 팔 캘리브레이션: {ARM_CALIB_PATH} 이 없습니다.")
-        print("      먼저 python calibrate_arm.py 로 캘리브레이션할 것.")
+        print("      각 관절의 min/max 리밋과 기준자세(부호+영점)를 지금 설정합니다.")
+        print("      (전 과정 토크 OFF - 팔을 손으로 잡고 진행합니다)")
+        if ask_yes("      지금 설정할까요?", True):
+            calib = run_arm_calibration(port)
     else:
-        print(f"[1/2] 팔 캘리브레이션: {ARM_CALIB_PATH}")
+        print(f"[1/2] 팔 캘리브레이션: {ARM_CALIB_PATH} 이 이미 있습니다.")
         _print_calib_summary(calib)
-        print("      다시 잡으려면 종료 후 python calibrate_arm.py")
+        if ask_yes("      다시 설정할까요?", False):
+            new = run_arm_calibration(port)
+            calib = new or calib
 
     if calib is None:
         print("[arm] 팔 캘리브레이션 없음 -> mock 사용 (화면과 카메라는 그대로 동작합니다)")
@@ -3249,18 +3689,6 @@ class App:
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.panel = HandEyePanel(self)
 
-        # --- 웹 UI (cv2 GUI 대체) ---------------------------------------
-        # 브라우저(HTTP 핸들러 스레드)에서 들어온 클릭/키 입력은 바로 처리하지
-        # 않고 큐에 쌓아 뒀다가, run() 루프가 자기 스레드에서 순서대로 꺼내
-        # on_mouse/handle_key 를 부른다. cv2 GUI 시절엔 마우스 콜백이 waitKey
-        # 안에서 렌더 스레드와 같은 스레드로 불렸으므로, on_mouse 는 원래
-        # self.st 등을 락 없이 건드려도 안전했다 - 그 가정을 유지하기 위함이다.
-        self._input_events: "queue.Queue[tuple]" = queue.Queue()
-        self._display_lock = threading.Lock()
-        self.last_display: Optional[np.ndarray] = None   # 스트림으로 내보낼 합성 화면
-        self._save_color: Optional[np.ndarray] = None     # 's' 키가 저장할 최신 컬러/depth
-        self._save_depth: Optional[np.ndarray] = None
-
     # --- 로봇 동작 워커 (UI 프리즈 방지) ----------------------------------
     def _worker_loop(self) -> None:
         while self.running:
@@ -3289,19 +3717,6 @@ class App:
 
     def _submit(self, job: Job) -> None:
         self.jobs.put(job)
-
-    # --- 웹 UI 입력/출력 -----------------------------------------------------
-    def enqueue_mouse(self, event: int, x: int, y: int) -> None:
-        """HTTP 핸들러 스레드에서 호출. run() 루프가 다음 턴에 처리한다."""
-        self._input_events.put(("mouse", event, x, y))
-
-    def enqueue_key(self, code: int) -> None:
-        self._input_events.put(("key", code))
-
-    def latest_display(self) -> Optional[np.ndarray]:
-        """MJPEG 스트림용 최신 합성 화면 (카메라 뷰 + 우측 패널)."""
-        with self._display_lock:
-            return None if self.last_display is None else self.last_display.copy()
 
     # --- 마우스 ------------------------------------------------------------
     def on_mouse(self, event: int, x: int, y: int, flags: int, param) -> None:
@@ -3713,74 +4128,11 @@ class App:
             print("              -> 콘솔에서 Enter (로봇 좌표는 자동 실측)")
 
     # --- 메인 루프 ---------------------------------------------------------
-    def _drain_input_events(self) -> None:
-        """웹 핸들러 스레드가 큐에 넣은 클릭/키를 이 스레드(run 루프)에서 처리."""
-        while True:
-            try:
-                item = self._input_events.get_nowait()
-            except queue.Empty:
-                return
-            kind = item[0]
-            if kind == "mouse":
-                _, event, x, y = item
-                self.on_mouse(event, x, y, 0, None)
-            elif kind == "key":
-                _, code = item
-                if not self.handle_key(code):
-                    self.running = False
-
-    def handle_key(self, key: int) -> bool:
-        """웹 UI에서 넘어온 키 1개 처리. False 를 돌려주면 앱을 종료한다.
-
-        cv2 GUI 시절 run() 루프 안에 있던 waitKey 이후의 분기를 그대로 옮긴 것 -
-        키 코드/동작이 바뀌면 안 되므로 로직은 손대지 않았다.
-        """
-        if key in (ord('q'), 27):
-            return False
-        if key == ord('d'):
-            self.cycle_view()
-        elif key == ord('w'):
-            self.st.show_reach = not self.st.show_reach
-            self.st.status = ("도달 가능 영역 표시 ON" if self.st.show_reach
-                              else "도달 가능 영역 표시 OFF")
-        elif key == ord('r'):
-            self.st.mode = STATE_IDLE
-            self.st.markers.clear()
-            self.st.status = "리셋됨 - 물체를 클릭하면 집습니다"
-        elif key == ord('k'):
-            self._finish_calib() if self.st.calibrating else self._start_calib()
-        elif key == ord('t'):
-            try:
-                self.torque_on = not getattr(self, "torque_on", True)
-                self.arm.set_torque(self.torque_on)
-                self.st.status = (f"토크 {'ON' if self.torque_on else 'OFF'}"
-                                  + ("" if self.torque_on else " - 손으로 움직일 수 있음"))
-            except Exception as e:
-                self.st.status = f"토크 전환 불가: {e}"
-        elif key == ord('s'):
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            if self._save_color is not None:
-                cv2.imwrite(f"frame_{ts}.png", self._save_color)
-            if self._save_depth is not None:
-                np.save(f"depth_{ts}.npy", self._save_depth)
-            self.st.status = f"저장: frame_{ts}.png / depth_{ts}.npy"
-        elif self.st.mode != STATE_BUSY:
-            if key == ord('h'):
-                self._submit(Job(RobotArm.home, (self.arm,), done_msg="홈 자세", kind="home"))
-            elif key == ord('o'):
-                self._submit(Job(RobotArm.open_gripper, (self.arm,),
-                                 done_msg="그리퍼 열림", kind="gripper"))
-            elif key == ord('c'):
-                self._submit(Job(RobotArm.close_gripper, (self.arm,),
-                                 done_msg="그리퍼 닫힘", kind="gripper"))
-        return True
-
     def run(self) -> None:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(WINDOW, self.on_mouse)
         self.worker.start()
         print(__doc__)
-        print("[web] 브라우저에서 여세요 (cv2 창 대신 여기서 보고 조작합니다):")
-        for u in api_urls():
-            print(f"        {u}")
         if self.depth_aligned:
             print("[align] depth 가 컬러 좌표계로 정렬되어 있다. 화면(컬러)에서 클릭한 "
                   "픽셀이 곧 depth 화소다 - ALIGN 호모그래피가 필요 없다.")
@@ -3798,9 +4150,6 @@ class App:
 
         try:
             while self.running:
-                self._drain_input_events()
-                if not self.running:
-                    break
                 legacy_color = self.st.view == "color" and not self.depth_aligned
                 rgb_now = (self.color_cam.latest((self.src.intr.width,
                                                    self.src.intr.height))
@@ -3883,23 +4232,55 @@ class App:
                 if lo is not None:
                     draw_depth_scale(frame, lo, hi)
                 self.last_frame = frame
-                self._save_color, self._save_depth = color, depth   # 's' 키용
-                display = np.hstack([frame, self.panel.draw(frame.shape[0])])
-                with self._display_lock:
-                    self.last_display = display
+                cv2.imshow(WINDOW, np.hstack([frame, self.panel.draw(frame.shape[0])]))
 
-                # 실기(카메라)가 자체적으로 프레임레이트를 맞춰 self.src.read() 에서
-                # 블로킹되는 것과 달리, SyntheticSource 등은 즉시 리턴하므로 여기서
-                # 직접 쉬어야 CPU 를 다 먹지 않는다. cv2 GUI 시절엔 waitKey(1) 이
-                # 이 역할도 겸했었다.
-                time.sleep(0.02)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 255:
+                    continue
+                if key in (ord('q'), 27):
+                    break
+                if key == ord('d'):
+                    self.cycle_view()
+                elif key == ord('w'):
+                    self.st.show_reach = not self.st.show_reach
+                    self.st.status = ("도달 가능 영역 표시 ON" if self.st.show_reach
+                                      else "도달 가능 영역 표시 OFF")
+                elif key == ord('r'):
+                    self.st.mode = STATE_IDLE
+                    self.st.markers.clear()
+                    self.st.status = "리셋됨 - 물체를 클릭하면 집습니다"
+                elif key == ord('k'):
+                    self._finish_calib() if self.st.calibrating else self._start_calib()
+                elif key == ord('t'):
+                    try:
+                        self.torque_on = not getattr(self, "torque_on", True)
+                        self.arm.set_torque(self.torque_on)
+                        self.st.status = (f"토크 {'ON' if self.torque_on else 'OFF'}"
+                                          + ("" if self.torque_on else " - 손으로 움직일 수 있음"))
+                    except Exception as e:
+                        self.st.status = f"토크 전환 불가: {e}"
+                elif key == ord('s'):
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    cv2.imwrite(f"frame_{ts}.png", color)
+                    np.save(f"depth_{ts}.npy", depth)
+                    self.st.status = f"저장: frame_{ts}.png / depth_{ts}.npy"
+                elif self.st.mode != STATE_BUSY:
+                    if key == ord('h'):
+                        self._submit(Job(RobotArm.home, (self.arm,), done_msg="홈 자세", kind="home"))
+                    elif key == ord('o'):
+                        self._submit(Job(RobotArm.open_gripper, (self.arm,),
+                                         done_msg="그리퍼 열림", kind="gripper"))
+                    elif key == ord('c'):
+                        self._submit(Job(RobotArm.close_gripper, (self.arm,),
+                                         done_msg="그리퍼 닫힘", kind="gripper"))
         finally:
             # 팔부터 정리한다. 카메라 닫기가 실패해도 토크는 반드시 꺼져야 하므로
             # 안전에 직결된 것을 먼저, 각각 독립적으로 감싼다.
             self.running = False
             for what, fn in (("팔", self.arm.disconnect),
                              ("컬러 카메라", self.color_cam.close),
-                             ("카메라", self.src.close)):
+                             ("카메라", self.src.close),
+                             ("창", cv2.destroyAllWindows)):
                 try:
                     fn()
                 except Exception as e:
@@ -3926,74 +4307,13 @@ class App:
 # 동작 완료는 /status 로 확인한다 - 팔이 움직이는 몇 초 동안 HTTP 를 붙잡고
 # 있으면 클라이언트가 타임아웃으로 재시도해 같은 동작을 두 번 걸게 된다.
 #
-# 기본은 0.0.0.0 - 같은 네트워크의 다른 PC/폰에서 http://<이 PC IP>:8765/ 로 연다.
-# 인증이 없고 HTTP 한 번에 팔이 움직이므로 신뢰하는 내부망에서만 쓸 것.
-# 공유기 포트포워딩으로 인터넷에 열면 안 된다.
-#   이 PC 에서만 열려면:  PICK_API_HOST=127.0.0.1
-#   끄려면:              PICK_API_PORT=0
+# 기본은 127.0.0.1 만 듣는다. HTTP 한 번에 팔이 움직이므로 네트워크에 여는 것은
+# 의도한 선택이어야 한다.
+#   다른 PC 에서 부르려면:  $env:PICK_API_HOST='0.0.0.0'
+#   끄려면:                $env:PICK_API_PORT='0'
 
-API_HOST = os.environ.get("PICK_API_HOST", "0.0.0.0")
+API_HOST = os.environ.get("PICK_API_HOST", "127.0.0.1")
 API_PORT = int(os.environ.get("PICK_API_PORT", "8765"))
-
-
-def api_urls() -> list[str]:
-    """브라우저에 입력할 주소. 0.0.0.0 은 주소가 아니므로 실제 LAN IP 로 바꿔 보여준다."""
-    if API_HOST not in ("0.0.0.0", ""):
-        return [f"http://{API_HOST}:{API_PORT}/"]
-    urls = []
-    try:
-        # UDP connect 는 패킷을 보내지 않는다. 기본 경로로 나가는 인터페이스 IP 만 얻는다.
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("192.0.2.1", 80))
-            urls.append(f"http://{s.getsockname()[0]}:{API_PORT}/")
-    except OSError:
-        pass
-    urls.append(f"http://127.0.0.1:{API_PORT}/")
-    return urls
-
-MJPEG_BOUNDARY = "so101frame"
-
-# cv2 GUI(imshow/waitKey) 를 대체하는 조작 페이지. 화면(카메라+패널 합성 이미지)은
-# /stream 이 MJPEG 로 내보내고, 클릭/마우스이동/키보드는 각각 /click, /hover, /key 로
-# 그대로 넘긴다 - 실제 판단은 App.on_mouse / App.handle_key 가 하므로 이 페이지는
-# 입력을 좌표/코드로 바꿔 보내기만 한다.
-UI_HTML = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>{WINDOW}</title>
-<style>
-  html, body {{ margin: 0; background: #111; color: #ddd; font-family: monospace; }}
-  #v {{ display: block; max-width: 100vw; height: auto; cursor: crosshair; }}
-  #hint {{ padding: 4px 8px; font-size: 12px; opacity: .75; }}
-</style></head>
-<body>
-  <img id="v" src="/stream">
-  <div id="hint">클릭 = pick/place/캘리브 점 | 키(포커스가 이 탭에 있을 때):
-    q 종료  h 홈  o/c 그리퍼  r 리셋  d 뷰전환  w 도달영역  k 캘리브  t 토크  s 저장</div>
-<script>
-const img = document.getElementById('v');
-function toImageXY(e) {{
-  const r = img.getBoundingClientRect();
-  const sx = img.naturalWidth / r.width, sy = img.naturalHeight / r.height;
-  return [Math.round((e.clientX - r.left) * sx), Math.round((e.clientY - r.top) * sy)];
-}}
-img.addEventListener('click', e => {{
-  const [x, y] = toImageXY(e);
-  fetch(`/click?x=${{x}}&y=${{y}}`);
-}});
-let lastHover = 0;
-img.addEventListener('mousemove', e => {{
-  const now = performance.now();
-  if (now - lastHover < 50) return;   // 매 픽셀마다 요청하지 않도록 쓰로틀
-  lastHover = now;
-  const [x, y] = toImageXY(e);
-  fetch(`/hover?x=${{x}}&y=${{y}}`);
-}});
-document.addEventListener('keydown', e => {{
-  if (e.repeat) return;
-  const code = e.key === 'Escape' ? 'Escape' : e.key;
-  fetch(`/key?code=${{encodeURIComponent(code)}}`);
-}});
-</script>
-</body></html>"""
 
 
 class _ApiHandler(BaseHTTPRequestHandler):
@@ -4029,41 +4349,6 @@ class _ApiHandler(BaseHTTPRequestHandler):
             return
         ctype = "image/png" if ext == ".png" else "image/jpeg"
         self._send_bytes(200, ctype, buf.tobytes(), extra)
-
-    def _send_html(self, code: int, html: str) -> None:
-        body = html.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _stream_mjpeg(self, app: "App") -> None:
-        """cv2.imshow 대신: 합성 화면(카메라+패널)을 MJPEG 로 계속 내보낸다."""
-        self.send_response(200)
-        self.send_header("Age", "0")
-        self.send_header("Cache-Control", "no-cache, private")
-        self.send_header("Content-Type",
-                         f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}")
-        self.end_headers()
-        try:
-            while app.running:
-                frame = app.latest_display()
-                if frame is None:
-                    time.sleep(0.05)
-                    continue
-                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if not ok:
-                    continue
-                data = buf.tobytes()
-                self.wfile.write(f"--{MJPEG_BOUNDARY}\r\n".encode())
-                self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                self.wfile.write(f"Content-Length: {len(data)}\r\n\r\n".encode())
-                self.wfile.write(data)
-                self.wfile.write(b"\r\n")
-                time.sleep(0.05)     # 스트림은 렌더 루프와 별개로 ~20fps 로 충분하다
-        except (BrokenPipeError, ConnectionResetError):
-            pass                     # 브라우저가 탭을 닫은 것 - 정상 종료
 
     def do_GET(self) -> None:
         u = urlparse(self.path)
@@ -4154,43 +4439,8 @@ class _ApiHandler(BaseHTTPRequestHandler):
             self._send(200 if ok else 409, {"ok": ok, "message": msg, **info})
             return
 
-        if path in ("/click", "/hover"):
-            try:
-                x = int(round(float(params["x"])))
-                y = int(round(float(params["y"])))
-            except (KeyError, TypeError, ValueError):
-                self._send(400, {"ok": False, "error": "x, y 를 숫자로 주세요"})
-                return
-            event = cv2.EVENT_LBUTTONDOWN if path == "/click" else cv2.EVENT_MOUSEMOVE
-            app.enqueue_mouse(event, x, y)
-            self._send(200, {"ok": True})
-            return
-
-        if path == "/key":
-            code = params.get("code", "")
-            key = 27 if code in ("Escape", "Esc") else (ord(code[0].lower()) if code else None)
-            if key is None:
-                self._send(400, {"ok": False, "error": "code 가 없습니다"})
-                return
-            app.enqueue_key(key)
-            self._send(200, {"ok": True})
-            return
-
-        if path == "/stream":
-            self._stream_mjpeg(app)
-            return
-
         if path == "/":
-            self._send_html(200, UI_HTML)
-            return
-
-        if path == "/api":
             self._send(200, {"ok": True, "endpoints": [
-                "GET /              브라우저 조작 페이지 (스트림 + 클릭 + 키보드)",
-                "GET /stream        MJPEG 영상 스트림",
-                "GET|POST /click   x,y (화면 픽셀) - 마우스 클릭과 동일",
-                "GET|POST /hover   x,y (화면 픽셀) - 마우스 이동(호버 좌표 표시)",
-                "GET|POST /key     code (q,h,o,c,r,d,w,k,t,s) - 키보드 단축키",
                 "GET /get_state  (= /status) 지금 무엇을 하는 중인지",
                 "GET|POST /pick   x,y (화면 픽셀)",
                 "GET|POST /place  x,y (화면 픽셀)",
@@ -4214,11 +4464,10 @@ def start_api(app: "App") -> Optional[ThreadingHTTPServer]:
         print(f"[api] 포트를 열지 못했다 ({e}) - REST 없이 계속한다")
         return None
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"[api] REST 대기: {API_HOST}:{API_PORT}  "
+    print(f"[api] REST 대기: http://{API_HOST}:{API_PORT}  "
           f"(/get_state /pick /place /get_rgb /get_depth)")
-    if API_HOST in ("0.0.0.0", ""):
-        print("      외부 접속 허용 (인증 없음 - 내부망에서만). "
-              "이 PC 에서만 열려면 PICK_API_HOST=127.0.0.1")
+    if API_HOST in ("127.0.0.1", "localhost"):
+        print("      다른 PC 에서 부르려면 $env:PICK_API_HOST='0.0.0.0' 로 실행할 것")
     return srv
 
 # ---------------------------------------------------------------------------
@@ -4226,12 +4475,12 @@ def start_api(app: "App") -> Optional[ThreadingHTTPServer]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if "--tcp" in sys.argv:
-        print("팔 TCP 확인은 calibrate_arm.py 로 옮겨졌다: python calibrate_arm.py --tcp")
+    if "--tcp" in sys.argv:            # 팔 TCP 만 확인하는 모드 (카메라를 열지 않는다)
+        monitor_tcp(os.environ.get("SO101_PORT") or find_so101_port() or "COM18")
         return
 
     source = open_depth_source()
-    arm = setup_arm()                  # 1/2: 팔 캘리브레이션 읽기
+    arm = setup_arm()                  # 1/2: 팔 캘리브레이션 확인/실행
     calib_now = want_handeye_calib(arm)   # 2/2: 카메라-로봇 캘리브레이션 확인/실행
     handeye = HandEye.load()
     app = App(source, arm, handeye)

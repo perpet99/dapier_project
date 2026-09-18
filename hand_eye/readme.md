@@ -19,8 +19,8 @@ Depth 카메라 화면에서 물체를 클릭하면 SO-101 팔이 집어서 옮�
 
 | 파일 | 역할 |
 |---|---|
-| `test4.py` | **본체.** UI, 기구학, pick/place, 팔 캘리브레이션, hand-eye 패널 전부 |
-| `calibrate_arm.py` | 팔 캘리브레이션 CLI 껍데기 (`test4.run_arm_calibration` 호출) |
+| `test4.py` | **본체.** 웹 UI, 기구학, pick/place, hand-eye 패널 |
+| `calibrate_arm.py` | **팔 캘리브레이션** (서보 영점 → 관절 리밋 → 부호/영점 → TCP 확인). `arm_calib.json` 을 만든다 |
 | `verify_arm.py` | 캘리브레이션 직후 관절 방향/부호를 단계적으로 검증 |
 | `calib_ui.py` | 팔 영점 확인용 별도 UI |
 | `handeye_auto.py`, `handeye_pnp.py` | hand-eye 를 다른 방식(자동/PnP)으로 푸는 실험 스크립트 |
@@ -35,10 +35,9 @@ Depth 카메라 화면에서 물체를 클릭하면 SO-101 팔이 집어서 옮�
 캘리브레이션 파일은 **스크립트 옆**에서 찾는다(`_HERE` 기준 절대경로). 어느 폴더에서 실행해도 된다.
 
 ```
-python hand_eye/test4.py              # 전체 실행
-python hand_eye/test4.py --tcp        # 카메라 없이 팔 TCP 만 실시간 확인
-python hand_eye/calibrate_arm.py COM18
-python hand_eye/calibrate_arm.py COM18 --tcp
+python hand_eye/calibrate_arm.py          # 팔 캘리브레이션 (포트 자동검출, 또는 /dev/ttyACM0 / COM18 지정)
+python hand_eye/calibrate_arm.py --tcp    # 카메라 없이 팔 TCP 만 실시간 확인
+python hand_eye/test4.py                  # 전체 실행
 ```
 
 실행하면 REST API 도 함께 뜬다 (기본 `127.0.0.1:8765`). → [7b절](#7b-rest-api--원격에서-좌표로-집기)
@@ -47,11 +46,11 @@ python hand_eye/calibrate_arm.py COM18 --tcp
 
 ## 2. 실행하면 벌어지는 일
 
-시작하면 캘리브레이션 상태부터 확인한다. 따로 스크립트를 먼저 돌릴 필요가 없다.
+시작하면 캘리브레이션 상태부터 확인한다. 팔 캘리브레이션은 `calibrate_arm.py` 로 먼저 만들어 둬야 한다.
 
 ```
 [1/2] 팔 캘리브레이션: arm_calib.json 이 없습니다.
-      지금 설정할까요? (Y/n) >          ← 있으면 "다시 설정할까요? (y/N)"
+      먼저 python calibrate_arm.py 로 캘리브레이션할 것.   ← 없으면 팔은 mock 으로 동작
 
 [2/2] 카메라-로봇 캘리브레이션: handeye.json 이 없습니다.
       탁상 위에서 실제로 집을 수 있는 위치 4곳 이상을 등록해야 합니다.
