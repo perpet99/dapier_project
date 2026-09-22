@@ -36,7 +36,7 @@ test4.py - Depth 기반 클릭 Pick & Place (SO-101)
 
 웹 UI / 원격 제어 (같은 HTTP 서버, 기본 0.0.0.0:8765 - 같은 네트워크에서 접속 가능):
   GET /            브라우저용 조작 페이지 (스트림 + 클릭 + 키보드)
-  GET /stream      MJPEG 영상 스트림
+  GET /stream      MJPEG 영상 스트림 (?fps=15&q=80, 기본값은 PICK_STREAM_FPS/QUALITY)
   GET|POST /click  x,y       화면 클릭과 동일 (pick/place/캘리브 점/버튼 히트테스트)
   GET|POST /hover  x,y       마우스 이동(호버 좌표 표시)
   GET|POST /key    code      키보드 단축키 1개 전달 (q,h,o,c,r,d,w,k,t,s)
@@ -315,7 +315,13 @@ class OpenNI2Source(DepthSource):
     # OpenNI2 런타임(libOpenNI2.so + OpenNI2/Drivers/liborbbec.so)을 찾을 위치
     REDIST_CANDIDATES = ("D:/OpenNI2/Redist", "C:/OpenNI2/Redist",
                          "C:/Program Files/OpenNI2/Redist",
-                         "/opt/openni2-orbbec", "/usr/local/lib/openni2-orbbec")
+                         "/opt/openni2-orbbec", "/usr/local/lib/openni2-orbbec",
+                         # ros2_astra_camera 를 빌드해 둔 PC 면 거기 든 Orbbec 런타임을 그대로 쓴다
+                         os.path.expanduser("~/ros2_ws/src/ros2_astra_camera/astra_camera/"
+                                            "openni2_redist/" + {"aarch64": "arm64",
+                                                                 "x86_64": "x64"}.get(
+                                                os.uname().machine if hasattr(os, "uname")
+                                                else "", "arm")))
 
     # 런타임 라이브러리 파일명은 OS 마다 다르다. 둘 다 받아준다.
     RUNTIME_NAMES = ("OpenNI2.dll", "libOpenNI2.so", "libOpenNI2.dylib")
@@ -680,12 +686,58 @@ def load_color_cam_index() -> Optional[int]:
         return None
 
 
+def linux_capture_nodes() -> list[tuple[int, str, str]]:
+    """Linux 의 영상 캡처 노드 목록. [(N, "VVVV:PPPP", 이름)] - /dev/videoN 순.
+
+    UVC 카메라 하나가 /dev/video 를 두 개(캡처 + 메타데이터) 만든다. 메타데이터
+    노드는 열려도 영상이 안 나오므로 sysfs 의 index 가 0 인 캡처 노드만 고른다.
+    """
+    base = "/sys/class/video4linux"
+    out = []
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return out
+    for dev in names:
+        if not dev.startswith("video") or not dev[5:].isdigit():
+            continue
+        d = os.path.join(base, dev)
+
+        def rd(*parts: str) -> str:
+            try:
+                with open(os.path.join(d, *parts)) as f:
+                    return f.read().strip()
+            except OSError:
+                return ""
+        vid, pid = rd("device", "..", "idVendor"), rd("device", "..", "idProduct")
+        if not vid or rd("index") not in ("", "0"):      # USB 가 아니거나 메타데이터 노드
+            continue
+        out.append((int(dev[5:]), f"{vid}:{pid}".lower(), rd("name")))
+    return sorted(out)
+
+
+def camera_index_cycle() -> list[int]:
+    """CAM 버튼이 돌아가며 열어 볼 번호들."""
+    if sys.platform.startswith("linux"):
+        nodes = [n for n, _, _ in linux_capture_nodes()]
+        if nodes:
+            return nodes
+    return [0, 1, 2, 3]
+
+
 def find_uvc_index(vid: str = ORBBEC_VID) -> tuple[Optional[int], str]:
     """UVC 카메라 목록에서 그 VID 장치가 몇 번째인지. (인덱스, 이름)
 
     OpenCV 는 장치 이름을 알려주지 않고 번호만 받는다. usbvideo 드라이버를 쓰는
     장치를 순서대로 세면 DirectShow 가 매기는 번호와 같은 순서가 된다.
+    Linux 는 sysfs 에 /dev/videoN 마다 USB VID 가 있어서 번호를 바로 안다.
     """
+    if sys.platform.startswith("linux"):
+        want = vid.upper().replace("VID_", "").lower()
+        for n, vp, name in linux_capture_nodes():
+            if vp.startswith(want + ":"):
+                return n, f"{name} (/dev/video{n}, {vp})"
+        return None, ""
     if os.name != "nt":
         return None, ""
     ps = ("Get-CimInstance Win32_PnPEntity -Filter \"Service='usbvideo'\" | "
@@ -721,8 +773,11 @@ class ColorCamera:
 
     def __init__(self, forced_index: Optional[str] = COLOR_CAM_INDEX):
         self.forced_index = int(forced_index) if forced_index not in (None, "") else None
-        if self.forced_index is None:
-            self.forced_index = load_color_cam_index()   # 사람이 골라 둔 번호
+        if self.forced_index is None and not (sys.platform.startswith("linux")
+                                              and find_uvc_index()[0] is not None):
+            # 사람이 골라 둔 번호. Linux 는 VID 로 정확히 찾으므로 그걸 먼저 쓴다 -
+            # USB 를 다시 꽂으면 /dev/videoN 번호가 바뀌어 저장된 번호가 빈 장치가 된다.
+            self.forced_index = load_color_cam_index()
         self.index: Optional[int] = None                 # 지금 열려 있는 번호
         self.note = ""                       # 화면에 띄울 상태 문구
         self.failed = False
@@ -778,7 +833,9 @@ class ColorCamera:
         # 열기에 실패했을 수도 있으므로 '요청한 번호' 를 우선으로 센다.
         # 열린 번호만 보면 실패한 자리에서 계속 맴돈다.
         cur = self.forced_index if self.forced_index is not None else self.index
-        nxt = ((cur if cur is not None else -1) + 1) % 4
+        cyc = camera_index_cycle()
+        nxt = (cyc[(cyc.index(cur) + 1) % len(cyc)] if cur in cyc
+               else next((i for i in cyc if cur is None or i > cur), cyc[0]))
         self.forced_index = nxt
         # 저장은 실제로 열린 뒤에 한다. 없는 번호를 저장해 두면 다음 실행이
         # 그 번호로 시작해서 매번 실패한다.
@@ -835,8 +892,10 @@ class ColorCamera:
             # 지정된 번호가 없는 장치일 수 있다(카메라 2대뿐인데 2번을 고른 경우).
             # 그러면 다음 번호로 넘어가며 열리는 것을 찾는다 - 사용자가 CAM 을
             # 눌러 빈 번호에 걸렸을 때 거기서 막히지 않게.
-            for k in range(4):
-                i = (self.forced_index + k) % 4
+            cyc = camera_index_cycle()
+            start = cyc.index(self.forced_index) if self.forced_index in cyc else 0
+            for k in range(len(cyc)):
+                i = cyc[(start + k) % len(cyc)]
                 cap = self._open_uvc(i, "지정된 번호" if k == 0 else "다음으로 열리는 번호")
                 if cap is not None:
                     if i != self.forced_index:
@@ -866,7 +925,7 @@ class ColorCamera:
         # 장면으로 확인한다. USB 열거 순서는 뽑았다 꽂으면 바뀌어서, VID 로 센
         # 번호가 노트북 웹캠을 가리키는 일이 실제로 생긴다. depth 센서와 같은
         # 장면을 보는 카메라가 우리가 찾는 것이다.
-        order = ([idx] if idx is not None else []) + [i for i in range(4) if i != idx]
+        order = ([idx] if idx is not None else []) + [i for i in camera_index_cycle() if i != idx]
         scores: list[tuple[int, int]] = []
         for i in order:
             frame = self._peek(i)
@@ -2410,6 +2469,105 @@ def colorize_depth(depth: np.ndarray,
     return vis, lo, hi
 
 
+# ---------------------------------------------------------------------------
+# 한글 텍스트
+# ---------------------------------------------------------------------------
+# cv2.putText 의 Hershey 폰트는 ASCII 만 있어서 한글이 전부 '?' 로 찍힌다.
+# 한글이 섞인 문자열만 PIL + TTF 로 그리고, ASCII 는 기존처럼 cv2 로 그린다.
+# 폰트를 못 찾거나 PIL 이 없으면 cv2 로 내려간다('?' 로 보이지만 죽지는 않는다).
+# 폰트 경로를 직접 주려면 HANDEYE_FONT=/path/to/font.ttf
+_FONT_CANDIDATES = (
+    os.environ.get("HANDEYE_FONT", ""),
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",            # apt: fonts-nanum
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",     # apt: fonts-noto-cjk
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf",
+    "C:/Windows/Fonts/malgun.ttf",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+)
+# Hershey SIMPLEX 의 scale 1.0 과 비슷한 글자 크기가 되는 TTF 픽셀 크기
+_FONT_PX_PER_SCALE = 30
+_font_cache: dict = {}
+_font_path: Optional[str] = None
+_font_warned = False
+
+
+def _get_font(scale: float):
+    """scale 에 맞는 PIL 폰트. 쓸 수 있는 폰트가 없으면 None."""
+    global _font_path, _font_warned
+    px = max(8, round(scale * _FONT_PX_PER_SCALE))
+    if px in _font_cache:
+        return _font_cache[px]
+    font = None
+    try:
+        from PIL import ImageFont
+        if _font_path is None:
+            _font_path = next((p for p in _FONT_CANDIDATES if p and os.path.isfile(p)), "")
+        if _font_path:
+            font = ImageFont.truetype(_font_path, px)
+    except ImportError:
+        pass
+    if font is None and not _font_warned:
+        _font_warned = True
+        print("[font] 한글 폰트(또는 Pillow)가 없어 한글이 '?' 로 보입니다. "
+              "sudo apt install fonts-nanum && pip install pillow")
+    _font_cache[px] = font
+    return font
+
+
+_text_cache: dict = {}
+
+
+def _text_mask(text: str, font, thickness: int):
+    """글자 모양 알파 마스크와 기준점(baseline 왼쪽) 기준 오프셋 (dx, dy)."""
+    key = (text, id(font), thickness)
+    hit = _text_cache.get(key)
+    if hit is not None:
+        return hit
+    from PIL import Image, ImageDraw
+    stroke = max(0, thickness - 1)
+    l, t, r, b = font.getbbox(text, anchor="ls", stroke_width=stroke)
+    w, h = max(1, r - l), max(1, b - t)
+    im = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(im).text((-l, -t), text, font=font, fill=255, anchor="ls",
+                            stroke_width=stroke, stroke_fill=255)
+    hit = (np.asarray(im, np.float32) / 255.0, l, t)
+    if len(_text_cache) > 512:        # 상태 문구가 계속 바뀌므로 무한히 쌓이지 않게
+        _text_cache.clear()
+    _text_cache[key] = hit
+    return hit
+
+
+def put_text(img: np.ndarray, text: str, org, scale: float, color,
+             thickness: int = 1) -> None:
+    """cv2.putText(FONT_HERSHEY_SIMPLEX, LINE_AA) 대체. org 는 baseline 왼쪽 (cv2 와 같다)."""
+    font = None if text.isascii() else _get_font(scale)
+    if font is None:
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color,
+                    thickness, cv2.LINE_AA)
+        return
+    mask, dx, dy = _text_mask(text, font, thickness)
+    x0, y0 = int(org[0]) + dx, int(org[1]) + dy
+    H, W = img.shape[:2]
+    mh, mw = mask.shape
+    ix0, iy0, ix1, iy1 = max(0, x0), max(0, y0), min(W, x0 + mw), min(H, y0 + mh)
+    if ix0 >= ix1 or iy0 >= iy1:
+        return
+    a = mask[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0, None]
+    roi = img[iy0:iy1, ix0:ix1]
+    roi[:] = (roi * (1.0 - a) + np.array(color, np.float32) * a).astype(img.dtype)
+
+
+def text_size(text: str, scale: float, thickness: int = 1) -> tuple[int, int]:
+    """cv2.getTextSize 대체: (폭, baseline 위 높이)."""
+    font = None if text.isascii() else _get_font(scale)
+    if font is None:
+        return cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0]
+    l, t, r, _ = font.getbbox(text, anchor="ls")
+    # 세로 가운데 정렬이 ASCII 버튼과 맞도록 높이는 대문자 기준으로 잡는다
+    return r - l, -font.getbbox("H", anchor="ls")[1]
+
+
 def draw_depth_scale(img: np.ndarray, lo: float, hi: float) -> None:
     """우측 하단에 컬러바와 근/원 거리 라벨을 그린다."""
     h, w = img.shape[:2]
@@ -2419,8 +2577,8 @@ def draw_depth_scale(img: np.ndarray, lo: float, hi: float) -> None:
     img[y0:y0 + bh, x0:x0 + bw] = bar
     cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (255, 255, 255), 1)
     for txt, ax in ((f"{lo*100:.0f}cm", x0 - 2), (f"{hi*100:.0f}cm", x0 + bw - 34)):
-        cv2.putText(img, txt, (ax, y0 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
-                    (255, 255, 255), 1, cv2.LINE_AA)
+        put_text(img, txt, (ax, y0 - 4), 0.38,
+                    (255, 255, 255), 1)
 
 
 VIEW_MODES = ("sensor", "depth", "color")
@@ -2443,8 +2601,8 @@ def draw_view_button(frame: np.ndarray, st: AppState) -> None:
            "color": (58, 96, 76)}[st.view]
     cv2.rectangle(frame, (x, y), (x + bw, y + bh), col, -1)
     cv2.rectangle(frame, (x, y), (x + bw, y + bh), (200, 200, 205), 1)
-    cv2.putText(frame, VIEW_LABEL[st.view], (x + 8, y + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 245), 1, cv2.LINE_AA)
+    put_text(frame, VIEW_LABEL[st.view], (x + 8, y + 18),
+                0.42, (240, 240, 245), 1)
 
 
 def draw_overlay(frame: np.ndarray, st: AppState, depth: np.ndarray,
@@ -2456,8 +2614,8 @@ def draw_overlay(frame: np.ndarray, st: AppState, depth: np.ndarray,
     for m in st.markers:
         cv2.drawMarker(out, m.uv, m.color, cv2.MARKER_CROSS, 20, 2)
         cv2.circle(out, m.uv, 12, m.color, 2)
-        cv2.putText(out, m.label, (m.uv[0] + 15, m.uv[1] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, m.color, 2, cv2.LINE_AA)
+        put_text(out, m.label, (m.uv[0] + 15, m.uv[1] - 10),
+                    0.5, m.color, 2)
 
     # 커서 아래 지점의 3D 정보
     u, v = st.hover
@@ -2474,8 +2632,8 @@ def draw_overlay(frame: np.ndarray, st: AppState, depth: np.ndarray,
                 txt += f"  base=({pb[0]:+.3f},{pb[1]:+.3f},{pb[2]:+.3f})"
         else:
             txt = f"({u},{v}) depth 없음"
-        cv2.putText(out, txt, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    (255, 255, 255), 1, cv2.LINE_AA)
+        put_text(out, txt, (10, h - 12), 0.45,
+                    (255, 255, 255), 1)
 
     # 상태 배너
     banner = {STATE_IDLE: (60, 140, 60), STATE_HOLDING: (30, 140, 220),
@@ -2484,29 +2642,28 @@ def draw_overlay(frame: np.ndarray, st: AppState, depth: np.ndarray,
         banner = (150, 60, 150)
     cv2.rectangle(out, (0, 0), (w, 52), banner, -1)
     head = "CALIB" if st.calibrating else st.mode
-    cv2.putText(out, head, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, st.status, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (255, 255, 255), 1, cv2.LINE_AA)
+    put_text(out, head, (10, 22), 0.7,
+                (255, 255, 255), 2)
+    put_text(out, st.status, (10, 44), 0.5,
+                (255, 255, 255), 1)
     if not he.calibrated and not st.calibrating:
-        cv2.putText(out, "hand-eye not calibrated: press 'k'", (w - 320, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        put_text(out, "hand-eye not calibrated: press 'k'", (w - 320, 22),
+                    0.45, (0, 255, 255), 1)
 
     draw_view_button(out, st)
     if st.color_display:
         cx, cy, cw, ch = cam_button_rect(w)
         cv2.rectangle(out, (cx, cy), (cx + cw, cy + ch), (70, 62, 58), -1)
         cv2.rectangle(out, (cx, cy), (cx + cw, cy + ch), (200, 200, 205), 1)
-        cv2.putText(out, f"CAM {st.cam_index}" if st.cam_index is not None else "CAM ?",
-                    (cx + 8, cy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                    (240, 240, 245), 1, cv2.LINE_AA)
+        put_text(out, f"CAM {st.cam_index}" if st.cam_index is not None else "CAM ?",
+                    (cx + 8, cy + 18), 0.42,
+                    (240, 240, 245), 1)
     if st.view_note:
-        cv2.putText(out, st.view_note, (10, h - 56), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (60, 200, 255), 1, cv2.LINE_AA)
+        put_text(out, st.view_note, (10, h - 56), 0.5, (60, 200, 255), 1)
     if st.view == "color" and st.color_readonly:
         # 비정렬 모드의 color 는 depth 와 안 맞는 별개 렌즈다. 여기서 클릭하면 엉뚱한 곳을 집는다.
-        cv2.putText(out, "color view only - use DEPTH_ALIGN mode to click", (10, h - 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 200, 255), 1, cv2.LINE_AA)
+        put_text(out, "color view only - use DEPTH_ALIGN mode to click", (10, h - 34),
+                    0.5, (60, 200, 255), 1)
     return out
 
 
@@ -2534,9 +2691,9 @@ class PanelButton:
         x, y, w, h = self.rect
         cv2.rectangle(img, (x, y), (x + w, y + h), self.col or (62, 62, 70), -1)
         cv2.rectangle(img, (x, y), (x + w, y + h), (96, 96, 104), 1)
-        (tw, th), _ = cv2.getTextSize(self.label, cv2.FONT_HERSHEY_SIMPLEX, self.scale, 1)
-        cv2.putText(img, self.label, (x + (w - tw) // 2, y + (h + th) // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, self.scale, P_FG, 1, cv2.LINE_AA)
+        tw, th = text_size(self.label, self.scale)
+        put_text(img, self.label, (x + (w - tw) // 2, y + (h + th) // 2),
+                    self.scale, P_FG, 1)
 
 
 class HandEyePanel:
@@ -2837,8 +2994,8 @@ class HandEyePanel:
             col = P_OK if err < 0.01 else (P_ACC if err < 0.03 else (60, 60, 255))
             cv2.drawMarker(frame, uv, col, cv2.MARKER_TILTED_CROSS, 14, 2)
             cv2.circle(frame, uv, 9, col, 1)
-            cv2.putText(frame, f"{i} {err*1000:.0f}mm", (uv[0] + 11, uv[1] - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
+            put_text(frame, f"{i} {err*1000:.0f}mm", (uv[0] + 11, uv[1] - 8),
+                        0.4, col, 1)
 
     # --- 재현성 검증 -------------------------------------------------------
     def verify_points(self) -> None:
@@ -3094,7 +3251,7 @@ class HandEyePanel:
         self.buttons = []
 
         def t(s, xy, sc=0.42, c=P_FG):
-            cv2.putText(img, s, xy, cv2.FONT_HERSHEY_SIMPLEX, sc, c, 1, cv2.LINE_AA)
+            put_text(img, s, xy, sc, c, 1)
 
         t("hand-eye 조절", (12, 24), 0.6, P_FG)
         cal = self.app.he.calibrated
@@ -3258,8 +3415,17 @@ class App:
         self._input_events: "queue.Queue[tuple]" = queue.Queue()
         self._display_lock = threading.Lock()
         self.last_display: Optional[np.ndarray] = None   # 스트림으로 내보낼 합성 화면
+        # 새 화면이 나올 때마다 번호를 올리고 기다리는 스트림을 깨운다. 스트림은
+        # 이미 보낸 번호보다 큰 '가장 최근' 화면만 가져가므로 중간 프레임은 버려진다.
+        self._display_cond = threading.Condition(self._display_lock)
+        self._display_seq = 0
+        self._jpeg_cache: dict = {}      # quality -> (seq, jpeg bytes), 접속자끼리 공유
         self._save_color: Optional[np.ndarray] = None     # 's' 키가 저장할 최신 컬러/depth
         self._save_depth: Optional[np.ndarray] = None
+        # 캘리브레이션 점의 콘솔 확정 (input() 이 run 루프를 막지 않게 별도 스레드)
+        self._calib_pending: Optional[tuple] = None      # (x, y, p_cam) 확정 대기 중
+        self._console_thread: Optional[threading.Thread] = None
+        self._stdin_eof = False
 
     # --- 로봇 동작 워커 (UI 프리즈 방지) ----------------------------------
     def _worker_loop(self) -> None:
@@ -3302,6 +3468,32 @@ class App:
         """MJPEG 스트림용 최신 합성 화면 (카메라 뷰 + 우측 패널)."""
         with self._display_lock:
             return None if self.last_display is None else self.last_display.copy()
+
+    def wait_display_jpeg(self, after_seq: int, quality: int,
+                          timeout: float = 1.0) -> Optional[tuple[int, bytes]]:
+        """after_seq 보다 새 화면이 나올 때까지 기다렸다가 (번호, JPEG) 를 준다.
+
+        기다리는 동안 여러 장이 쌓였어도 가장 최근 것 하나만 돌려준다. 인코딩은
+        번호/화질별로 한 번만 하고 접속자끼리 나눠 쓴다. 시간 안에 새 화면이 없으면 None.
+        """
+        with self._display_cond:
+            if not self._display_cond.wait_for(
+                    lambda: self._display_seq > after_seq or not self.running, timeout):
+                return None
+            if not self.running or self.last_display is None:
+                return None
+            seq, frame = self._display_seq, self.last_display
+            hit = self._jpeg_cache.get(quality)
+        if hit is not None and hit[0] == seq:
+            return hit
+        # run 루프는 매번 새 배열을 만들어 넣으므로 락 밖에서 인코딩해도 안전하다
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return None
+        hit = (seq, buf.tobytes())
+        with self._display_lock:
+            self._jpeg_cache[quality] = hit
+        return hit
 
     # --- 마우스 ------------------------------------------------------------
     def on_mouse(self, event: int, x: int, y: int, flags: int, param) -> None:
@@ -3594,10 +3786,54 @@ class App:
             print("        로봇 TCP 를 같은 물리적 지점에 대고 그 x y z [m] 를 입력 (건너뛰려면 s)")
             prompt = "        x y z > "
 
-        try:
-            raw = input(prompt).strip()
-        except EOFError:
-            raw = "s"
+        # 여기서 input() 으로 기다리면 run() 루프가 통째로 멈춰 웹 화면이 굳는다.
+        # 콘솔 입력은 별도 스레드가 받아 큐로 넘기고, 받은 줄로 _calib_confirm 을 부른다.
+        if self._calib_pending is not None:
+            print("[calib] 이전 클릭은 확정되지 않아 버리고 이 점으로 바꿉니다")
+        self._calib_pending = (x, y, p_cam)
+        if self._stdin_eof:              # 입력을 받을 수 없는 환경 -> 건너뜀
+            self._calib_confirm("s")
+            return
+        self.st.status = "콘솔에서 Enter 로 확정하세요 (s = 건너뜀)"
+        print(prompt, end="", flush=True)
+        self._start_console_reader()
+
+    def _start_console_reader(self) -> None:
+        """콘솔 한 줄씩 읽어 ("console", 줄) 이벤트로 넘기는 스레드를 한 번만 띄운다."""
+        if self._console_thread is not None:
+            return
+
+        def loop() -> None:
+            while self.running:
+                try:
+                    line = input()
+                except (EOFError, OSError):
+                    self._input_events.put(("console", None))
+                    return
+                self._input_events.put(("console", line))
+
+        self._console_thread = threading.Thread(target=loop, daemon=True)
+        self._console_thread.start()
+
+    def _on_console_line(self, line: Optional[str]) -> None:
+        if line is None:                  # 입력 불가(파이프 실행 등) -> 건너뜀
+            self._stdin_eof = True
+            line = "s"
+        if self._calib_pending is None:   # 기다리는 점이 없을 때의 입력은 무시
+            return
+        self._calib_confirm(line)
+
+    def _calib_confirm(self, raw: str) -> None:
+        """콘솔 입력으로 대기 중인 캘리브레이션 점을 확정한다 (run 루프 스레드)."""
+        if self._calib_pending is None:
+            return
+        x, y, p_cam = self._calib_pending
+        self._calib_pending = None
+        n = len(self.st.calib_cam) + 1
+        raw = raw.strip()
+        if not self.st.calibrating:
+            print("[calib] 캘리브레이션 모드가 끝나 이 점은 버립니다")
+            return
 
         if raw.lower() == "s":
             print("[calib] 건너뜀")
@@ -3728,6 +3964,8 @@ class App:
                 _, code = item
                 if not self.handle_key(code):
                     self.running = False
+            elif kind == "console":
+                self._on_console_line(item[1])
 
     def handle_key(self, key: int) -> bool:
         """웹 UI에서 넘어온 키 1개 처리. False 를 돌려주면 앱을 종료한다.
@@ -3878,15 +4116,16 @@ class App:
                                      self.depth_est)
                 self.panel.draw_points(frame, self.src.intr)
                 if reach_note:
-                    cv2.putText(frame, reach_note, (10, 74), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.45, (120, 255, 120), 1, cv2.LINE_AA)
+                    put_text(frame, reach_note, (10, 74), 0.45, (120, 255, 120), 1)
                 if lo is not None:
                     draw_depth_scale(frame, lo, hi)
                 self.last_frame = frame
                 self._save_color, self._save_depth = color, depth   # 's' 키용
                 display = np.hstack([frame, self.panel.draw(frame.shape[0])])
-                with self._display_lock:
+                with self._display_cond:
                     self.last_display = display
+                    self._display_seq += 1
+                    self._display_cond.notify_all()
 
                 # 실기(카메라)가 자체적으로 프레임레이트를 맞춰 self.src.read() 에서
                 # 블로킹되는 것과 달리, SyntheticSource 등은 즉시 리턴하므로 여기서
@@ -3935,6 +4174,17 @@ class App:
 API_HOST = os.environ.get("PICK_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("PICK_API_PORT", "8765"))
 
+# /stream 전송 설정. 접속마다 /stream?fps=10&q=70 으로 바꿀 수 있고, 웹 UI 에도 선택 칸이 있다.
+#   PICK_STREAM_FPS      최대 전송 프레임 (기본 15). 화면 갱신보다 빠르게는 못 보낸다.
+#   PICK_STREAM_QUALITY  JPEG 화질 1~100 (기본 80). 낮출수록 가볍다.
+STREAM_FPS = float(os.environ.get("PICK_STREAM_FPS", "15"))
+STREAM_QUALITY = int(os.environ.get("PICK_STREAM_QUALITY", "80"))
+STREAM_FPS_MAX = 60.0
+# 커널 송신 버퍼. 기본(자동 조절, 수 MB)이면 네트워크가 느릴 때 프레임 수십 장이
+# 버퍼에 쌓여 화면이 몇 초씩 밀린다. 한두 장 크기로 묶어 두면 쓰기가 막히는 동안
+# 새 프레임은 버려지고, 풀리면 그 시점의 최신 화면을 보낸다.
+STREAM_SNDBUF = 64 * 1024
+
 
 def api_urls() -> list[str]:
     """브라우저에 입력할 주소. 0.0.0.0 은 주소가 아니므로 실제 LAN IP 로 바꿔 보여준다."""
@@ -3957,19 +4207,44 @@ MJPEG_BOUNDARY = "so101frame"
 # /stream 이 MJPEG 로 내보내고, 클릭/마우스이동/키보드는 각각 /click, /hover, /key 로
 # 그대로 넘긴다 - 실제 판단은 App.on_mouse / App.handle_key 가 하므로 이 페이지는
 # 입력을 좌표/코드로 바꿔 보내기만 한다.
+_FPS_OPTIONS = "".join(f'<option value="{v}">{v} fps</option>' for v in (1, 2, 5, 10, 15, 20, 30))
+_Q_OPTIONS = "".join(f'<option value="{v}">{v}</option>' for v in (40, 60, 80, 95))
 UI_HTML = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{WINDOW}</title>
 <style>
   html, body {{ margin: 0; background: #111; color: #ddd; font-family: monospace; }}
   #v {{ display: block; max-width: 100vw; height: auto; cursor: crosshair; }}
   #hint {{ padding: 4px 8px; font-size: 12px; opacity: .75; }}
+  #bar {{ padding: 4px 8px; font-size: 12px; }}
+  #bar select {{ background: #222; color: #ddd; border: 1px solid #555; font: inherit; }}
 </style></head>
 <body>
-  <img id="v" src="/stream">
+  <img id="v">
+  <div id="bar">전송 프레임
+    <select id="fps">{_FPS_OPTIONS}</select>
+    화질 <select id="q">{_Q_OPTIONS}</select>
+  </div>
   <div id="hint">클릭 = pick/place/캘리브 점 | 키(포커스가 이 탭에 있을 때):
     q 종료  h 홈  o/c 그리퍼  r 리셋  d 뷰전환  w 도달영역  k 캘리브  t 토크  s 저장</div>
 <script>
 const img = document.getElementById('v');
+const fpsSel = document.getElementById('fps'), qSel = document.getElementById('q');
+function loadPref(k, d) {{ try {{ return localStorage.getItem(k) || d; }} catch (e) {{ return d; }} }}
+function pick(sel, v) {{   // 목록에 없는 값(서버 기본값)이면 항목을 추가해서 고른다
+  if (![...sel.options].some(o => o.value === String(v))) sel.add(new Option(v, v));
+  sel.value = String(v);
+}}
+pick(fpsSel, loadPref('fps', '{STREAM_FPS:g}'));
+pick(qSel, loadPref('q', '{STREAM_QUALITY}'));
+function restartStream() {{
+  // 스트림을 새로 연다. src 를 먼저 비워야 이전 연결이 확실히 끊긴다.
+  img.src = '';
+  img.src = `/stream?fps=${{fpsSel.value}}&q=${{qSel.value}}&t=${{Date.now()}}`;
+  try {{ localStorage.setItem('fps', fpsSel.value); localStorage.setItem('q', qSel.value); }} catch (e) {{}}
+}}
+fpsSel.addEventListener('change', restartStream);
+qSel.addEventListener('change', restartStream);
+restartStream();
 function toImageXY(e) {{
   const r = img.getBoundingClientRect();
   const sx = img.naturalWidth / r.width, sy = img.naturalHeight / r.height;
@@ -3988,7 +4263,7 @@ img.addEventListener('mousemove', e => {{
   fetch(`/hover?x=${{x}}&y=${{y}}`);
 }});
 document.addEventListener('keydown', e => {{
-  if (e.repeat) return;
+  if (e.repeat || e.target.tagName === 'SELECT') return;   // 선택 칸 조작은 단축키가 아니다
   const code = e.key === 'Escape' ? 'Escape' : e.key;
   fetch(`/key?code=${{encodeURIComponent(code)}}`);
 }});
@@ -4038,30 +4313,52 @@ class _ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _stream_mjpeg(self, app: "App") -> None:
-        """cv2.imshow 대신: 합성 화면(카메라+패널)을 MJPEG 로 계속 내보낸다."""
+    def _stream_mjpeg(self, app: "App", params: dict) -> None:
+        """cv2.imshow 대신: 합성 화면(카메라+패널)을 MJPEG 로 계속 내보낸다.
+
+        밀리지 않게 하는 게 핵심이다. 늘 '지금 가장 최신' 화면 하나만 보내고,
+        보내는 동안 나온 프레임은 버린다. 같은 화면을 다시 보내지도 않는다.
+        """
+        try:
+            fps = float(params.get("fps", STREAM_FPS))
+            quality = int(params.get("q", STREAM_QUALITY))
+        except ValueError:
+            self._send(400, {"ok": False, "error": "fps, q 는 숫자로 주세요"})
+            return
+        fps = min(max(fps, 0.5), STREAM_FPS_MAX)
+        quality = min(max(quality, 10), 100)
+        interval = 1.0 / fps
+
+        try:
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STREAM_SNDBUF)
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         self.send_response(200)
         self.send_header("Age", "0")
         self.send_header("Cache-Control", "no-cache, private")
         self.send_header("Content-Type",
                          f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}")
         self.end_headers()
+        sent_seq = 0
+        next_t = time.monotonic()
         try:
             while app.running:
-                frame = app.latest_display()
-                if frame is None:
-                    time.sleep(0.05)
+                wait = next_t - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                got = app.wait_display_jpeg(sent_seq, quality)
+                if got is None:
                     continue
-                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if not ok:
-                    continue
-                data = buf.tobytes()
-                self.wfile.write(f"--{MJPEG_BOUNDARY}\r\n".encode())
-                self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                self.wfile.write(f"Content-Length: {len(data)}\r\n\r\n".encode())
-                self.wfile.write(data)
-                self.wfile.write(b"\r\n")
-                time.sleep(0.05)     # 스트림은 렌더 루프와 별개로 ~20fps 로 충분하다
+                sent_seq, data = got
+                # 헤더와 본문을 한 번에 써서 조각난 패킷이 따로 나가지 않게 한다
+                self.wfile.write(b"".join((
+                    f"--{MJPEG_BOUNDARY}\r\n".encode(),
+                    b"Content-Type: image/jpeg\r\n",
+                    f"Content-Length: {len(data)}\r\n\r\n".encode(),
+                    data, b"\r\n")))
+                # 전송이 오래 걸렸으면(느린 망) 밀린 시간을 따라잡으려 몰아 보내지 않는다
+                next_t = max(next_t + interval, time.monotonic())
         except (BrokenPipeError, ConnectionResetError):
             pass                     # 브라우저가 탭을 닫은 것 - 정상 종료
 
@@ -4177,7 +4474,7 @@ class _ApiHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/stream":
-            self._stream_mjpeg(app)
+            self._stream_mjpeg(app, params)
             return
 
         if path == "/":
@@ -4187,7 +4484,7 @@ class _ApiHandler(BaseHTTPRequestHandler):
         if path == "/api":
             self._send(200, {"ok": True, "endpoints": [
                 "GET /              브라우저 조작 페이지 (스트림 + 클릭 + 키보드)",
-                "GET /stream        MJPEG 영상 스트림",
+                "GET /stream        MJPEG 영상 스트림 (?fps=15&q=80)",
                 "GET|POST /click   x,y (화면 픽셀) - 마우스 클릭과 동일",
                 "GET|POST /hover   x,y (화면 픽셀) - 마우스 이동(호버 좌표 표시)",
                 "GET|POST /key     code (q,h,o,c,r,d,w,k,t,s) - 키보드 단축키",

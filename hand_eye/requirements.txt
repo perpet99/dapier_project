@@ -1,0 +1,23 @@
+# hand_eye 실행에 필요한 패키지
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# 웹 UI 의 한글 표시에는 한글 폰트도 필요하다 (Linux: sudo apt install fonts-nanum)
+
+# --- 필수 (test4.py, calib_ui.py, handeye_*.py, aim_camera.py, api_client.py) ---
+opencv-python>=4.8        # imshow 를 쓰는 스크립트가 있어 headless 가 아닌 일반 빌드
+numpy>=1.24
+pyserial>=3.5             # SO-101 (Feetech STS3215) 직접 제어
+pillow>=10.0              # 화면에 한글 텍스트 그리기
+
+# --- llm_client.py ---
+google-genai
+pydantic>=2
+
+# --- 선택: depth 카메라 SDK (없으면 합성 depth 데모 모드로 동작) ---
+# primesense              # Orbbec Astra Pro (OpenNI2 런타임 별도 설치 필요)
+# pyorbbecsdk             # Orbbec SDK v2 지원 모델
+# pyrealsense2            # Intel RealSense
+
+# --- 선택: lerobot 백엔드로 팔을 제어할 때 ---
+# lerobot[feetech]
