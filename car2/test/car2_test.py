@@ -5,9 +5,9 @@ car2.ino(ST3215 4륜 자동차) 시리얼 테스트 스크립트.
     pip install pyserial
 
 사용법:
-    python car2_test.py --port /dev/ttyUSB0            # 전체 자동 테스트
-    python car2_test.py --port COM5 --test wheels      # 바퀴별 방향 점검만
-    python car2_test.py --port /dev/ttyUSB0 --keyboard # 키보드(WASD) 조종
+    python car2_test.py --port /dev/ttyS0              # 전체 자동 테스트 (라즈베리파이 GPIO UART)
+    python car2_test.py --port COM5 --test wheels      # 바퀴별 방향 점검만 (USB 연결 시)
+    python car2_test.py --port /dev/ttyS0 --keyboard   # 키보드(WASD) 조종
 
 !! 첫 테스트는 반드시 차체를 들어 바퀴가 공중에 뜬 상태에서 진행 !!
 

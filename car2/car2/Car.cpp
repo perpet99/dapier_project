@@ -2,7 +2,7 @@
 
 // 장착 방향에 따른 회전 반전 여부 {FL, FR, RL, RR}
 // 전진 명령 시 바퀴가 반대로 돌면 해당 값을 바꾼다
-static const bool INVERT_DEFAULT[4] = {false, true, false, true};
+static const bool INVERT_DEFAULT[4] = {true, false, true, false};
 
 Car::Car(uint8_t idFL, uint8_t idFR, uint8_t idRL, uint8_t idRR)
   : _ids{idFL, idFR, idRL, idRR}, _acc(50) {
