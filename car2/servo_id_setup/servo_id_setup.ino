@@ -9,6 +9,7 @@
 //   WHEEL,<id>        : 해당 서보를 바퀴(연속 회전) 모드로 EEPROM에 저장
 //   SERVO,<id>        : 해당 서보를 위치(서보) 모드로 EEPROM에 되돌림
 //   SPIN,<id>,<speed> : 바퀴 모드에서 회전 테스트 (speed: -3400~3400, 0=정지)
+//   DIAG              : SCAN 실패 시 보레이트/핀 조합별 브로드캐스트 Ping 진단
 //   HELP              : 명령 목록
 //
 // 권장 ID 배치 (car2.ino와 동일)
@@ -40,7 +41,7 @@ void loop() {
 
 void printHelp() {
   Serial.println("=== ST3215 ID SETUP ===");
-  Serial.println("SCAN | ID,<old>,<new> | WHEEL,<id> | SERVO,<id> | SPIN,<id>,<speed> | HELP");
+  Serial.println("SCAN | DIAG | ID,<old>,<new> | WHEEL,<id> | SERVO,<id> | SPIN,<id>,<speed> | HELP");
   Serial.println("* ID 변경 시 버스에 서보 1개만 연결할 것");
 }
 
@@ -68,6 +69,33 @@ void scan() {
     }
   }
   Serial.printf("SCAN 완료: %d개 발견\n", found);
+}
+
+// 스캔 실패 시 원인 진단: 보레이트 × 핀(정상/RX-TX 뒤바뀜) 조합마다 브로드캐스트 Ping(0xFE)
+// 브로드캐스트 Ping은 ID와 무관하게 서보 1개가 응답하므로, 서보 1개만 연결한 상태에서 사용
+void diag() {
+  const long bauds[] = {1000000, 500000, 250000, 128000, 115200, 76800, 57600, 38400};
+  const int pins[2][2] = {{S_RXD, S_TXD}, {S_TXD, S_RXD}};
+  Serial.println("DIAG 시작 (브로드캐스트 Ping)...");
+  bool any = false;
+  for (int p = 0; p < 2; p++) {
+    for (long baud : bauds) {
+      Serial1.end();
+      Serial1.begin(baud, SERIAL_8N1, pins[p][0], pins[p][1]);
+      delay(20);
+      int id = st.Ping(0xFE);
+      Serial.printf("  RX=%d TX=%d %7ld bps : %s", pins[p][0], pins[p][1], baud,
+                    id >= 0 ? "응답" : "-");
+      if (id >= 0) { Serial.printf(" ID=%d", id); any = true; }
+      Serial.println();
+    }
+  }
+  // 원래 설정으로 복구
+  Serial1.end();
+  Serial1.begin(1000000, SERIAL_8N1, S_RXD, S_TXD);
+  if (!any) {
+    Serial.println("DIAG: 전 조합 무응답 -> 서보 전원(DC 7~12V) / 커넥터 / 케이블 확인");
+  }
 }
 
 void changeId(int oldId, int newId) {
@@ -109,6 +137,8 @@ void setMode(int id, int mode) {
 void handleCommand(const String &line) {
   if (line == "SCAN") {
     scan();
+  } else if (line == "DIAG") {
+    diag();
   } else if (line == "HELP") {
     printHelp();
   } else if (line.startsWith("ID,")) {
