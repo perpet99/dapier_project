@@ -5,6 +5,7 @@
 - `car2/car2.ino` : 자동차 메인 스케치. 시리얼 명령으로 4바퀴 제어, 명령 끊기면 자동 정지
 - `car2/Car.h`, `car2/Car.cpp` : ST3215 4개를 바퀴 모드로 묶어 제어하는 클래스 (좌/우 반전 처리 포함)
 - `test/car2_test.py` : PC(파이썬)에서 PING/상태/바퀴 방향/주행/타임아웃 자동 테스트 + 키보드 조종
+- `test/car2_web.py` : 웹 UI(방향키/버튼 조종) + REST API 서버 — API 문서는 [`test/car2_web_api.md`](test/car2_web_api.md)
 
 ## 바퀴 배치 / ID
 ```
