@@ -26,7 +26,6 @@ def generate_launch_description():
     params_file = LaunchConfiguration('params_file')
     use_rviz = LaunchConfiguration('use_rviz')
     serial_port = LaunchConfiguration('serial_port')
-    car2_api_url = LaunchConfiguration('car2_api_url')
     wheel_radius_m = LaunchConfiguration('wheel_radius_m')
     wheel_separation_m = LaunchConfiguration('wheel_separation_m')
 
@@ -35,7 +34,6 @@ def generate_launch_description():
             os.path.join(bringup_share, 'launch', 'bringup.launch.py')),
         launch_arguments={
             'serial_port': serial_port,
-            'car2_api_url': car2_api_url,
             'wheel_radius_m': wheel_radius_m,
             'wheel_separation_m': wheel_separation_m,
         }.items(),
@@ -63,7 +61,6 @@ def generate_launch_description():
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('use_rviz', default_value='true'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('car2_api_url', default_value=''),
         DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
         DeclareLaunchArgument('wheel_separation_m', default_value='0.18'),
         bringup,

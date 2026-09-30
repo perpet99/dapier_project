@@ -20,9 +20,9 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
@@ -37,10 +37,9 @@ def generate_launch_description():
         bringup_share, '..', '..', '..', '..', 'third_party', 'orbbec_openni2'))
 
     serial_port = LaunchConfiguration('serial_port')
-    car2_api_url = LaunchConfiguration('car2_api_url')
-    # Non-empty car2_api_url -> drive the car remotely via car2_web.py's REST
-    # API (car2_http_node) instead of a local serial port (car2_serial_node).
-    use_http = PythonExpression(["'", car2_api_url, "' != ''"])
+    # use_car2_driver:=false leaves the car driver out so it can run in its own
+    # terminal (scripts/run_car2_driver.sh) and be restarted independently.
+    use_car2_driver = LaunchConfiguration('use_car2_driver')
     wheel_radius_m = LaunchConfiguration('wheel_radius_m')
     wheel_separation_m = LaunchConfiguration('wheel_separation_m')
     camera_namespace = LaunchConfiguration('camera_namespace')
@@ -55,11 +54,8 @@ def generate_launch_description():
     openni2_lib_override_dir = LaunchConfiguration('openni2_lib_override_dir')
 
     return LaunchDescription([
+        DeclareLaunchArgument('use_car2_driver', default_value='true'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument(
-            'car2_api_url', default_value='',
-            description='car2_web.py base URL, e.g. http://192.168.0.31:8766. '
-                        'Empty = use the local serial_port instead.'),
         DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
         DeclareLaunchArgument('wheel_separation_m', default_value='0.18'),
         DeclareLaunchArgument('camera_namespace', default_value='camera'),
@@ -94,20 +90,7 @@ def generate_launch_description():
                 'wheel_radius_m': wheel_radius_m,
                 'wheel_separation_m': wheel_separation_m,
             }],
-            condition=UnlessCondition(use_http),
-        ),
-
-        Node(
-            package='car2_driver',
-            executable='car2_http_node',
-            name='car2_http_node',
-            output='screen',
-            parameters=[{
-                'api_url': car2_api_url,
-                'wheel_radius_m': wheel_radius_m,
-                'wheel_separation_m': wheel_separation_m,
-            }],
-            condition=IfCondition(use_http),
+            condition=IfCondition(use_car2_driver),
         ),
 
         Node(

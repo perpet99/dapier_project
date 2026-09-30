@@ -24,7 +24,6 @@ setup(
     entry_points={
         'console_scripts': [
             'car2_serial_node = car2_driver.car2_serial_node:main',
-            'car2_http_node = car2_driver.car2_http_node:main',
         ],
     },
 )

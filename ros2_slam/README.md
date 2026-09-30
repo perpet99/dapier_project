@@ -131,10 +131,19 @@ odometry를 적분합니다(위치값 pos는 회전마다 랩어라운드되는 
 
 ### 1) 맵 수집
 
-터미널 A:
+터미널 A (카메라 + depth->scan + slam_toolbox + RViz):
 ```bash
 cd ros2_slam
-./scripts/run_mapping.sh /dev/ttyUSB0
+./scripts/run_mapping.sh                 # RViz 없이: ./scripts/run_mapping.sh use_rviz:=false
+```
+RViz(`car2_bringup/rviz/mapping.rviz`)가 같이 뜨며 `/map`, `/scan`, TF, `/odom`을
+`map` 프레임 기준으로 보여줍니다. 왼쪽 SlamToolboxPlugin 패널의 **Save Map**으로도
+맵을 저장할 수 있습니다. (depth Image 디스플레이는 SlamToolboxPlugin과 함께 쓰면
+rviz2가 시작 시 segfault 나서 넣지 않았습니다.)
+
+car2 드라이버는 따로 실행합니다 (로컬 시리얼 또는 로봇 쪽 Raspberry Pi에서):
+```bash
+./scripts/run_car2_driver.sh /dev/ttyUSB0
 ```
 
 터미널 B (주행):
