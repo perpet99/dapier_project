@@ -150,8 +150,8 @@ car2 드라이버는 따로 실행합니다 (로컬 시리얼 또는 로봇 쪽 
 ```bash
 cd ros2_slam
 ./scripts/run_teleop.sh
-```
 
+```
 터미널 C (맵이 충분히 쌓이면 저장):
 ```bash
 cd ros2_slam
@@ -173,6 +173,68 @@ RViz에서:
 `myrobot_ws`의 `go_to_pose_service` 패턴처럼 좌표를 코드/서비스로 넘기고
 싶다면 `nav2_simple_commander`(이미 설치됨)를 사용하는 작은 스크립트를
 추가하면 됩니다 (`myrobot_ws/src/myrobot_nav_service` 참고).
+
+### 3) RTAB-Map 원격 매핑 (로봇: Pi, 매핑: 노트북)
+
+로봇(Raspberry Pi, `user@192.168.0.31`)에는 car2 드라이버와 Astra Pro 카메라만
+띄우고, 압축 영상을 WiFi로 받아 노트북에서 RTAB-Map(RGB-D SLAM)을 돌립니다.
+
+```
+[Pi] robot_rgbd.launch.py                       [노트북] rtabmap_mapping.launch.py
+  car2_serial_node   -> /odom, TF odom->base_link ─────► rtabmap (odom은 /odom 토픽으로 동기화)
+  openni2 (depth 320x240@10) -> .../compressedDepth ───► 압축 해제 -> depth_image_proc/register
+  usb_cam (RGB 640x480@30, JPEG 60) -> .../compressed ─► 압축 해제 ──┘   (depth -> RGB 프레임)
+  static TF base_link->camera_*                            rgbd_sync -> rtabmap -> /map, 3D 맵, map->odom
+```
+
+Astra Pro의 RGB는 OpenNI2가 못 여는 별도 UVC 장치라서 `usb_cam`으로 받고,
+depth를 RGB 프레임으로 맞추는 정합(register)은 노트북에서 합니다.
+
+**준비 (최초 1회)**
+- 노트북: `sudo apt install ros-jazzy-rtabmap-ros ros-jazzy-image-transport-plugins`
+- Pi: `sudo apt install ros-jazzy-openni2-camera ros-jazzy-usb-cam ros-jazzy-image-transport-plugins`
+- 노트북에서 코드를 Pi로 배포·빌드 (Pi의 `~/ros2_slam_robot`에 복사하므로 Pi의 git
+  클론은 건드리지 않음. 첫 배포 때 Orbbec OpenNI2 arm64 런타임도 설치):
+  ```bash
+  ./scripts/deploy_to_robot.sh            # 기본 user@192.168.0.31
+  ```
+  코드를 고칠 때마다 다시 실행하면 됩니다.
+
+**실행** (모든 터미널이 같은 `ROS_DOMAIN_ID`여야 함. 스크립트 기본값은 42이고,
+노트북·Pi의 `~/.bashrc`는 99를 export하므로 헷갈리지 않게 한쪽으로 맞추세요)
+```bash
+# Pi (ssh user@192.168.0.31)
+cd ~/ros2_slam_robot && ./scripts/run_robot_rgbd.sh
+#   RGB 장치가 /dev/video0이 아니면: ./scripts/run_robot_rgbd.sh video_device:=/dev/video1
+#   (스크립트가 시작할 때 v4l2-ctl로 찾은 Astra 장치를 보여줌)
+
+# 노트북
+./scripts/run_rtabmap_mapping.sh                    # 기존 DB(maps/rtabmap.db)에 이어서
+./scripts/run_rtabmap_mapping.sh new_map:=true      # DB 지우고 새로 시작
+./scripts/run_rtabmap_mapping.sh use_rtabmap_viz:=true   # RTAB-Map 자체 GUI도 같이
+./scripts/run_teleop.sh                             # 주행
+./scripts/save_map.sh my_map                        # 2D 격자(/map) 저장 -> Nav2용
+```
+RViz(`car2_bringup/rviz/rtabmap.rviz`)에는 3D 컬러 맵(MapCloud), 포즈 그래프
+(MapGraph, 루프 클로저는 빨간 선), 2D 점유 격자, RGB 영상이 표시됩니다.
+
+**주의**
+- **car2 드라이버는 하나만** 띄우세요. `robot_rgbd.launch.py`에 드라이버가 포함돼
+  있으므로 `run_car2_driver.sh`를 같이 띄우면 두 프로세스가 `/dev/ttyS0`를 두고
+  경쟁해 STAT 응답이 깨지고 `/odom`이 수 초씩 끊깁니다(실측: 60초에 147/600개).
+  드라이버를 따로 띄우고 싶으면 `run_robot_rgbd.sh use_car2_driver:=false`.
+- RGB 내부 파라미터(`config/astra_pro_rgb.yaml`)는 **임시값**입니다. 정합과 맵
+  정확도를 위해 `camera_calibration`으로 보정하고 `rgb_camera_info_url:=file://...`로
+  지정하세요 (yaml 상단에 명령 있음).
+- 로봇 쪽 odometry는 10Hz(`odom_poll_every_n:=2`)로 올려 두었습니다.
+- WiFi 대역폭(실측): depth 30Hz + JPEG 품질 95로는 노트북에 4~6Hz밖에 안 와서,
+  depth는 `depth_skip:=2`(10Hz), RGB JPEG 품질은 60(`config/robot_rgb_transport.yaml`)으로
+  낮췄습니다. 합계 약 1MB/s.
+- RGB는 카메라 기본값인 30fps로 받습니다. 10fps로 요청하면 V4L2 버퍼에 프레임이
+  쌓여 약 1.1초 지난 영상이 나와 depth와 짝이 맞지 않습니다(30fps에서도 RGB는
+  depth보다 약 0.5초 늦게 도착하므로 노트북 쪽 동기화 큐를 30으로 두었습니다).
+- 실행 직후 30초 정도는 `Did not receive data` 경고가 날 수 있습니다. 그 뒤로는
+  안정적으로 갱신됩니다.
 
 ## 트러블슈팅
 
