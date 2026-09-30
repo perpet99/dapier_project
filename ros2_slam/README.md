@@ -148,8 +148,8 @@ car2 드라이버는 따로 실행합니다 (로컬 시리얼 또는 로봇 쪽 
 
 터미널 B (주행):
 ```bash
-source /opt/ros/jazzy/setup.bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
+cd ros2_slam
+./scripts/run_teleop.sh
 ```
 
 터미널 C (맵이 충분히 쌓이면 저장):

@@ -6,7 +6,7 @@ set -euo pipefail
 # starts the driver). Must use the same ROS_DOMAIN_ID as run_mapping.sh.
 #
 # Usage: ./scripts/run_car2_driver.sh [serial_port] [extra ROS args...]
-#   e.g. ./scripts/run_car2_driver.sh /dev/ttyUSB0 -p wheel_radius_m:=0.033
+#   e.g. ./scripts/run_car2_driver.sh /dev/ttyS0 -p wheel_radius_m:=0.033
 
 if [[ -z "${ROS_DISTRO:-}" ]]; then
   echo "ROS_DISTRO is not set. Example: export ROS_DISTRO=jazzy"
@@ -15,7 +15,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WS_DIR="$(dirname "$SCRIPT_DIR")"
-SERIAL_PORT="${1:-/dev/ttyUSB0}"
+SERIAL_PORT="${1:-/dev/ttyS0}"
 shift || true
 
 # Avoid colliding with other ROS2 traffic on the default domain (0) or any

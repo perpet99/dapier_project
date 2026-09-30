@@ -28,9 +28,7 @@ set -u
 
 echo "In other terminals (same ROS_DOMAIN_ID=${ROS_DOMAIN_ID}!):"
 echo "  1) car2 driver : ROS_DOMAIN_ID=${ROS_DOMAIN_ID} ${SCRIPT_DIR}/run_car2_driver.sh [serial_port]"
-echo "  2) teleop      : export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
-echo "                   source /opt/ros/${ROS_DISTRO}/setup.bash"
-echo "                   ros2 run teleop_twist_keyboard teleop_twist_keyboard"
+echo "  2) teleop      : ROS_DOMAIN_ID=${ROS_DOMAIN_ID} ${SCRIPT_DIR}/run_teleop.sh"
 echo ""
 
 exec ros2 launch car2_bringup mapping.launch.py use_car2_driver:=false "$@"
