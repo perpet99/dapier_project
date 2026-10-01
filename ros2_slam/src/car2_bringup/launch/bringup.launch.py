@@ -57,7 +57,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_car2_driver', default_value='true'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
-        DeclareLaunchArgument('wheel_separation_m', default_value='0.18'),
+        DeclareLaunchArgument('wheel_separation_m', default_value='0.43'),
         DeclareLaunchArgument('camera_namespace', default_value='camera'),
         # openni2_camera (ros-drivers, jazzy branch) publishes the unregistered
         # depth stream as "depth_raw/image" (+ "depth_raw/camera_info"), and

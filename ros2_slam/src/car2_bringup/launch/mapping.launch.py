@@ -90,7 +90,7 @@ def generate_launch_description():
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('use_car2_driver', default_value='true'),
         DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
-        DeclareLaunchArgument('wheel_separation_m', default_value='0.18'),
+        DeclareLaunchArgument('wheel_separation_m', default_value='0.43'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
         bringup,
         slam_toolbox_node,

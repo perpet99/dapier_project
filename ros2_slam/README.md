@@ -113,9 +113,9 @@ cd ros2_slam
 | 값 | 위치 | 기본값(placeholder) | 비고 |
 |---|---|---|---|
 | `wheel_radius_m` | launch 인자 / `car2_driver` 파라미터 | 0.032 | 바퀴 반지름 실측 |
-| `wheel_separation_m` | launch 인자 | 0.18 | 좌/우 바퀴 중심 간 거리 실측 |
+| `wheel_separation_m` | launch 인자 / `car2_driver` 파라미터 | **0.43 (실측 윤거)** | 좌/우 바퀴 중심 간 거리. 축거 0.20m는 스키드 스티어 운동학에는 쓰이지 않음 |
 | `base_to_camera_*` (x,y,z,roll,pitch,yaw) | `bringup.launch.py` 인자 | x=0.08, z=0.15, 나머지 0 | base_link(바퀴 중심 지면 투영점) -> 카메라 광학 중심 실측 |
-| `robot_radius` | `config/nav2_params.yaml` | 0.15 | 로봇 풋프린트 반지름 실측 |
+| `robot_radius` | `config/nav2_params.yaml` | 0.26 | 윤거·축거·바퀴 반지름으로 계산한 바퀴 바깥 모서리 반경(약 0.252m). 차체가 바퀴보다 크면 늘릴 것 |
 | 속도 제한(vx_max 등) | `config/nav2_params.yaml` | 보수적으로 낮게 설정 | 실측 후 올리기 |
 
 `steps_per_rev`(4096)와 `max_step_speed`(3400)는 `car2/car2/Car.h`의

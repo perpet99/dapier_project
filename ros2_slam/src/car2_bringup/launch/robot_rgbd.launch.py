@@ -66,7 +66,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_car2_driver', default_value='true'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyS0'),
         DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
-        DeclareLaunchArgument('wheel_separation_m', default_value='0.18'),
+        DeclareLaunchArgument('wheel_separation_m', default_value='0.43'),
         # STAT poll every 2 control ticks (0.05s) -> 10Hz odom/TF. The default
         # 4 (5Hz) is too coarse for RTAB-Map to interpolate odom at image stamps.
         DeclareLaunchArgument('odom_poll_every_n', default_value='2'),

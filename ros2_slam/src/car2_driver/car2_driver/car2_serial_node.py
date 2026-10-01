@@ -9,9 +9,10 @@ Protocol reference: car2/car2/car2.ino, car2/car2/Car.cpp (this repo).
     be resent continuously (this node resends every control tick regardless of
     whether cmd_vel changed).
 
-wheel_radius_m / wheel_separation_m are placeholders -- measure the actual
-hardware and set them via parameters (or a launch/param file) before trusting
-odometry or Nav2 motion.
+wheel_separation_m is the measured track width (윤거, 0.43m; wheelbase/축거 is
+0.20m but doesn't enter skid-steer kinematics). wheel_radius_m is still a
+placeholder -- measure it and set it via parameters (or a launch/param file)
+before trusting odometry or Nav2 motion.
 """
 import math
 import re
@@ -44,7 +45,7 @@ class Car2SerialNode(Node):
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('wheel_radius_m', 0.032)
-        self.declare_parameter('wheel_separation_m', 0.18)
+        self.declare_parameter('wheel_separation_m', 0.43)  # track width (윤거), measured
         self.declare_parameter('steps_per_rev', 4096)
         self.declare_parameter('max_step_speed', 3400)
         self.declare_parameter('control_period_s', 0.05)

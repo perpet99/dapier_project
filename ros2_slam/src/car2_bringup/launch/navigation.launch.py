@@ -62,7 +62,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_rviz', default_value='true'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
-        DeclareLaunchArgument('wheel_separation_m', default_value='0.18'),
+        DeclareLaunchArgument('wheel_separation_m', default_value='0.43'),
         bringup,
         nav2,
         rviz,

@@ -20,11 +20,11 @@ CTL="$(mktemp -u /tmp/deploy_robot_ssh.XXXXXX)"
 SSH_OPTS=(-o ControlMaster=auto -o ControlPath="$CTL" -o ControlPersist=60)
 trap 'ssh "${SSH_OPTS[@]}" -O exit "$ROBOT" 2>/dev/null || true' EXIT
 
-echo "[1/3] Syncing src/ and scripts/ to ${ROBOT}:~/${REMOTE_WS} ..."
+echo "[1/3] Syncing src/, scripts/ and test/ to ${ROBOT}:~/${REMOTE_WS} ..."
 ssh "${SSH_OPTS[@]}" "$ROBOT" "mkdir -p ~/${REMOTE_WS}"
 rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
   --exclude '__pycache__' \
-  "${WS_DIR}/src" "${WS_DIR}/scripts" "${ROBOT}:~/${REMOTE_WS}/"
+  "${WS_DIR}/src" "${WS_DIR}/scripts" "${WS_DIR}/test" "${ROBOT}:~/${REMOTE_WS}/"
 
 echo "[2/3] Building on the robot ..."
 ssh "${SSH_OPTS[@]}" "$ROBOT" "bash -lc 'cd ~/${REMOTE_WS} && source /opt/ros/jazzy/setup.bash && colcon build --symlink-install 2>&1 | tail -3'"
