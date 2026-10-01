@@ -200,8 +200,8 @@ depth를 RGB 프레임으로 맞추는 정합(register)은 노트북에서 합�
   ```
   코드를 고칠 때마다 다시 실행하면 됩니다.
 
-**실행** (모든 터미널이 같은 `ROS_DOMAIN_ID`여야 함. 스크립트 기본값은 42이고,
-노트북·Pi의 `~/.bashrc`는 99를 export하므로 헷갈리지 않게 한쪽으로 맞추세요)
+**실행** (모든 터미널이 같은 `ROS_DOMAIN_ID`여야 함. 스크립트 기본값과 노트북·Pi의
+`~/.bashrc` 모두 42로 통일되어 있음)
 ```bash
 # Pi (ssh user@192.168.0.31)
 cd ~/ros2_slam_robot && ./scripts/run_robot_rgbd.sh
