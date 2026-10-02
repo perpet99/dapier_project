@@ -350,3 +350,5 @@ RViz(Nav2 화면)에서:
   dialout $USER` 후 재로그인.
 - **Nav2가 목표를 바로 거부**: AMCL 초기 위치가 안 맞아 `map -> base_link`
   TF가 없는 상태입니다. RViz "2D Pose Estimate"로 먼저 위치를 맞추세요.
+
+ros2 run tf2_ros tf2_echo map base_link
