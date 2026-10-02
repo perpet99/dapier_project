@@ -17,6 +17,8 @@ Usage:
   ros2 launch car2_bringup rtabmap_mapping.launch.py                  # continue the existing database
   ros2 launch car2_bringup rtabmap_mapping.launch.py new_map:=true    # delete the database and start over
   ros2 launch car2_bringup rtabmap_mapping.launch.py use_rtabmap_viz:=true use_rviz:=false
+  ros2 launch car2_bringup rtabmap_mapping.launch.py localization:=true  # use the map, don't change it
+                                                                         # (rtabmap_navigation.launch.py)
 """
 import os
 
@@ -24,9 +26,9 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import ComposableNodeContainer, Node
-from launch_ros.descriptions import ComposableNode
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -35,6 +37,7 @@ def generate_launch_description():
 
     database_path = LaunchConfiguration('database_path')
     new_map = LaunchConfiguration('new_map')
+    localization = LaunchConfiguration('localization')
     use_rviz = LaunchConfiguration('use_rviz')
     use_rtabmap_viz = LaunchConfiguration('use_rtabmap_viz')
     rgb_topic = LaunchConfiguration('rgb_topic')
@@ -51,52 +54,50 @@ def generate_launch_description():
     # registered depth carry the RGB stamp, so rgbd_sync pairs them exactly.
     # Queues are deep because the Astra Pro's UVC RGB frames reach us ~0.5s
     # later than the depth frame with the same capture time (measured).
-    front_end = ComposableNodeContainer(
-        name='rgbd_front_end',
-        namespace=ns,
-        package='rclcpp_components',
-        executable='component_container',
-        output='screen',
-        composable_node_descriptions=[
-            ComposableNode(
-                package='image_transport',
-                plugin='image_transport::Republisher',
-                name='rgb_decompress',
-                namespace=ns,
-                parameters=[{'in_transport': 'compressed', 'out_transport': 'raw'}],
-                # The subscriber resolves 'in' + '/<transport>' without applying
-                # an 'in' remap, so remap the transport-specific topic itself.
-                remappings=[('in/compressed', [rgb_topic, '/compressed']), ('out', 'rgb/image')],
-            ),
-            ComposableNode(
-                package='image_transport',
-                plugin='image_transport::Republisher',
-                name='depth_decompress',
-                namespace=ns,
-                parameters=[{'in_transport': 'compressedDepth', 'out_transport': 'raw'}],
-                remappings=[('in/compressedDepth', [depth_topic, '/compressedDepth']),
-                            ('out', 'depth_raw/image')],
-            ),
-            ComposableNode(
-                package='depth_image_proc',
-                plugin='depth_image_proc::RegisterNode',
-                name='register_depth',
-                namespace=ns,
-                parameters=[{
-                    'queue_size': 30,
-                    'fill_upsampling_holes': True,
-                    'use_rgb_timestamp': True,
-                }],
-                remappings=[
-                    ('depth/image_rect', 'depth_raw/image'),
-                    ('depth/camera_info', depth_info_topic),
-                    ('rgb/camera_info', rgb_info_topic),
-                    ('depth_registered/image_rect', 'depth_registered/image'),
-                    ('depth_registered/camera_info', 'depth_registered/camera_info'),
-                ],
-            ),
-        ],
-    )
+    # Plain processes, not components in a named container: launch loads
+    # components into a container *by name*, and when a previous run's
+    # '/rtabmap/rgbd_front_end' was still shutting down the new run's load
+    # requests went to it and the pipeline silently never started.
+    front_end = [
+        Node(
+            package='image_transport',
+            executable='republish',
+            name='rgb_decompress',
+            namespace=ns,
+            output='screen',
+            parameters=[{'in_transport': 'compressed', 'out_transport': 'raw'}],
+            remappings=[('in/compressed', [rgb_topic, '/compressed']), ('out', 'rgb/image')],
+        ),
+        Node(
+            package='image_transport',
+            executable='republish',
+            name='depth_decompress',
+            namespace=ns,
+            output='screen',
+            parameters=[{'in_transport': 'compressedDepth', 'out_transport': 'raw'}],
+            remappings=[('in/compressedDepth', [depth_topic, '/compressedDepth']),
+                        ('out', 'depth_raw/image')],
+        ),
+        Node(
+            package='depth_image_proc',
+            executable='register_node',
+            name='register_depth',
+            namespace=ns,
+            output='screen',
+            parameters=[{
+                'queue_size': 30,
+                'fill_upsampling_holes': True,
+                'use_rgb_timestamp': True,
+            }],
+            remappings=[
+                ('depth/image_rect', 'depth_raw/image'),
+                ('depth/camera_info', depth_info_topic),
+                ('rgb/camera_info', rgb_info_topic),
+                ('depth_registered/image_rect', 'depth_registered/image'),
+                ('depth_registered/camera_info', 'depth_registered/camera_info'),
+            ],
+        ),
+    ]
 
     rgbd_sync = Node(
         package='rtabmap_sync',
@@ -143,13 +144,28 @@ def generate_launch_description():
         'Reg/Force3DoF': 'true',          # ground robot: x, y, yaw only
         'Reg/Strategy': '0',              # visual registration
         'Vis/MinInliers': '12',
+        # Re-register every new node against the previous one visually and use
+        # that instead of the raw wheel-odometry delta. Without it the map
+        # inherits all skid-steer yaw error and only the rare loop closure
+        # corrects it.
+        'RGBD/NeighborLinkRefining': 'true',
         'RGBD/LinearUpdate': '0.05',
         'RGBD/AngularUpdate': '0.05',
         'RGBD/OptimizeMaxError': '3.0',
         'Rtabmap/DetectionRate': '2',
-        'Mem/IncrementalMemory': 'true',  # mapping (false = localization)
+        # Mapping adds to the database; localization:=true only localizes in it
+        # (the saved map is loaded whole and left unchanged). value_type=str:
+        # rtabmap parameters are strings, a bare 'false' would become a bool.
+        'Mem/IncrementalMemory': ParameterValue(
+            PythonExpression(["'false' if '", localization, "' == 'true' else 'true'"]), value_type=str),
+        'Mem/InitWMWithAllNodes': ParameterValue(localization, value_type=str),
         'Grid/Sensor': '1',               # occupancy grid from depth
-        'Grid/3D': 'false',
+        # 3D local grids so /rtabmap/cloud_map is a real 3D cloud. It is built
+        # through the grid filters (Grid/DepthRoiRatios, RangeMin/Max, ground /
+        # obstacle heights), so the robot body cut by the web UI's RoiRatios is
+        # gone from it -- unlike RViz's MapCloud display, which re-projects the
+        # raw depth images itself. /map (2D) is still produced.
+        'Grid/3D': 'true',
         'Grid/RayTracing': 'true',
         'Grid/CellSize': '0.05',
         'Grid/RangeMin': '0.6',           # Astra Pro is unreliable closer than ~0.6m
@@ -173,14 +189,18 @@ def generate_launch_description():
                 # 2D grid on the standard /map topic so scripts/save_map.sh and
                 # Nav2's map_server tooling work unchanged.
                 ('map', '/map'),
+                # RViz "2D Pose Estimate" -> tell rtabmap where the robot is
+                ('initialpose', '/initialpose'),
             ],
             arguments=arguments,
             condition=condition,
         )
 
     # '-d' = delete the database on start (a fresh map).
-    rtabmap_new = rtabmap_node(['-d'], IfCondition(new_map))
-    rtabmap_continue = rtabmap_node([], UnlessCondition(new_map))
+    # Never delete the database in localization mode, whatever new_map says.
+    delete_db = PythonExpression(["'", new_map, "' == 'true' and '", localization, "' != 'true'"])
+    rtabmap_new = rtabmap_node(['-d'], IfCondition(delete_db))
+    rtabmap_continue = rtabmap_node([], UnlessCondition(delete_db))
 
     rtabmap_viz = Node(
         package='rtabmap_viz',
@@ -214,6 +234,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('database_path',
                               default_value=os.path.expanduser('~/.ros/rtabmap.db')),
+        DeclareLaunchArgument('localization', default_value='false',
+                              description='true = localize in the existing map without modifying it'),
         DeclareLaunchArgument('new_map', default_value='false',
                               description='true = delete database_path and start a new map'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
@@ -222,7 +244,7 @@ def generate_launch_description():
         DeclareLaunchArgument('rgb_info_topic', default_value='/camera/color/camera_info'),
         DeclareLaunchArgument('depth_topic', default_value='/camera/depth_raw/image'),
         DeclareLaunchArgument('depth_info_topic', default_value='/camera/depth_raw/camera_info'),
-        front_end,
+        *front_end,
         rgbd_sync,
         rtabmap_new,
         rtabmap_continue,

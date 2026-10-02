@@ -20,6 +20,16 @@ WS_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Avoid colliding with other ROS2 traffic on the default domain (0) or any
 # domain left with stale/leftover participants from earlier sessions.
+# Only one rtabmap at a time: two instances on the same database lock it, the
+# running one dies ("database is locked") and the database is left unclosed
+# (no visual-word dictionary -> no relocalization; fix with rtabmap-recovery).
+if pgrep -x rtabmap >/dev/null; then
+  echo "ERROR: rtabmap is already running on this machine:"
+  pgrep -ax rtabmap | cut -c1-150
+  echo "Stop that mapping/navigation first (Ctrl-C in its terminal, wait until it exits)."
+  exit 1
+fi
+
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 
 set +u

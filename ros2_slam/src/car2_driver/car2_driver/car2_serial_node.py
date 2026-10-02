@@ -9,10 +9,14 @@ Protocol reference: car2/car2/car2.ino, car2/car2/Car.cpp (this repo).
     be resent continuously (this node resends every control tick regardless of
     whether cmd_vel changed).
 
-wheel_separation_m is the measured track width (윤거, 0.43m; wheelbase/축거 is
-0.20m but doesn't enter skid-steer kinematics). wheel_radius_m is still a
-placeholder -- measure it and set it via parameters (or a launch/param file)
-before trusting odometry or Nav2 motion.
+wheel_separation_m is the *effective* skid-steer track (0.53m), not the
+measured 윤거 (0.43m; wheelbase/축거 0.20m): the wheels scrub sideways when
+turning, so the body rotates less than (v_r - v_l) / 0.43 predicts. 0.43
+over-reported yaw by ~19-20% (RTAB-Map's visual registration; a 360 deg spin
+matched against the lidar: actual/odom = 0.833 with r=0.032). wheel_radius_m 0.0329
+comes from a 0.87 m straight run measured by the lidar (actual/odom = 1.027); the
+track was scaled with it (0.0329 / (0.833 * 0.032 / 0.43) = 0.53) so the rotation
+calibration still holds.
 """
 import math
 import re
@@ -44,8 +48,8 @@ class Car2SerialNode(Node):
 
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('baud_rate', 115200)
-        self.declare_parameter('wheel_radius_m', 0.032)
-        self.declare_parameter('wheel_separation_m', 0.43)  # track width (윤거), measured
+        self.declare_parameter('wheel_radius_m', 0.0329)  # lidar-verified straight run (was 0.032)
+        self.declare_parameter('wheel_separation_m', 0.53)  # effective track (measured 윤거 0.43)
         self.declare_parameter('steps_per_rev', 4096)
         self.declare_parameter('max_step_speed', 3400)
         self.declare_parameter('control_period_s', 0.05)
@@ -54,6 +58,11 @@ class Car2SerialNode(Node):
         self.declare_parameter('odom_frame_id', 'odom')
         self.declare_parameter('base_frame_id', 'base_link')
         self.declare_parameter('accel', 20)
+        # Stop if no /cmd_vel arrives for this long (0 = keep the last command
+        # forever, the old behavior). Protects against a publisher that dies
+        # mid-move (Nav2 Ctrl-C/crash, WiFi drop) -- the firmware's own 500ms
+        # timeout doesn't help because this node resends every tick.
+        self.declare_parameter('cmd_vel_timeout_s', 1.0)
 
         self.port = self.get_parameter('serial_port').value
         self.baud = self.get_parameter('baud_rate').value
@@ -67,10 +76,13 @@ class Car2SerialNode(Node):
         self.odom_frame_id = self.get_parameter('odom_frame_id').value
         self.base_frame_id = self.get_parameter('base_frame_id').value
         self.accel = self.get_parameter('accel').value
+        self.cmd_vel_timeout_s = float(self.get_parameter('cmd_vel_timeout_s').value)
 
         self._lock = threading.Lock()
         self._target_v = 0.0
         self._target_w = 0.0
+        self._last_cmd_time = None
+        self._timed_out = False
         self._tick = 0
 
         self._x = 0.0
@@ -125,6 +137,8 @@ class Car2SerialNode(Node):
         with self._lock:
             self._target_v = msg.linear.x
             self._target_w = msg.angular.z
+            self._last_cmd_time = self.get_clock().now()
+            self._timed_out = False
 
     def _wheel_speeds_steps(self, v: float, w: float):
         v_l = v - w * self.wheel_separation_m / 2.0
@@ -138,6 +152,13 @@ class Car2SerialNode(Node):
 
     def _control_tick(self):
         with self._lock:
+            if (self.cmd_vel_timeout_s > 0 and self._last_cmd_time is not None and not self._timed_out
+                    and (self.get_clock().now() - self._last_cmd_time).nanoseconds * 1e-9 > self.cmd_vel_timeout_s
+                    and (self._target_v or self._target_w)):
+                self._target_v = self._target_w = 0.0
+                self._timed_out = True
+                self.get_logger().warning(
+                    f'no /cmd_vel for {self.cmd_vel_timeout_s:.1f}s -- stopping the car')
             v, w = self._target_v, self._target_w
         left_steps, right_steps = self._wheel_speeds_steps(v, w)
 

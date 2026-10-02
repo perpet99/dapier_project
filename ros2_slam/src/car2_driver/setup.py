@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'car2_serial_node = car2_driver.car2_serial_node:main',
+            'ld_lidar_node = car2_driver.ld_lidar_node:main',
         ],
     },
 )

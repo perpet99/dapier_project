@@ -22,17 +22,39 @@ synchronized.
 """
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import ComposableNodeContainer, Node
-from launch_ros.descriptions import ComposableNode
+from launch_ros.actions import Node
+
+
+# Camera mount angles measured on the robot (written by the "현재 값으로 설정"
+# button in test/camera_test.py's web UI). Lives outside the workspace so
+# deploy_to_robot.sh never overwrites it. Values become the defaults of the
+# base_to_camera_* launch arguments; explicit launch arguments still win.
+CAMERA_MOUNT_FILE = os.environ.get(
+    'CAR2_CAMERA_MOUNT_FILE', os.path.expanduser('~/.ros/car2_camera_mount.yaml'))
+
+
+def load_camera_mount():
+    try:
+        with open(CAMERA_MOUNT_FILE) as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    return {k: float(v) for k, v in data.items() if k.startswith('base_to_camera_')}
 
 
 def generate_launch_description():
+    mount = load_camera_mount()
+
+    def mount_default(name, fallback):
+        return str(mount.get(name, fallback))
+
     bringup_share = get_package_share_directory('car2_bringup')
     openni2_share = get_package_share_directory('openni2_camera')
     # bringup_share = <ws>/install/car2_bringup/share/car2_bringup
@@ -65,8 +87,15 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_car2_driver', default_value='true'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyS0'),
-        DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
-        DeclareLaunchArgument('wheel_separation_m', default_value='0.43'),
+        # Wheel radius from a 0.87 m straight run vs the lidar (ICP 0.892 m, front wall
+        # 0.887 m): actual/odom = 1.027 -> 0.032 * 1.027 = 0.0329 m (2026-10-02).
+        DeclareLaunchArgument('wheel_radius_m', default_value='0.0329'),
+        # Effective skid-steer track, not the measured 0.43m: wheels scrub when
+        # turning, so 0.43 over-reported yaw by ~19-20% (RTAB-Map visual registration;
+        # lidar scan matching on a 360 deg spin: actual/odom = 0.833).
+        # ... and the track scaled with it (rotation calibration needs radius/track
+        # = 0.833 * 0.032/0.43): 0.0329 / 0.06199 = 0.53.
+        DeclareLaunchArgument('wheel_separation_m', default_value='0.53'),
         # STAT poll every 2 control ticks (0.05s) -> 10Hz odom/TF. The default
         # 4 (5Hz) is too coarse for RTAB-Map to interpolate odom at image stamps.
         DeclareLaunchArgument('odom_poll_every_n', default_value='2'),
@@ -94,12 +123,14 @@ def generate_launch_description():
         # Placeholder mount offset -- measure on the real robot (same as bringup.launch.py).
         DeclareLaunchArgument('base_to_camera_x', default_value='0.08'),
         DeclareLaunchArgument('base_to_camera_y', default_value='0.0'),
-        DeclareLaunchArgument('base_to_camera_z', default_value='0.15'),
-        DeclareLaunchArgument('base_to_camera_roll', default_value='0.0'),
-        DeclareLaunchArgument('base_to_camera_pitch', default_value='0.0'),
+        DeclareLaunchArgument('base_to_camera_z', default_value=mount_default('base_to_camera_z', '0.15')),
+        DeclareLaunchArgument('base_to_camera_roll', default_value=mount_default('base_to_camera_roll', '0.0')),
+        DeclareLaunchArgument('base_to_camera_pitch', default_value=mount_default('base_to_camera_pitch', '0.0')),
         DeclareLaunchArgument('base_to_camera_yaw', default_value='0.0'),
         DeclareLaunchArgument('openni2_lib_override_dir', default_value=default_openni2_override),
         AppendEnvironmentVariable('LD_LIBRARY_PATH', openni2_lib_override_dir, prepend=True),
+        LogInfo(msg=(f'camera mount from {CAMERA_MOUNT_FILE}: {mount}' if mount else
+                     f'no {CAMERA_MOUNT_FILE}; using placeholder camera mount angles')),
 
         Node(
             package='car2_driver',
@@ -133,29 +164,30 @@ def generate_launch_description():
         ),
 
         # Depth only, same reasoning as bringup.launch.py (no OpenNI2 color).
-        ComposableNodeContainer(
-            name='container',
+        # Standalone driver executable rather than a component in a
+        # '/camera/container': with the laptop on the same ROS_DOMAIN_ID, the
+        # laptop's bringup.launch.py (run_mapping.sh) loads its own OpenNI2
+        # driver into whatever answers to '/camera/container' -- it landed in
+        # this robot's container and crashed the running depth driver. A plain
+        # process also makes respawn meaningful (a respawned container would
+        # come back empty).
+        Node(
+            package='openni2_camera',
+            executable='openni2_camera_driver',
+            name='driver',
             namespace='camera',
-            package='rclcpp_components',
-            executable='component_container',
-            composable_node_descriptions=[
-                ComposableNode(
-                    package='openni2_camera',
-                    plugin='openni2_wrapper::OpenNI2Driver',
-                    name='driver',
-                    namespace='camera',
-                    parameters=[{
-                        'depth_registration': False,
-                        'use_device_time': False,
-                        'depth_mode': depth_mode,
-                        'data_skip': depth_skip,
-                        'rgb_frame_id': 'camera_rgb_optical_frame',
-                        'depth_frame_id': 'camera_depth_optical_frame',
-                        'ir_frame_id': 'camera_ir_optical_frame',
-                    }],
-                ),
-            ],
             output='screen',
+            respawn=True,
+            respawn_delay=3.0,
+            parameters=[{
+                'depth_registration': False,
+                'use_device_time': False,
+                'depth_mode': depth_mode,
+                'data_skip': depth_skip,
+                'rgb_frame_id': 'camera_rgb_optical_frame',
+                'depth_frame_id': 'camera_depth_optical_frame',
+                'ir_frame_id': 'camera_ir_optical_frame',
+            }],
         ),
 
         IncludeLaunchDescription(

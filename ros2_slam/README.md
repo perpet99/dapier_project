@@ -113,7 +113,7 @@ cd ros2_slam
 | 값 | 위치 | 기본값(placeholder) | 비고 |
 |---|---|---|---|
 | `wheel_radius_m` | launch 인자 / `car2_driver` 파라미터 | 0.032 | 바퀴 반지름 실측 |
-| `wheel_separation_m` | launch 인자 / `car2_driver` 파라미터 | **0.43 (실측 윤거)** | 좌/우 바퀴 중심 간 거리. 축거 0.20m는 스키드 스티어 운동학에는 쓰이지 않음 |
+| `wheel_separation_m` | launch 인자 / `car2_driver` 파라미터 | **0.51 (실효 윤거)** | 스키드 스티어 실효 윤거. 실측 윤거는 0.43m지만 회전 시 바퀴 미끄러짐 때문에 0.43이면 yaw가 ~19% 과대 추정됨(RTAB-Map 영상 정합 대비). 축거 0.20m는 운동학에 쓰이지 않음 |
 | `base_to_camera_*` (x,y,z,roll,pitch,yaw) | `bringup.launch.py` 인자 | x=0.08, z=0.15, 나머지 0 | base_link(바퀴 중심 지면 투영점) -> 카메라 광학 중심 실측 |
 | `robot_radius` | `config/nav2_params.yaml` | 0.26 | 윤거·축거·바퀴 반지름으로 계산한 바퀴 바깥 모서리 반경(약 0.252m). 차체가 바퀴보다 크면 늘릴 것 |
 | 속도 제한(vx_max 등) | `config/nav2_params.yaml` | 보수적으로 낮게 설정 | 실측 후 올리기 |
@@ -203,7 +203,15 @@ depth를 RGB 프레임으로 맞추는 정합(register)은 노트북에서 합�
 **실행** (모든 터미널이 같은 `ROS_DOMAIN_ID`여야 함. 스크립트 기본값과 노트북·Pi의
 `~/.bashrc` 모두 42로 통일되어 있음)
 ```bash
-# Pi (ssh user@192.168.0.31)
+# 로봇 쪽 — 노트북에서 원격으로 (Pi의 tmux 'robot_rgbd'에서 실행, 웹 UI 재시작 버튼과 같은 세션)
+./scripts/remote_robot_rgbd.sh start      # stop / restart / status / log / attach
+#   드라이버만: ./scripts/remote_car2_driver.sh start /dev/ttyS0 -p odom_poll_every_n:=2
+#   카메라 웹 UI(영상·각도·RoiRatios·재시작 버튼): ./scripts/remote_camera_web.sh start  → http://192.168.0.31:8080
+#   ROS 없이 웹 조종(car2_web.py):                ./scripts/remote_car2_web.sh start    → http://192.168.0.31:8766
+#   (시리얼 /dev/ttyS0를 쓰는 드라이버·car2_web은 하나만 — 이미 쓰고 있으면 시작을 거부함)
+
+# 로봇 쪽 — Pi에서 직접 하려면 (ssh user@192.168.0.31)
+source /opt/ros/jazzy/setup.bash
 cd ~/ros2_slam_robot && ./scripts/run_robot_rgbd.sh
 #   RGB 장치가 /dev/video0이 아니면: ./scripts/run_robot_rgbd.sh video_device:=/dev/video1
 #   (스크립트가 시작할 때 v4l2-ctl로 찾은 Astra 장치를 보여줌)
@@ -235,6 +243,84 @@ RViz(`car2_bringup/rviz/rtabmap.rviz`)에는 3D 컬러 맵(MapCloud), 포즈 그
   depth보다 약 0.5초 늦게 도착하므로 노트북 쪽 동기화 큐를 30으로 두었습니다).
 - 실행 직후 30초 정도는 `Did not receive data` 경고가 날 수 있습니다. 그 뒤로는
   안정적으로 갱신됩니다.
+
+### 4) RTAB-Map 맵으로 자율 주행 (Nav2)
+
+`run_rtabmap_mapping.sh`로 만든 `maps/rtabmap.db`에서 위치를 추정하고 Nav2로 주행합니다.
+
+```
+rtabmap (localization:=true, DB 읽기 전용) -> /map, map->odom      (AMCL/map_server 대신)
+depth -> /rtabmap/depth_cloud (rtabmap_util/point_cloud_xyz)        -> 코스트맵·collision_monitor 장애물
+Nav2 (navigation_launch.py + config/nav2_rtabmap_params.yaml)      -> /cmd_vel -> 로봇 드라이버
+```
+
+```bash
+./scripts/remote_robot_rgbd.sh start                    # 로봇 쪽 (드라이버 + 카메라)
+./scripts/run_rtabmap_navigation.sh                     # 기본 maps/rtabmap.db
+./scripts/run_rtabmap_navigation.sh maps/office.db use_rtabmap_viz:=true
+```
+RViz(Nav2 화면)에서:
+1. **위치 맞추기**: 매핑을 시작/끝낸 자리 근처에 로봇을 두면 rtabmap이 카메라로 아는 장소를 찾아
+   스스로 위치를 잡습니다. 안 맞으면 **2D Pose Estimate**로 지정 (`/initialpose` → rtabmap).
+2. **Nav2 Goal**로 목적지 지정.
+
+**주의**
+- **매핑을 정상 종료(Ctrl-C 후 종료 대기)한 DB**를 쓰세요. rtabmap은 장소 인식용 단어 사전을
+  종료할 때 저장하므로, 매핑 중이거나 강제 종료된 DB로는 스스로 위치를 찾지 못합니다.
+- 매핑(`run_rtabmap_mapping.sh`)과 동시에 실행하지 마세요 (같은 rtabmap 노드 이름). 두 스크립트 모두
+  rtabmap이 이미 떠 있으면 시작을 거부합니다. 같은 DB로 rtabmap 두 개가 뜨면 `database is locked`로
+  죽고 DB가 정상 종료되지 않습니다(`rtabmap-info`에서 `0 words`).
+- **정상 종료되지 않은 DB 복구**: 사본에 `rtabmap-recovery 사본.db` (원본은 그대로 두세요).
+  2026-10-01 맵은 이렇게 복구한 `maps/rtabmap_recovered.db`를 쓰면 됩니다.
+- 로봇이 가만히 있으면 카메라가 거의 바닥만 봐서 장소 인식이 잘 안 됩니다. 시작 후 제자리에서
+  한 바퀴 돌리면(웹 UI ◀/▶) rtabmap이 위치를 잡습니다.
+- 속도 한계: 직진 0.15 m/s, 회전 0.7 rad/s (바퀴 최대 ~0.167 m/s, ~0.77 rad/s). 로봇 반경 0.26 m.
+- 장애물은 depth 점 중 바닥 위 0.06~0.7 m, 2.5 m 이내만 씁니다. 화면 아래 22.5%(로봇 몸체)는
+  제외 (`body_roi_ratios:="0 0 0 0.225"`, 웹 UI의 RoiRatios와 같은 값으로 맞추세요).
+- 카메라 기울기(pitch/roll)가 정확해야 바닥이 장애물로 잡히지 않습니다 — 웹 UI의 "현재 값으로 설정".
+- **드라이버 안전 정지**: `car2_serial_node`는 `/cmd_vel`이 1초 끊기면 스스로 멈춥니다
+  (`cmd_vel_timeout_s`, 0이면 예전처럼 마지막 명령 유지). Nav2가 죽거나 WiFi가 끊겨도 계속 달리지 않습니다.
+
+### 5) 2D 라이다 (LD 계열) + 4륜 구동
+
+로봇에 추가한 2D 라이다는 LDROBOT LD06/LD19 계열 프로토콜(CP2102 USB 시리얼, 230400 bps,
+6 Hz 회전, 약 4000점/초)입니다. apt 드라이버가 없어 `car2_driver/ld_lidar_node.py`로 직접 읽어
+`/scan`(LaserScan, `laser_frame`, 0.5° 간격)을 냅니다.
+
+```bash
+./scripts/remote_car2_lidar.sh start                          # 드라이버 + 라이다 (Pi tmux 'car2_lidar')
+./scripts/remote_car2_lidar.sh start use_car2_driver:=false   # 라이다만 (robot_rgbd와 같이 쓸 때)
+./scripts/remote_car2_lidar.sh status | log | attach | restart | stop
+# 장착 위치: lidar_x/y/z (m, base_link 기준), lidar_yaw (rad)
+./scripts/remote_car2_lidar.sh restart lidar_x:=0.05 lidar_z:=0.25 lidar_yaw:=3.1416
+```
+- 장착 위치: 바퀴 사이 정중앙 (`lidar_x/y` = 0), 0° 방향이 로봇 정면보다 약 4.5° 왼쪽 (`lidar_yaw` = 0.0785,
+  직진 2회 측정). 높이 `lidar_z`(0.2)만 임시값 — 2D에는 영향 없음.
+- 라이다 각도는 시계 방향이라 ROS(반시계)로 뒤집어 냅니다 (360° 회전 시험으로 검증).
+- 로봇 기둥 4개(라이다에서 약 0.2 m, ±69.5~96.5° 부근)는 `robot_lidar.launch.py`의 `self_mask_deg`로
+  제외합니다 — 그 각도에서 0.35 m보다 가까운 점만 버리고, 기둥 사이로 보이는 먼 물체는 남깁니다.
+  라이다를 다시 달거나 돌리면 각도를 다시 재야 합니다.
+
+### 6) 라이다 맵핑 · 저장 · 내비게이션 (slam_toolbox + AMCL + Nav2)
+
+로봇 쪽은 `./scripts/remote_car2_lidar.sh start` (드라이버 + 라이다). 나머지는 노트북에서:
+
+```bash
+./scripts/run_lidar_mapping.sh                     # 새 맵 (slam_toolbox + RViz)
+./scripts/save_lidar_map.sh office                 # 맵핑 중에 저장 -> maps/office.yaml/.pgm + .posegraph/.data
+./scripts/run_lidar_mapping.sh office              # 저장한 맵에 이어서 맵핑 (pose graph)
+./scripts/run_lidar_navigation.sh maps/office.yaml # AMCL 위치 추정 + Nav2 (RViz에서 Nav2 Goal)
+./scripts/run_lidar_navigation.sh maps/office.yaml initial_x:=1.0 initial_y:=0.5 initial_yaw:=1.57
+```
+- 설정: `config/slam_toolbox_lidar_params.yaml` (0.1~8 m, TF 대기 0.5 s),
+  `config/nav2_lidar_params.yaml` (RTAB-Map용과 같은 로봇 한계 + 장애물/AMCL은 `/scan`).
+- 내비게이션 시작 4초 뒤 AMCL에 초기 위치를 자동으로 보냅니다(기본: 맵 원점 = 맵핑을 시작한 자리).
+  다른 곳에서 시작했으면 `initial_x/y/yaw`를 주거나 RViz **2D Pose Estimate**로 고치세요.
+- SLAM/위치추정 노드는 한 번에 하나만 (스크립트가 이미 떠 있으면 거부).
+- 라이다: 바퀴 사이 정중앙, 0° 방향은 정면에서 약 4.5° 왼쪽 (`lidar_yaw` = 0.0785, 직진 2회 측정). 각도 방향은 360° 회전으로 검증.
+- 바퀴 반지름 `wheel_radius_m` = 0.0329 m (0.87 m 직진을 라이다로 측정: 실제/odom = 1.027).
+- 유효 윤거 `wheel_separation_m` = 0.53 m (실제 윤거 0.43 m, 스키드 스티어 미끄러짐 보정 — 360° 회전에서 라이다 기준
+  실제 회전이 odom의 0.833배, 반지름 보정에 맞춰 함께 조정).
 
 ## 트러블슈팅
 

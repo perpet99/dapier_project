@@ -83,6 +83,48 @@ def tilt_from_plane(n: np.ndarray, d: float):
     return pitch_down, roll, height
 
 
+def median_depth(frames) -> np.ndarray:
+    """Per-pixel median over depth frames (mm), ignoring zeros (= no return)."""
+    stack = np.stack(frames).astype(np.float32)
+    stack[stack == 0] = np.nan
+    with np.errstate(all='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN pixels = never valid -> 0
+        return np.nan_to_num(np.nanmedian(stack, axis=0))
+
+
+def measure_tilt(depth: np.ndarray, info: CameraInfo, max_points: int = 20000, iters: int = 400):
+    """Depth image (mm) + its CameraInfo -> floor-plane tilt.
+
+    Returns None when there are too few valid points, else a dict with pitch /
+    roll (rad, REP-103: + pitch = nose down, + roll = right side down), height
+    (m), floor_ratio, residual_mm, and the floor pixel coords (vs, us).
+    """
+    h, w = depth.shape
+    fx, fy, cx, cy = info.k[0], info.k[4], info.k[2], info.k[5]
+    if (info.width, info.height) != (w, h):   # info for another resolution
+        sx, sy = w / info.width, h / info.height
+        fx, cx, fy, cy = fx * sx, cx * sx, fy * sy, cy * sy
+
+    vs, us = np.nonzero((depth > MIN_MM) & (depth < MAX_MM))
+    z = depth[vs, us] / 1000.0
+    pts = np.column_stack([(us - cx) * z / fx, (vs - cy) * z / fy, z])
+    if len(pts) < 500:
+        return None
+
+    sample = pts if len(pts) <= max_points else \
+        pts[np.random.default_rng(1).choice(len(pts), max_points, replace=False)]
+    n, d, _ = fit_plane(sample, iters=iters)
+    inl = np.abs(pts @ n + d) < INLIER_M
+    pitch, roll, height = tilt_from_plane(n, d)
+    return {
+        'pitch': pitch, 'roll': roll, 'height': height,
+        'floor_ratio': float(inl.mean()),
+        'residual_mm': float(np.abs(pts[inl] @ n + d).std() * 1000),
+        'valid_points': len(pts),
+        'floor_vs': vs[inl], 'floor_us': us[inl],
+    }
+
+
 class Grabber(Node):
     def __init__(self, depth_topic, info_topic):
         super().__init__('camera_tilt')
@@ -115,41 +157,23 @@ def main():
               'with the same ROS_DOMAIN_ID?')
         return 1
 
-    # Per-pixel median over frames (ignoring zeros) to suppress depth noise.
-    stack = np.stack(node.frames)
-    stack[stack == 0] = np.nan
-    with np.errstate(all='ignore'), warnings.catch_warnings():
-        warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN pixels = never valid -> 0
-        depth = np.nan_to_num(np.nanmedian(stack, axis=0))
+    depth = median_depth(node.frames)
     h, w = depth.shape
-    fx, fy, cx, cy = node.info.k[0], node.info.k[4], node.info.k[2], node.info.k[5]
-    if (node.info.width, node.info.height) != (w, h):   # info for another resolution
-        sx, sy = w / node.info.width, h / node.info.height
-        fx, cx, fy, cy = fx * sx, cx * sx, fy * sy, cy * sy
-
-    vs, us = np.nonzero((depth > MIN_MM) & (depth < MAX_MM))
-    z = depth[vs, us] / 1000.0
-    pts = np.column_stack([(us - cx) * z / fx, (vs - cy) * z / fy, z])
-    if len(pts) < 500:
-        print(f'Only {len(pts)} valid depth points in {MIN_MM}-{MAX_MM}mm -- point the camera at more floor.')
+    t = measure_tilt(depth, node.info)
+    if t is None:
+        print(f'Too few valid depth points in {MIN_MM}-{MAX_MM}mm -- point the camera at more floor.')
         return 1
-
-    sample = pts if len(pts) < 20000 else pts[np.random.default_rng(1).choice(len(pts), 20000, replace=False)]
-    n, d, _ = fit_plane(sample)
-    inl = np.abs(pts @ n + d) < INLIER_M
-    pitch, roll, height = tilt_from_plane(n, d)
-    ratio = inl.mean()
-    resid = np.abs(pts[inl] @ n + d).std() * 1000
+    pitch, roll, height, ratio = t['pitch'], t['roll'], t['height'], t['floor_ratio']
 
     vis = cv2.applyColorMap(cv2.convertScaleAbs(depth, alpha=255.0 / MAX_MM), cv2.COLORMAP_JET)
     vis[depth == 0] = 0
     overlay = vis.copy()
-    overlay[vs[inl], us[inl]] = (0, 255, 0)
+    overlay[t['floor_vs'], t['floor_us']] = (0, 255, 0)
     vis = cv2.addWeighted(vis, 0.4, overlay, 0.6, 0)
     cv2.imwrite(args.out, cv2.resize(vis, (w * 2, h * 2), interpolation=cv2.INTER_NEAREST))
 
-    print(f'frames used      : {len(node.frames)}  ({w}x{h}, {len(pts)} valid points)')
-    print(f'floor plane      : {ratio * 100:.0f}% of valid points, residual {resid:.1f} mm  -> {args.out}')
+    print(f'frames used      : {len(node.frames)}  ({w}x{h}, {t["valid_points"]} valid points)')
+    print(f'floor plane      : {ratio * 100:.0f}% of valid points, residual {t["residual_mm"]:.1f} mm  -> {args.out}')
     print(f'pitch (down)     : {math.degrees(pitch):6.1f} deg')
     print(f'roll             : {math.degrees(roll):6.1f} deg  (+ = right side down)')
     print(f'camera height    : {height:6.3f} m above the floor plane')

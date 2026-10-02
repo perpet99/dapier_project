@@ -89,8 +89,15 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('use_car2_driver', default_value='true'),
-        DeclareLaunchArgument('wheel_radius_m', default_value='0.032'),
-        DeclareLaunchArgument('wheel_separation_m', default_value='0.43'),
+        # Wheel radius from a 0.87 m straight run vs the lidar (ICP 0.892 m, front wall
+        # 0.887 m): actual/odom = 1.027 -> 0.032 * 1.027 = 0.0329 m (2026-10-02).
+        DeclareLaunchArgument('wheel_radius_m', default_value='0.0329'),
+        # Effective skid-steer track, not the measured 0.43m: wheels scrub when
+        # turning, so 0.43 over-reported yaw by ~19-20% (RTAB-Map visual registration;
+        # lidar scan matching on a 360 deg spin: actual/odom = 0.833).
+        # ... and the track scaled with it (rotation calibration needs radius/track
+        # = 0.833 * 0.032/0.43): 0.0329 / 0.06199 = 0.53.
+        DeclareLaunchArgument('wheel_separation_m', default_value='0.53'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
         bringup,
         slam_toolbox_node,
