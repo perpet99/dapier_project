@@ -322,6 +322,35 @@ RViz(Nav2 화면)에서:
 - 유효 윤거 `wheel_separation_m` = 0.53 m (실제 윤거 0.43 m, 스키드 스티어 미끄러짐 보정 — 360° 회전에서 라이다 기준
   실제 회전이 odom의 0.833배, 반지름 보정에 맞춰 함께 조정).
 
+#### 지도 웹 UI (위치 · 방향 · 주행)
+
+```bash
+./scripts/remote_map_web.sh start      # Pi에서 test/map_web.py 실행 → http://192.168.0.31:8081
+./scripts/remote_map_web.sh status     # 현재 위치/지도/라이다 요약
+```
+- 지도(`/map`) 위에 로봇 위치·방향(화살표, 원 = 차체 반경), 라이다 스캔, 주행 궤적, Nav2 경로, AMCL 오차 타원을 표시.
+  드래그/휠/핀치로 이동·확대, '따라가기'·'전방 위'(로봇 앞이 화면 위)·'전체' 버튼.
+- 위치는 TF `map→base_link`. 노트북에서 SLAM/내비게이션이 안 떠 있으면 `odom→base_link`(바퀴 주행거리) 기준으로 표시.
+- 주행 패드(전진·후진·좌/우회전, 속도 슬라이더, 키보드 ↑↓←→/WASD, Space 정지)는 `/cmd_vel`로 보내며
+  누르고 있는 동안만 움직입니다(0.5초 내 자동 정지). 주행 코드는 `test/drive_control.py` (camera_test.py와 같은 방식).
+- 지도 좌표: 가장자리에 m 눈금, 원점 (0, 0)에 X→/Y↑ 화살표, 커서 위치 좌표, 지도 범위(X/Y)를 표시.
+- **위치 라벨**: 이름을 입력하고 '현재 위치 라벨 추가' → 로봇의 현재 map 좌표·방향을 저장
+  (Pi의 `~/.ros/car2_map_labels.json`). 지도에 빨간 점 + 이름으로 표시되고, 목록이나 지도 위 점을 눌러 선택합니다.
+  map 좌표계가 있을 때만(SLAM/내비게이션 실행 중) 저장되며, 그 지도 기준 좌표이므로 같은 저장 맵으로 내비게이션해야 의미가 있습니다.
+- **Go to (Navi)**: 선택한 라벨 위치·방향으로 Nav2 `navigate_to_pose` 목표를 보냅니다(RViz의 Nav2 Goal과 같음).
+  노트북에서 `run_lidar_navigation.sh`(또는 `run_rtabmap_navigation.sh`)가 실행 중이어야 하고, 남은 거리·도착/실패를 표시합니다.
+  'Navi 취소' 또는 주행 패드를 누르면 목표가 취소됩니다.
+- **현재 위치 자동 다시 잡기**: 현재 라이다 스캔을 지도와 맞춰(scan matching) 로봇 위치를 찾고 AMCL에 `/initialpose`로
+  보냅니다(RViz 2D Pose Estimate와 같음). 기본은 현재 추정 위치 주변 ±1 m·±40° 검색(Pi에서 약 2~3초),
+  위치를 전혀 모를 때는 '전체 지도에서 찾기'(지도 전체·모든 방향, 약 10초). 스캔 일치율이 50% 미만이면 보내지 않고,
+  다른 곳에도 비슷하게 맞는 후보가 있으면 경고합니다. 로봇이 멈춘 상태에서만 동작하고, 내비게이션(AMCL)이 실행 중이어야 합니다.
+- 라벨이 Nav2 비용지도에서 장애물/로봇 반경(0.26 m) 안이면 목록에 '⚠ 도달 불가'로 표시하고 Go to를 거부합니다.
+  실제로는 비어 있는데 그렇다면 지도에 가짜 장애물이 찍힌 것(예: 라이다 range_min 0.25 수정 전 로봇 기둥) — 지도를 새로 만드세요.
+- **도착 오차**: 위치(m)·방향(°) 슬라이더/입력 후 '적용' → 실행 중인 Nav2 goal checker(`controller_server`의
+  `general_goal_checker.xy/yaw_goal_tolerance`)에 바로 적용. 허용 범위 위치 0.03~0.5 m, 방향 3~90°
+  (`-p goal_xy_min/goal_xy_max/goal_yaw_min_deg/goal_yaw_max_deg`로 변경). 값은 Pi의 `~/.ros/car2_nav_tolerance.json`에
+  저장되어 내비게이션을 다시 시작해도 자동으로 다시 적용됩니다(yaml 값보다 우선).
+
 ## 트러블슈팅
 
 - **`Failed to find a free participant index for domain N` / 노드 생성 실패**:

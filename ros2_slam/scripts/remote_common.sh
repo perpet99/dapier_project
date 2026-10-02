@@ -33,6 +33,7 @@ remote_tty() { ssh -t "${SSH_OPTS[@]}" "$ROBOT" "$@"; }
 # kills -- the tmux server, taking every other session (robot_rgbd!) with it.
 PAT_CAMERA_WEB='^[^ ]*python[0-9.]* .*camera_test\.py'
 PAT_CAR2_WEB='^[^ ]*python[0-9.]* .*car2_web\.py'
+PAT_MAP_WEB='^[^ ]*python[0-9.]* .*map_web\.py'
 
 # Print the usage block at the top of the calling script (lines starting "# " after line 3).
 usage() { sed -n '4,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }

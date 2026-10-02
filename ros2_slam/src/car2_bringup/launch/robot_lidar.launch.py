@@ -80,12 +80,18 @@ def generate_launch_description():
                 'port': cfg['lidar_port'],
                 'frame_id': cfg['lidar_frame'],
                 'min_intensity': cfg['lidar_min_intensity'],
+                # Nothing real can be closer than this: it is inside the robot
+                # footprint (radius 0.26 m). Drops the robot's own posts (~0.19-0.21 m)
+                # whatever their angle -- leaked post points made collision_monitor
+                # see a collision "now" and hold Nav2's /cmd_vel at zero.
+                'range_min': 0.25,
                 # The robot's 4 frame posts, ~0.2 m from the lidar on both sides
-                # (measured 2026-10-02 over 30 scans, +-3 deg margin). Only returns
-                # closer than self_mask_range there are dropped. Angles are in
-                # laser_frame, so they stay valid if the TF lidar_yaw changes;
-                # re-measure if the lidar itself is remounted/rotated.
-                'self_mask_deg': [-95.0, -83.5, -81.5, -69.5, 71.5, 82.5, 84.5, 96.5],
+                # (measured 2026-10-02; re-checked: they reach -99.5 / +98.5 deg and
+                # show between the two posts of a side, so each side is one sector
+                # with a margin). Only returns closer than self_mask_range there are
+                # dropped. Angles are in laser_frame, so they stay valid if the TF
+                # lidar_yaw changes; re-measure if the lidar itself is remounted/rotated.
+                'self_mask_deg': [-103.0, -66.0, 68.0, 102.0],
                 'self_mask_range': 0.35,
             }],
         ),

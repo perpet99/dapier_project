@@ -24,9 +24,9 @@ if [[ $# -gt 0 && "$1" != *:=* ]]; then
 fi
 
 # One SLAM at a time (two would both publish map->odom).
-if pgrep -f "async_slam_toolbox_node|lib/rtabmap_slam/rtabmap" >/dev/null; then
-  echo "ERROR: a SLAM node (slam_toolbox / rtabmap) is already running on this machine:"
-  pgrep -af "async_slam_toolbox_node|lib/rtabmap_slam/rtabmap" | grep -v pgrep | cut -c1-120
+if pgrep -f "async_slam_toolbox_node|lib/rtabmap_slam/rtabmap|lib/nav2_amcl/amcl|lib/nav2_map_server/map_server" >/dev/null; then
+  echo "ERROR: a SLAM / localization node (slam_toolbox, rtabmap, AMCL navigation) is already running on this machine:"
+  pgrep -af "async_slam_toolbox_node|lib/rtabmap_slam/rtabmap|lib/nav2_amcl/amcl|lib/nav2_map_server/map_server" | grep -v pgrep | cut -c1-120
   exit 1
 fi
 
