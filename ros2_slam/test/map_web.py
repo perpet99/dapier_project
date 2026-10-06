@@ -23,8 +23,9 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
   POST /api/labels {"name": "주방"}   label the robot's current map pose
                                 (or {"name", "x", "y", "yaw"} for an explicit pose)
   POST /api/labels/delete {"id": "..."}
-  POST /api/nav/goto {"id": "..."}    back up goto_backup_m (0.30 m) first, then
-                                Nav2 NavigateToPose to the label
+  POST /api/nav/goto {"id": "..."}    Nav2 NavigateToPose to the label; when the label is
+                                behind the robot (bearing > 90 deg) back up goto_backup_m
+                                (0.30 m) first
   POST /api/nav/cancel          cancel the Nav2 goal (manual driving cancels it too)
   GET  /api/nav/tolerance       JSON: arrival tolerance saved here / active in Nav2, limits
   POST /api/nav/tolerance {"xy": 0.05, "yaw_deg": 14}
@@ -1271,15 +1272,31 @@ class MapWeb(Node):
             # a goal still running would fight the backup over /cmd_vel: cancel it first
             if self.goal_handle is not None and self.nav.get('state') in ('sending', 'active'):
                 self.goal_handle.cancel_goal_async()
-            if self.backup_m <= 0:
-                self._send_goal(label, '')
+            bearing = self._goal_bearing(label)
+            if self.backup_m <= 0 or bearing is None or abs(bearing) <= math.pi / 2:
+                note = ('' if self.backup_m <= 0 else
+                        '현재 위치를 몰라 후진 생략' if bearing is None else
+                        f'목표가 앞쪽({math.degrees(bearing):+.0f}°)이라 후진 생략')
+                self._send_goal(label, note)
                 continue
             self.backup = {'label': label, 'start': None, 't0': time.time()}
             self.nav = {'state': 'backing', 'target': label, 'started': time.time(), 'backed': 0.0,
                         'message': f'후진 {self.backup_m * 100:.0f} cm 중…'}
-            self.get_logger().info(f"goto '{label['name']}': backing up {self.backup_m:.2f} m first")
+            self.get_logger().info(f"goto '{label['name']}': goal behind ({math.degrees(bearing):+.0f} deg), "
+                                   f"backing up {self.backup_m:.2f} m first")
         if self.backup is not None:
             self._backup_tick()
+
+    def _goal_bearing(self, label):
+        """Direction of the label seen from the robot (rad, 0 = straight ahead, +-pi = behind), None if unknown."""
+        cur = self.cur_pose
+        if cur is None or time.time() - cur[4] > 2.0 or cur[0] != label.get('frame', self.map_frame):
+            return None
+        dx, dy = label['x'] - cur[1], label['y'] - cur[2]
+        if math.hypot(dx, dy) < 0.05:
+            return 0.0
+        b = math.atan2(dy, dx) - cur[3]
+        return math.atan2(math.sin(b), math.cos(b))
 
     def _send_goal(self, label, note):
         self.nav_seq += 1
@@ -1538,7 +1555,7 @@ __DRIVE_CSS__
 </div>
 <div class="legend">
   <span><i style="background:#ffb300"></i>로봇 (원 = 차체 반경)</span><span><i style="background:#e040fb"></i>라이다 스캔</span>
-  <span><i style="background:#ff1744;border-radius:50%"></i>위치 라벨</span>
+  <span><i style="background:#ff1744;border-radius:50%"></i>위치 라벨 (화살표 = 도착 방향)</span>
   <span><i style="background:#4cc2ff"></i>주행 궤적</span><span><i style="background:#69f0ae"></i>Nav2 경로</span>
   <span><i style="background:#eceff1"></i>빈 공간</span><span><i style="background:#000;border:1px solid #555"></i>장애물</span>
   <span><i style="background:#808080"></i>미탐색</span>
@@ -1730,11 +1747,18 @@ function drawLabels() {
     if (lb.id === target) {     // Nav2 goal: green ring
       ctx.beginPath(); ctx.arc(x, y, 14, 0, 2 * Math.PI); ctx.strokeStyle = '#69f0ae'; ctx.lineWidth = 3; ctx.stroke();
     }
-    if (sel) {                  // selected: ring + saved heading
-      const a = -(lb.yaw + view.rot);
+    if (sel) {                  // selected: white ring
       ctx.beginPath(); ctx.arc(x, y, 10, 0, 2 * Math.PI); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(x + 10 * Math.cos(a), y + 10 * Math.sin(a)); ctx.lineTo(x + 24 * Math.cos(a), y + 24 * Math.sin(a));
-      ctx.stroke();
+    }
+    {                           // saved heading (the robot faces this way on arrival): arrow
+      const a = -(lb.yaw + view.rot), L = sel ? 30 : 24, c = Math.cos(a), s = Math.sin(a);
+      const tx = x + L * c, ty = y + L * s;
+      ctx.beginPath(); ctx.moveTo(x + 5 * c, y + 5 * s); ctx.lineTo(tx - 6 * c, ty - 6 * s);
+      ctx.strokeStyle = '#000'; ctx.lineWidth = sel ? 5 : 4; ctx.stroke();
+      ctx.strokeStyle = sel ? '#fff' : '#ff5252'; ctx.lineWidth = sel ? 3 : 2; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(tx, ty);
+      ctx.lineTo(tx - 9 * c + 5 * s, ty - 9 * s - 5 * c); ctx.lineTo(tx - 9 * c - 5 * s, ty - 9 * s + 5 * c); ctx.closePath();
+      ctx.fillStyle = sel ? '#fff' : '#ff5252'; ctx.fill(); ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
     }
     ctx.beginPath(); ctx.arc(x, y, sel ? 7 : 5.5, 0, 2 * Math.PI);
     ctx.fillStyle = '#ff1744'; ctx.fill(); ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5; ctx.stroke();
@@ -2068,7 +2092,10 @@ $('ldel').onclick = async () => {
 };
 $('lgo').onclick = async () => {
   const lb = S.labels.find(l => l.id === selId); if (!lb) return;
-  if (!confirm(`로봇이 먼저 30 cm 후진한 뒤 '${lb.name}' (x ${lb.x.toFixed(2)}, y ${lb.y.toFixed(2)})까지 자율 주행합니다.\n주변이 안전한가요? (중지: 'Navi 취소' 또는 주행 패드)`)) return;
+  const p = S.frame === 'map' ? S.pose : null;
+  const behind = p && Math.abs(Math.atan2(Math.sin(Math.atan2(lb.y - p.y, lb.x - p.x) - p.yaw),
+                                          Math.cos(Math.atan2(lb.y - p.y, lb.x - p.x) - p.yaw))) > Math.PI / 2;
+  if (!confirm(`로봇이 ${behind ? '(목표가 뒤쪽이라) 먼저 30 cm 후진한 뒤 ' : ''}'${lb.name}' (x ${lb.x.toFixed(2)}, y ${lb.y.toFixed(2)})까지 자율 주행합니다.\n주변이 안전한가요? (중지: 'Navi 취소' 또는 주행 패드)`)) return;
   try { await post('/api/nav/goto', { id: lb.id }); msg('navstate', `'${lb.name}'(으)로 목표 전송`, 'busy'); }
   catch (e) { msg('navstate', e.message, 'err'); }
 };

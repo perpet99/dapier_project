@@ -97,7 +97,7 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | GET | `/api/labels` | 위치 라벨 목록 | |
 | POST | `/api/labels` | 라벨 추가 (현재 위치 또는 지정 좌표) | |
 | POST | `/api/labels/delete` | 라벨 삭제 | |
-| POST | `/api/nav/goto` | 30 cm 후진 후 라벨 위치로 Nav2 자율 주행 | **예** |
+| POST | `/api/nav/goto` | 라벨 위치로 Nav2 자율 주행 (목표가 뒤쪽이면 먼저 30 cm 후진) | **예** |
 | POST | `/api/nav/cancel` | Nav2 목표 취소 | |
 | GET | `/api/nav/tolerance` | 도착 오차 | |
 | POST | `/api/nav/tolerance` | 도착 오차 설정 | |
@@ -270,8 +270,10 @@ curl -X POST http://192.168.0.31:8081/api/labels -d '{"name":"문 앞","x":1.2,"
 `{"id": "994b2b49"}` → `{"ok": true}`. 없는 id면 `404 {"error": "없는 라벨입니다"}`.
 
 ### POST `/api/nav/goto`
-`{"id": "994b2b49"}` **먼저 똑바로 `goto_backup_m`(30 cm) 후진한 뒤**, 라벨의 위치·방향으로
-Nav2 `navigate_to_pose` 목표를 보낸다(RViz "Nav2 Goal"과 같음). **로봇이 움직인다.**
+`{"id": "994b2b49"}` 라벨의 위치·방향으로 Nav2 `navigate_to_pose` 목표를 보낸다(RViz "Nav2 Goal"과 같음).
+**목표가 로봇 뒤쪽이면, 즉 로봇 정면에서 본 목표 방향이 ±90°를 넘으면, 먼저 똑바로 `goto_backup_m`(30 cm) 후진한다.**
+목표가 앞쪽이거나 map 좌표의 현재 위치를 모르면 후진하지 않는다. 그 이유는 `nav.note`에 남는다.
+**로봇이 움직인다.**
 
 **후진 단계**
 - 속도 `goto_backup_speed`(0.08 m/s)로 후진하며, 거리는 odom으로 잰다.
