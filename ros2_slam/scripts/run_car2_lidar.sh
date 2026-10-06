@@ -7,6 +7,7 @@ set -euo pipefail
 # Usage: ./scripts/run_car2_lidar.sh [launch args...]
 #   e.g. ./scripts/run_car2_lidar.sh lidar_z:=0.25 lidar_yaw:=3.1416
 #        ./scripts/run_car2_lidar.sh use_car2_driver:=false     # lidar only
+#        ./scripts/run_car2_lidar.sh use_camera:=true           # + depth/RGB camera
 
 export ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
