@@ -16,16 +16,28 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
   POST /api/drive/stop
   GET  /api/drive
   POST /api/trail/clear         forget the driven trail
+  GET  /stream/rgb.mjpg         camera RGB (MJPEG), /stream/depth.mjpg?max=4000 colorized depth
+                                (robot_rgbd.launch.py running; topics are only subscribed
+                                while someone watches)
   GET  /api/labels              JSON: saved location labels (map frame)
   POST /api/labels {"name": "주방"}   label the robot's current map pose
                                 (or {"name", "x", "y", "yaw"} for an explicit pose)
   POST /api/labels/delete {"id": "..."}
-  POST /api/nav/goto {"id": "..."}    Nav2 NavigateToPose to a label
+  POST /api/nav/goto {"id": "..."}    back up goto_backup_m (0.30 m) first, then
+                                Nav2 NavigateToPose to the label
   POST /api/nav/cancel          cancel the Nav2 goal (manual driving cancels it too)
   GET  /api/nav/tolerance       JSON: arrival tolerance saved here / active in Nav2, limits
   POST /api/nav/tolerance {"xy": 0.05, "yaw_deg": 14}
                                 set Nav2's goal checker tolerance (within the min..max
                                 limits), saved and re-applied whenever Nav2 (re)starts
+  GET  /api/approach            JSON: approach settings + state
+  POST /api/approach/config {"line": 0.7, "obstacle_mm": 1000, "ignore_bottom": 0.22, "speed": 0.05, "min_px": 40}
+  POST /api/approach/start      creep forward until an obstacle is past the approach line
+  POST /api/approach/stop
+  GET  /api/wall                JSON: lidar wall approach settings + state + fitted wall
+  POST /api/wall/config {"gap": 0.1, "tol_deg": 1.5, "speed": 0.06}
+  POST /api/wall/start          square up to the wall in front, then drive to `gap` from it
+  POST /api/wall/stop
   POST /api/relocalize {"global": false, "dry_run": false}
                                 re-find the robot in the map by matching the current
                                 lidar scan to it, then send that pose to AMCL
@@ -51,6 +63,26 @@ running), otherwise odom->base_link (pure wheel odometry, drifts).
 The page polls /api/state at ~5 Hz; the state is computed in the ROS thread
 (timer), so HTTP threads never touch TF.
 
+Approach (깊이 근접 이동): the depth camera looks down at the floor in front of the
+robot (bird's-eye; image bottom = nearest). A depth pixel closer to the camera
+than obstacle_mm is "obstacle" (the floor is farther: ~1.3 m at the bottom,
+~2 m in the middle). The approach zone is the band of rows between the line
+(fraction of the image height) and the ignored bottom strip (robot body).
+Start creeps forward at `speed` and stops when >= min_px obstacle pixels are
+in the zone. It also stops on: no fresh depth (> 0.5 s), most of the zone
+unmeasurable (too close for the camera, < ~0.6 m), a lidar point right in front
+of the robot, approach_max_m travelled, approach_timeout_s, the drive pad,
+or Go to.
+
+Lidar approach (라이다 근접 이동): RANSAC line fit on the lidar points within
++-40 deg / 3 m in front (base_link); a wall must face the robot (normal within
++-50 deg). Phases: align (turn in place until the wall normal is straight
+ahead within tol_deg; near the target, short turn pulses each followed by a
+fresh scan, so the 6 Hz lidar lag can't overshoot) -> approach (forward with
+heading correction, slowing down, until the wall is robot_front + gap from
+the center) -> final align. Stops on: wall lost, stale scan, anything in the
+corridor closer than the wall, 3 m travelled, 90 s, stop / drive pad / Go to.
+
 Usage (on the Pi, same ROS_DOMAIN_ID as the laptop):
   source /opt/ros/jazzy/setup.bash
   /usr/bin/python3 map_web.py
@@ -64,7 +96,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import cv2
 import numpy as np
@@ -81,7 +113,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import CompressedImage, Image, LaserScan
 import tf2_ros
 
 from drive_control import DRIVE_CSS, DRIVE_HTML, DRIVE_JS, DriveControl
@@ -242,6 +274,560 @@ class ScanMatcher:
         return sorted(out, key=lambda r: -r[0])
 
 
+def image_to_array(msg: Image) -> np.ndarray:
+    """sensor_msgs/Image -> numpy without cv_bridge (BGR for color, uint16 mm for depth)."""
+    if msg.encoding in ('rgb8', 'bgr8'):
+        arr = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.step)[:, :msg.width * 3]
+        arr = arr.reshape(msg.height, msg.width, 3)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if msg.encoding == 'rgb8' else arr.copy()
+    if msg.encoding in ('16UC1', 'mono16'):
+        dtype = np.dtype('>u2' if msg.is_bigendian else '<u2')
+        return np.frombuffer(msg.data, dtype).reshape(msg.height, msg.step // 2)[:, :msg.width].astype(np.uint16)
+    if msg.encoding == '32FC1':  # meters -> mm
+        arr = np.frombuffer(msg.data, np.float32).reshape(msg.height, msg.step // 4)[:, :msg.width]
+        return np.nan_to_num(arr * 1000.0).astype(np.uint16)
+    raise ValueError(f'unsupported encoding {msg.encoding}')
+
+
+class CameraFeed:
+    """Latest frame of one camera topic, subscribed only while a browser watches.
+
+    Raw 640x480 images at 30 fps cost real CPU to deserialize in Python on the
+    Pi, so the subscription is created when the first MJPEG viewer connects and
+    dropped 5 s after the last one leaves (the ROS thread does both, in tick()).
+    JPEG encoding happens once per new frame however many viewers there are;
+    a sensor_msgs/CompressedImage (jpeg) topic is passed through as is.
+
+    QoS is RELIABLE, depth 1: a raw 640x480 RGB frame is ~920 KB, and with
+    BEST_EFFORT one lost UDP fragment (the Pi's socket buffer is ~200 KB)
+    drops the whole frame -- RGB arrived at 0 fps that way.
+    """
+
+    QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+
+    def __init__(self, node: Node, topic: str, render, compressed=False):
+        self.node, self.topic, self.render, self.compressed = node, topic, render, compressed
+        self.cond = threading.Condition()
+        self.frame, self.seq, self.stamps = None, 0, []
+        self.jpeg_cache = {}          # (seq, key) -> bytes
+        self.viewers, self.last_viewer = 0, 0.0
+        self.keep = False             # stay subscribed without viewers (approach running)
+        self.sub = None
+
+    def latest(self):
+        """(frame, receive time) of the newest frame, (None, 0) if none."""
+        with self.cond:
+            return self.frame, (self.stamps[-1] if self.stamps else 0.0)
+
+    def _on(self, msg):
+        try:
+            if self.compressed:
+                if 'jpeg' not in msg.format.lower() and 'jpg' not in msg.format.lower():
+                    raise ValueError(f'not a JPEG: format {msg.format!r}')
+                frame = bytes(msg.data)
+            else:
+                frame = image_to_array(msg)
+        except ValueError as exc:
+            self.node.get_logger().warn(f'{self.topic}: {exc}', throttle_duration_sec=10.0)
+            return
+        with self.cond:
+            now = time.time()
+            self.frame, self.seq = frame, self.seq + 1
+            self.stamps = [t for t in self.stamps if now - t < 2.0] + [now]
+            self.jpeg_cache.clear()
+            self.cond.notify_all()
+
+    def tick(self):
+        if self.viewers > 0 or self.keep or time.time() - self.last_viewer < 5.0:
+            if self.sub is None:
+                self.sub = self.node.create_subscription(CompressedImage if self.compressed else Image,
+                                                         self.topic, self._on, self.QOS)
+        elif self.sub is not None:
+            self.node.destroy_subscription(self.sub)
+            self.sub = None
+            with self.cond:
+                self.frame, self.stamps = None, []
+
+    def fps(self):
+        now = time.time()
+        return round(len([t for t in self.stamps if now - t < 2.0]) / 2.0, 1)
+
+    def watch(self, wfile, key, arg, max_fps, quality):
+        """Serve MJPEG to one browser until it disconnects."""
+        with self.cond:
+            self.viewers += 1
+        seq, last = -1, 0.0
+        try:
+            while rclpy.ok():
+                with self.cond:
+                    self.cond.wait_for(lambda: self.seq != seq, timeout=2.0)
+                    seq, frame = self.seq, self.frame
+                    jpg = self.jpeg_cache.get((seq, key))
+                if frame is None:
+                    continue
+                if jpg is None and self.compressed:
+                    jpg = frame
+                if jpg is None:
+                    ok, buf = cv2.imencode('.jpg', self.render(frame, arg), [cv2.IMWRITE_JPEG_QUALITY, quality])
+                    jpg = buf.tobytes()
+                    with self.cond:
+                        if self.seq == seq:
+                            self.jpeg_cache[(seq, key)] = jpg
+                wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n'
+                            + f'Content-Length: {len(jpg)}\r\n\r\n'.encode() + jpg + b'\r\n')
+                wait = 1.0 / max_fps - (time.time() - last)
+                if wait > 0:
+                    time.sleep(wait)
+                last = time.time()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # browser closed / hid the view
+        finally:
+            with self.cond:
+                self.viewers -= 1
+                self.last_viewer = time.time()
+
+
+def render_rgb(frame, _arg):
+    return frame if frame.shape[1] <= 640 else cv2.resize(frame, (640, 640 * frame.shape[0] // frame.shape[1]))
+
+
+def render_depth(depth, max_mm, approach=None):
+    vis = cv2.applyColorMap(cv2.convertScaleAbs(depth, alpha=255.0 / max(max_mm, 1)), cv2.COLORMAP_JET)
+    vis[depth == 0] = 0  # no return -> black
+    if approach is not None:
+        cfg = approach.cfg
+        h = depth.shape[0]
+        r0, r1 = approach.rows(h)
+        obst = (depth > 0) & (depth < cfg['obstacle_mm'])
+        # obstacle pixels: red inside the approach zone, pink elsewhere
+        zone = np.zeros_like(obst)
+        zone[r0:r1] = True
+        vis[obst & ~zone] = (vis[obst & ~zone] * 0.35 + np.array([180, 105, 255]) * 0.65).astype(np.uint8)
+        vis[obst & zone] = (0, 0, 255)
+        vis[r1:] = (vis[r1:] * 0.35).astype(np.uint8)        # ignored bottom strip (robot body)
+    if vis.shape[1] < 640:  # 320x240 depth -> same size as the RGB view
+        vis = cv2.resize(vis, (640, 640 * vis.shape[0] // vis.shape[1]), interpolation=cv2.INTER_NEAREST)
+    if approach is not None:
+        H, W = vis.shape[:2]
+        y0, y1 = int(r0 * H / h), int(r1 * H / h)
+        cv2.line(vis, (0, y0), (W, y0), (255, 255, 255), 3)
+        cv2.line(vis, (0, y0), (W, y0), (0, 0, 0), 1)
+        cv2.putText(vis, f"APPROACH LINE  obstacle < {cfg['obstacle_mm']} mm", (8, max(y0 - 8, 16)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+        if y1 < H:
+            for x in range(0, W, 16):
+                cv2.line(vis, (x, y1), (x + 8, y1), (200, 200, 200), 1)
+            cv2.putText(vis, 'IGNORED (robot body)', (8, min(y1 + 18, H - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (200, 200, 200), 1, cv2.LINE_AA)
+        n = approach.zone_px
+        if n is not None:
+            hit = n >= cfg['min_px']
+            cv2.putText(vis, f'zone obstacle px {n}' + (' >= STOP' if hit else ''), (8, min(y0 + 22, H - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255) if hit else (255, 255, 255), 2, cv2.LINE_AA)
+    return vis
+
+
+class Approach:
+    """Creep forward until an obstacle (depth closer than obstacle_mm) crosses the approach line."""
+
+    LIMITS = {'line': (0.05, 0.95), 'obstacle_mm': (300, 6000), 'ignore_bottom': (0.0, 0.5),
+              'speed': (0.02, 0.10), 'min_px': (5, 5000), 'lidar_stop_m': (0.0, 1.0)}
+
+    def __init__(self, node):
+        self.node = node
+        p = lambda name, default: node.declare_parameter(name, default).value
+        self.path = os.path.expanduser(p('approach_file', '~/.ros/car2_approach.json'))
+        self.max_m = float(p('approach_max_m', 1.5))
+        self.timeout_s = float(p('approach_timeout_s', 60.0))
+        # lidar stop: gap in front of the body (stop at robot_front + this from the center)
+        self.cfg = {'line': 0.7, 'obstacle_mm': 1100, 'ignore_bottom': 0.22, 'speed': 0.05, 'min_px': 40,
+                    'lidar_stop_m': float(p('approach_lidar_stop_m', 0.12))}
+        try:
+            with open(self.path) as f:
+                self.cfg.update({k: v for k, v in json.load(f).items() if k in self.cfg})
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            node.get_logger().warn(f'approach: cannot read {self.path}: {exc}')
+        self.state = {'state': 'idle', 'message': ''}
+        self.zone_px = None           # obstacle pixels in the zone (latest analysed frame)
+        self.zone_invalid = None      # fraction of zone pixels without depth
+        self.lidar_front = None       # closest lidar point in the forward corridor (m from center)
+        self.start_xy = None
+        self.started = 0.0
+        node.create_timer(0.1, self.tick)
+
+    def rows(self, h):
+        r0 = int(round(self.cfg['line'] * h))
+        r1 = int(round((1.0 - self.cfg['ignore_bottom']) * h))
+        return r0, max(r0, r1)
+
+    def set_config(self, req: dict) -> dict:
+        new = dict(self.cfg)
+        for k, (lo, hi) in self.LIMITS.items():
+            if k in req:
+                v = float(req[k])
+                if not lo <= v <= hi:
+                    raise ValueError(f'{k}: {lo:g} ~ {hi:g} 범위로 입력하세요')
+                new[k] = int(v) if k in ('obstacle_mm', 'min_px') else round(v, 3)
+        if new['line'] >= 1.0 - new['ignore_bottom'] - 0.02:
+            raise ValueError('근접선이 하단 제외 영역 안에 있습니다 — 근접선을 위로 올리거나 하단 제외를 줄이세요')
+        self.cfg = new
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path + '.tmp', 'w') as f:
+            json.dump(self.cfg, f)
+        os.replace(self.path + '.tmp', self.path)
+        return self.status()
+
+    def analyze(self, depth):
+        r0, r1 = self.rows(depth.shape[0])
+        zone = depth[r0:r1]
+        if zone.size == 0:
+            return 0, 1.0
+        obst = (zone > 0) & (zone < self.cfg['obstacle_mm'])
+        return int(obst.sum()), float((zone == 0).mean())
+
+    def running(self):
+        return self.state['state'] == 'running'
+
+    def start(self):
+        n = self.node
+        if self.running():
+            raise ValueError('이미 깊이 근접 이동 중입니다')
+        if n.wall.running():
+            n.wall.stop('stopped', '깊이 근접 이동으로 중지')
+        if n.nav_active():
+            raise ValueError('Navi 주행 중입니다 — 먼저 취소하세요')
+        if not n.drive.status()['driver_connected']:
+            raise ValueError('차량 드라이버가 /cmd_vel을 구독하지 않습니다')
+        if n.count_publishers(n.cameras['depth'].topic) == 0:
+            raise ValueError('깊이 카메라 토픽이 없습니다 — robot_rgbd 실행')
+        n.cameras['depth'].keep = True
+        self.start_xy = None
+        self.started = time.time()
+        self.state = {'state': 'running', 'message': '전진 중…', 'moved': 0.0}
+
+    def stop(self, state='stopped', message='정지'):
+        was = self.running()
+        self.node.cameras['depth'].keep = False
+        if was:
+            self.node.drive.stop()
+        self.state = {**self.state, 'state': state, 'message': message, 'finished': time.time()}
+        if was:
+            self.node.get_logger().info(f'approach {state}: {message}')
+
+    def _lidar_front(self):
+        """Closest lidar point in the robot's forward corridor beyond its footprint (m), or None."""
+        n = self.node
+        if n.scan is None or time.time() - n.scan[1] > 1.0:
+            return None
+        msg = n.scan[0]
+        t = n._lookup(n.base_frame, msg.header.frame_id)
+        if t is None:
+            return None
+        tx, ty, tyaw = tf2d(t)
+        r = np.asarray(msg.ranges, dtype=np.float32)
+        a = msg.angle_min + np.arange(r.size, dtype=np.float32) * msg.angle_increment + tyaw
+        ok = np.isfinite(r) & (r >= msg.range_min) & (r <= msg.range_max)
+        x, y = tx + r[ok] * np.cos(a[ok]), ty + r[ok] * np.sin(a[ok])
+        front = (x > n.robot_front) & (np.abs(y) < n.robot_radius)
+        return float(x[front].min()) if front.any() else None
+
+    def tick(self):
+        frame, t = self.node.cameras['depth'].latest()
+        fresh = frame is not None and time.time() - t < 0.5
+        if fresh:
+            self.zone_px, self.zone_invalid = self.analyze(frame)
+        elif not self.node.cameras['depth'].sub:
+            self.zone_px = self.zone_invalid = None
+        self.lidar_front = self._lidar_front()
+        if not self.running():
+            return
+        n = self.node
+        cur = n.cur_pose
+        if cur is not None and self.start_xy is None:
+            self.start_xy = (cur[0], cur[1], cur[2])
+        moved = 0.0
+        if cur is not None and self.start_xy is not None and cur[0] == self.start_xy[0]:
+            moved = math.hypot(cur[1] - self.start_xy[1], cur[2] - self.start_xy[2])
+        self.state['moved'] = round(moved, 3)
+        if not fresh:
+            if time.time() - self.started > 2.0:     # allow the subscription to start
+                self.stop('failed', '깊이 영상이 끊겼습니다 — 정지')
+            else:
+                n.drive.stop()
+            return
+        if self.zone_px >= self.cfg['min_px']:
+            self.stop('done', f'장애물이 근접선 안으로 들어옴 — 정지 ({moved:.2f} m 이동)')
+            return
+        if self.zone_invalid > 0.5:
+            self.stop('failed', f'근접 영역의 {self.zone_invalid * 100:.0f}%가 깊이 측정 불가 (너무 가까움?) — 정지')
+            return
+        front = self.lidar_front
+        if front is not None and front < n.robot_front + self.cfg['lidar_stop_m']:
+            self.stop('failed', f'라이다: 앞 {front:.2f} m 장애물 — 정지')
+            return
+        if moved > self.max_m:
+            self.stop('failed', f'최대 이동 거리 {self.max_m:g} m 도달 — 정지')
+            return
+        if time.time() - self.started > self.timeout_s:
+            self.stop('failed', f'{self.timeout_s:g}초 안에 도달하지 못함 — 정지')
+            return
+        n.drive.drive(self.cfg['speed'], 0.0)
+
+    def status(self):
+        return {**self.cfg, **self.state, 'zone_px': self.zone_px,
+                'zone_invalid': None if self.zone_invalid is None else round(self.zone_invalid, 2),
+                'max_m': self.max_m, 'limits': self.LIMITS, 'robot_front': self.node.robot_front,
+                'lidar_front': None if self.lidar_front is None else round(self.lidar_front, 3)}
+
+
+def fit_wall(pts, sector_deg=40.0, max_range=3.0, inlier_m=0.025, min_inliers=15, facing_deg=50.0):
+    """Dominant wall in front of the robot from lidar points (N x 2, base_link).
+
+    -> {'dist': m from the robot center, 'err': rad (turn left by this to face it
+    squarely), 'inliers', 'rms', 'ends': [[x, y], [x, y]]} or None.
+    """
+    if pts is None or len(pts) < min_inliers:
+        return None
+    r = np.hypot(pts[:, 0], pts[:, 1])
+    a = np.arctan2(pts[:, 1], pts[:, 0])
+    P = pts[(np.abs(a) < math.radians(sector_deg)) & (r < max_range) & (pts[:, 0] > 0)]
+    if len(P) < min_inliers:
+        return None
+    rng = np.random.default_rng()
+    pairs = rng.integers(0, len(P), size=(200, 2))
+    best_cnt, best_inl = 0, None
+    for i, j in pairs:
+        d = P[j] - P[i]
+        L = math.hypot(d[0], d[1])
+        if L < 0.05:
+            continue
+        nvec = np.array([-d[1], d[0]]) / L
+        c = float(nvec @ P[i])
+        if c < 0:
+            nvec, c = -nvec, -c
+        if abs(math.atan2(nvec[1], nvec[0])) > math.radians(facing_deg):
+            continue                       # a side wall, not one we face
+        inl = np.abs(P @ nvec - c) < inlier_m
+        cnt = int(inl.sum())
+        if cnt > best_cnt:
+            best_cnt, best_inl = cnt, inl
+    if best_cnt < min_inliers:
+        return None
+    Q = P[best_inl]
+    mean = Q.mean(axis=0)
+    _, _, vt = np.linalg.svd(Q - mean, full_matrices=False)
+    dvec = vt[0]
+    nvec = np.array([-dvec[1], dvec[0]])
+    c = float(nvec @ mean)
+    if c < 0:
+        nvec, c = -nvec, -c
+    t = (Q - mean) @ dvec
+    ends = [mean + dvec * t.min(), mean + dvec * t.max()]
+    return {'dist': c, 'err': math.atan2(nvec[1], nvec[0]), 'inliers': best_cnt,
+            'rms': float(np.sqrt(np.mean((Q @ nvec - c) ** 2))),
+            'ends': [[round(float(e[0]), 3), round(float(e[1]), 3)] for e in ends]}
+
+
+class WallApproach:
+    """Square up to the wall in front using the lidar, then drive as close as `gap`."""
+
+    LIMITS = {'gap': (0.02, 0.5), 'tol_deg': (0.5, 5.0), 'speed': (0.02, 0.10)}
+    MIN_W = 0.15          # rad/s, slowest turn the skid-steer reliably makes
+    MAX_W = 0.35
+
+    def __init__(self, node):
+        self.node = node
+        p = lambda name, default: node.declare_parameter(name, default).value
+        self.path = os.path.expanduser(p('wall_file', '~/.ros/car2_wall_approach.json'))
+        self.max_m = float(p('wall_max_m', 3.0))
+        self.timeout_s = float(p('wall_timeout_s', 90.0))
+        self.cfg = {'gap': 0.10, 'tol_deg': 1.5, 'speed': 0.06}
+        try:
+            with open(self.path) as f:
+                self.cfg.update({k: float(v) for k, v in json.load(f).items() if k in self.cfg})
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            node.get_logger().warn(f'wall approach: cannot read {self.path}: {exc}')
+        self.state = {'state': 'idle', 'message': ''}
+        self.wall = None              # latest fit
+        self.wall_t = 0.0             # receive time of the scan it came from
+        self.corridor = None          # closest point in the forward corridor (m)
+        self.scan_seen = 0.0
+        self.misses = 0
+        self.pulse_end = None
+        self.settle_after = 0.0       # need a scan received after this before deciding
+        self.phase_t = 0.0
+        node.create_timer(0.1, self.tick)
+
+    def set_config(self, req: dict) -> dict:
+        new = dict(self.cfg)
+        for k, (lo, hi) in self.LIMITS.items():
+            if k in req:
+                v = float(req[k])
+                if not lo <= v <= hi:
+                    raise ValueError(f'{k}: {lo:g} ~ {hi:g} 범위로 입력하세요')
+                new[k] = round(v, 3)
+        self.cfg = new
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path + '.tmp', 'w') as f:
+            json.dump(self.cfg, f)
+        os.replace(self.path + '.tmp', self.path)
+        return self.status()
+
+    def target(self):
+        return self.node.robot_front + self.cfg['gap']
+
+    def running(self):
+        return self.state['state'] == 'running'
+
+    def start(self):
+        n = self.node
+        if self.running():
+            raise ValueError('이미 라이다 근접 이동 중입니다')
+        if n.nav_active():
+            raise ValueError('Navi 주행 중입니다 — 먼저 취소하세요')
+        if not n.drive.status()['driver_connected']:
+            raise ValueError('차량 드라이버가 /cmd_vel을 구독하지 않습니다')
+        w = self.wall
+        if w is None or time.time() - self.wall_t > 1.0:
+            raise ValueError('정면(±40°, 3 m 안)에서 벽을 찾지 못했습니다')
+        if w['dist'] <= self.target() + 0.005:
+            raise ValueError(f"이미 목표 거리 안입니다 (벽까지 {w['dist']:.2f} m, 목표 {self.target():.2f} m)")
+        if n.approach.running():
+            n.approach.stop('stopped', '라이다 근접 이동으로 중지')
+        self.start_xy = None
+        self.started = self.phase_t = time.time()
+        self.pulse_end, self.settle_after, self.misses = None, 0.0, 0
+        self.state = {'state': 'running', 'phase': 'align', 'message': '벽과 수직으로 회전 중…', 'moved': 0.0}
+        n.get_logger().info(f"wall approach start: wall {w['dist']:.2f} m, {math.degrees(w['err']):+.1f} deg, "
+                            f"target {self.target():.2f} m")
+
+    def stop(self, state='stopped', message='정지'):
+        was = self.running()
+        if was:
+            self.node.drive.stop()
+        self.pulse_end = None
+        self.state = {**self.state, 'state': state, 'message': message, 'finished': time.time()}
+        if was:
+            self.node.get_logger().info(f'wall approach {state}: {message}')
+
+    def _update_wall(self):
+        n = self.node
+        if n.scan is None or n.scan[1] == self.scan_seen:
+            return
+        msg, recv = n.scan
+        self.scan_seen = recv
+        t = n._lookup(n.base_frame, msg.header.frame_id)
+        if t is None:
+            return
+        tx, ty, tyaw = tf2d(t)
+        r = np.asarray(msg.ranges, dtype=np.float64)
+        a = msg.angle_min + np.arange(r.size) * msg.angle_increment + tyaw
+        ok = np.isfinite(r) & (r >= msg.range_min) & (r <= msg.range_max)
+        pts = np.stack([tx + r[ok] * np.cos(a[ok]), ty + r[ok] * np.sin(a[ok])], axis=1)
+        # the robot's own wheels / frame show up beside it (x < robot_front): not obstacles
+        ahead = pts[:, 0] > n.robot_front
+        corr = ahead & (np.abs(pts[:, 1]) < n.robot_radius)
+        self.corridor = float(pts[corr, 0].min()) if corr.any() else None
+        fit = fit_wall(pts[ahead])
+        if fit is None:
+            # close to the wall the lidar's 0.25 m minimum range hides the points straight
+            # ahead -- look wider (side walls are still rejected by the facing check)
+            fit = fit_wall(pts[ahead], sector_deg=65.0)
+        if fit is None:
+            self.misses += 1
+            if self.misses > 5:
+                self.wall = None
+            return
+        self.misses = 0
+        self.wall, self.wall_t = fit, recv
+
+    def _turn(self, err, tol):
+        """Align step toward err (rad). True when within tol."""
+        now = time.time()
+        d = self.node.drive
+        if self.pulse_end is not None:
+            if now < self.pulse_end:
+                d.drive(0.0, self.pulse_w)
+                return False
+            self.pulse_end = None
+            d.stop()
+            self.settle_after = now + 0.15      # judge only from a scan taken after the robot stopped
+            return False
+        if self.wall_t < self.settle_after:
+            return False
+        if abs(err) <= tol:
+            d.stop()
+            return True
+        if abs(err) > 3 * tol:                   # far: turn continuously, proportional
+            w = max(self.MIN_W, min(self.MAX_W, 1.2 * abs(err)))
+            d.drive(0.0, math.copysign(w, err))
+        else:                                    # near: one short pulse, then look again
+            self.pulse_w = math.copysign(self.MIN_W, err)
+            self.pulse_end = now + min(0.4, max(0.08, abs(err) / self.MIN_W))
+            d.drive(0.0, self.pulse_w)
+        return False
+
+    def tick(self):
+        self._update_wall()
+        if not self.running():
+            return
+        n, now = self.node, time.time()
+        cur = n.cur_pose
+        if cur is not None and self.start_xy is None:
+            self.start_xy = (cur[0], cur[1], cur[2])
+        moved = 0.0
+        if cur is not None and self.start_xy is not None and cur[0] == self.start_xy[0]:
+            moved = math.hypot(cur[1] - self.start_xy[1], cur[2] - self.start_xy[2])
+        self.state['moved'] = round(moved, 3)
+        if n.scan is None or now - n.scan[1] > 0.6:
+            return self.stop('failed', '라이다 스캔이 끊겼습니다 — 정지')
+        if self.wall is None or now - self.wall_t > 1.0:
+            return self.stop('failed', '벽을 놓쳤습니다 — 정지')
+        if moved > self.max_m:
+            return self.stop('failed', f'최대 이동 거리 {self.max_m:g} m 도달 — 정지')
+        if now - self.started > self.timeout_s:
+            return self.stop('failed', f'{self.timeout_s:g}초 안에 끝나지 않음 — 정지')
+        w, tgt, tol = self.wall, self.target(), math.radians(self.cfg['tol_deg'])
+        # nothing (wall or not) may come closer than the stop distance (1.5 cm for lidar noise)
+        if self.corridor is not None and self.corridor < min(w['dist'], tgt) - 0.015:
+            return self.stop('failed', f'벽보다 가까운 물체가 앞에 있습니다 ({self.corridor:.2f} m) — 정지')
+        phase = self.state['phase']
+        if phase == 'align':
+            if self._turn(w['err'], tol):
+                self.state.update(phase='approach', message='전진 중…')
+        elif phase == 'approach':
+            remaining = w['dist'] - tgt
+            if remaining <= 0.005:
+                n.drive.stop()
+                self.settle_after = now + 0.15
+                self.phase_t = now
+                self.state.update(phase='final', message='마지막 각도 맞추는 중…')
+            elif abs(w['err']) > max(4 * tol, math.radians(6)):
+                n.drive.stop()
+                self.state.update(phase='align', message='각도가 벗어나 다시 회전 중…')
+            else:
+                v = max(0.02, min(self.cfg['speed'], 0.6 * remaining))
+                wz = max(-0.15, min(0.15, 1.0 * w['err']))
+                n.drive.drive(v, wz)
+        elif phase == 'final':
+            if self._turn(w['err'], tol) or now - self.phase_t > 15.0:
+                self.stop('done', f"완료 — 벽까지 {w['dist']:.3f} m (차체 앞 여유 약 {w['dist'] - n.robot_front:.3f} m), "
+                                  f"각도 오차 {math.degrees(w['err']):+.1f}°, {moved:.2f} m 이동")
+
+    def status(self):
+        w = self.wall if self.wall and time.time() - self.wall_t < 1.0 else None
+        return {**self.cfg, **self.state, 'target': round(self.target(), 3), 'max_m': self.max_m,
+                'robot_front': self.node.robot_front,
+                'limits': self.LIMITS,
+                'wall': None if w is None else {'dist': round(w['dist'], 3), 'err_deg': round(math.degrees(w['err']), 2),
+                                                'inliers': w['inliers'], 'rms': round(w['rms'], 4), 'ends': w['ends']},
+                'corridor': None if self.corridor is None else round(self.corridor, 3)}
+
+
 class GoalTolerance:
     """Nav2 goal checker tolerance, set from the page and kept applied.
 
@@ -358,7 +944,10 @@ class MapWeb(Node):
         self.map_frame = self.declare_parameter('map_frame', 'map').value
         self.odom_frame = self.declare_parameter('odom_frame', 'odom').value
         self.base_frame = self.declare_parameter('base_frame', 'base_link').value
+        # half width / footprint circle (wheels at +-0.24 m): side clearance, map drawing
         self.robot_radius = float(self.declare_parameter('robot_radius', 0.26).value)
+        # center -> front of the body: where the approach features stop
+        self.robot_front = float(self.declare_parameter('robot_front', 0.16).value)
         self.trail_max = int(self.declare_parameter('trail_max', 3000).value)
         self.drive = DriveControl(self)
         self.labels = Labels(os.path.expanduser(
@@ -370,6 +959,12 @@ class MapWeb(Node):
         self.nav_requests = []
         self.nav_seq = 0
         self.goal_handle = None
+        # every Go to first backs straight up this far (odom distance), then sends the goal
+        self.backup_m = float(self.declare_parameter('goto_backup_m', 0.30).value)
+        self.backup_speed = float(self.declare_parameter('goto_backup_speed', 0.08).value)
+        self.robot_back = float(self.declare_parameter('robot_back', 0.16).value)       # center -> rear of body
+        self.backup_clear_m = float(self.declare_parameter('goto_backup_clear_m', 0.12).value)
+        self.backup = None            # {'label', 'start': (x, y) in odom, 't0'} while backing up
 
         # relocalization
         self.reloc_min_match = float(self.declare_parameter('reloc_min_match', 0.5).value)
@@ -411,6 +1006,21 @@ class MapWeb(Node):
         self.create_timer(0.2, self._update_state)
         self.create_timer(0.1, self._nav_tick)
         self.tolerance = GoalTolerance(self)
+
+        # camera (robot_rgbd.launch.py), MJPEG to the page
+        self.cam_max_fps = float(self.declare_parameter('camera_max_fps', 10.0).value)
+        self.cam_quality = int(self.declare_parameter('camera_jpeg_quality', 70).value)
+        self.depth_max_mm = int(self.declare_parameter('depth_max_mm', 4000).value)
+        self.cameras = {
+            # the camera's own JPEG stream: ~40 KB/frame instead of ~920 KB, no re-encoding here
+            'rgb': CameraFeed(self, self.declare_parameter('rgb_topic', '/camera/color/image_raw/compressed').value,
+                              render_rgb, compressed=True),
+            'depth': CameraFeed(self, self.declare_parameter('depth_topic', '/camera/depth_raw/image').value,
+                                lambda d, mx: render_depth(d, mx, self.approach)),
+        }
+        self.create_timer(0.5, lambda: [c.tick() for c in self.cameras.values()])
+        self.approach = Approach(self)
+        self.wall = WallApproach(self)
 
     # ---- inputs -------------------------------------------------------------
     def _on_map(self, msg: OccupancyGrid):
@@ -587,7 +1197,49 @@ class MapWeb(Node):
             self.nav_requests.append(req)
 
     def nav_active(self):
-        return self.nav.get('state') in ('sending', 'active', 'canceling')
+        return self.nav.get('state') in ('backing', 'sending', 'active', 'canceling')
+
+    def _rear_clearance(self):
+        """Closest lidar point behind the body, within the robot's width (m from center), or None."""
+        if self.scan is None or time.time() - self.scan[1] > 1.0:
+            return None
+        msg = self.scan[0]
+        t = self._lookup(self.base_frame, msg.header.frame_id)
+        if t is None:
+            return None
+        tx, ty, tyaw = tf2d(t)
+        r = np.asarray(msg.ranges, dtype=np.float32)
+        a = msg.angle_min + np.arange(r.size, dtype=np.float32) * msg.angle_increment + tyaw
+        ok = np.isfinite(r) & (r >= msg.range_min) & (r <= msg.range_max)
+        x, y = tx + r[ok] * np.cos(a[ok]), ty + r[ok] * np.sin(a[ok])
+        behind = (x < -self.robot_back) & (np.abs(y) < self.robot_radius)
+        return float(-x[behind].max()) if behind.any() else None
+
+    def _backup_tick(self):
+        """Back straight up backup_m, then send the Nav2 goal. Called from _nav_tick (ROS thread)."""
+        b = self.backup
+        t = self._lookup(self.odom_frame, self.base_frame)
+        if t is None:
+            self.backup = None
+            self.drive.stop()
+            self.nav = {**self.nav, 'state': 'failed', 'message': '후진 실패: odom TF 없음', 'finished': time.time()}
+            return
+        x, y, _ = tf2d(t)
+        if b['start'] is None:
+            b['start'] = (x, y)
+        moved = math.hypot(x - b['start'][0], y - b['start'][1])
+        self.nav['backed'] = round(moved, 3)
+        rear = self._rear_clearance()
+        blocked = rear is not None and rear < self.robot_back + self.backup_clear_m
+        if moved >= self.backup_m or blocked or time.time() - b['t0'] > 15.0:
+            self.drive.stop()
+            self.backup = None
+            note = (f'뒤 {rear:.2f} m 장애물로 후진 {moved * 100:.0f} cm에서 멈춤' if blocked and moved < self.backup_m
+                    else f'후진 {moved * 100:.0f} cm (시간 초과)' if moved < self.backup_m else f'후진 {moved * 100:.0f} cm 완료')
+            self.get_logger().info(f'goto backup: {note}')
+            self._send_goal(b['label'], note)
+            return
+        self.drive.drive(-self.backup_speed, 0.0)
 
     def _set_nav(self, seq, **kw):
         if seq == self.nav_seq:          # ignore callbacks of a replaced goal
@@ -601,27 +1253,48 @@ class MapWeb(Node):
             self._start_reloc(reloc)
         for req in reqs:
             if req[0] == 'cancel':
-                if self.goal_handle is not None and self.nav_active():
+                if self.backup is not None:
+                    self.backup = None
+                    self.drive.stop()
+                    self.nav = {**self.nav, 'state': 'canceled', 'message': '후진 중 취소됨', 'finished': time.time()}
+                elif self.goal_handle is not None and self.nav_active():
                     self.goal_handle.cancel_goal_async()
                     self.nav = {**self.nav, 'state': 'canceling', 'message': '취소 요청'}
                 continue
             label = req[1]
             self.nav_seq += 1
             if not self.nav_client.server_is_ready():
+                self.backup = None
                 self.nav = {'state': 'unavailable', 'target': label, 'message':
                             'Nav2(navigate_to_pose)가 없습니다 — 노트북에서 run_lidar_navigation.sh 실행'}
                 continue
-            goal = NavigateToPose.Goal()
-            goal.pose.header.frame_id = label.get('frame', self.map_frame)
-            goal.pose.pose.position.x = float(label['x'])
-            goal.pose.pose.position.y = float(label['y'])
-            goal.pose.pose.orientation.z = math.sin(label['yaw'] / 2)
-            goal.pose.pose.orientation.w = math.cos(label['yaw'] / 2)
-            seq = self.nav_seq
-            self.nav = {'state': 'sending', 'target': label, 'started': time.time(), 'message': '목표 전송 중'}
-            fut = self.nav_client.send_goal_async(goal, feedback_callback=lambda fb, s=seq: self._nav_feedback(s, fb))
-            fut.add_done_callback(lambda f, s=seq: self._nav_accepted(s, f))
-            self.get_logger().info(f"nav goal '{label['name']}' x {label['x']:.2f} y {label['y']:.2f}")
+            # a goal still running would fight the backup over /cmd_vel: cancel it first
+            if self.goal_handle is not None and self.nav.get('state') in ('sending', 'active'):
+                self.goal_handle.cancel_goal_async()
+            if self.backup_m <= 0:
+                self._send_goal(label, '')
+                continue
+            self.backup = {'label': label, 'start': None, 't0': time.time()}
+            self.nav = {'state': 'backing', 'target': label, 'started': time.time(), 'backed': 0.0,
+                        'message': f'후진 {self.backup_m * 100:.0f} cm 중…'}
+            self.get_logger().info(f"goto '{label['name']}': backing up {self.backup_m:.2f} m first")
+        if self.backup is not None:
+            self._backup_tick()
+
+    def _send_goal(self, label, note):
+        self.nav_seq += 1
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = label.get('frame', self.map_frame)
+        goal.pose.pose.position.x = float(label['x'])
+        goal.pose.pose.position.y = float(label['y'])
+        goal.pose.pose.orientation.z = math.sin(label['yaw'] / 2)
+        goal.pose.pose.orientation.w = math.cos(label['yaw'] / 2)
+        seq = self.nav_seq
+        self.nav = {'state': 'sending', 'target': label, 'started': self.nav.get('started', time.time()),
+                    'backed': self.nav.get('backed'), 'note': note, 'message': '목표 전송 중'}
+        fut = self.nav_client.send_goal_async(goal, feedback_callback=lambda fb, s=seq: self._nav_feedback(s, fb))
+        fut.add_done_callback(lambda f, s=seq: self._nav_accepted(s, f))
+        self.get_logger().info(f"nav goal '{label['name']}' x {label['x']:.2f} y {label['y']:.2f}")
 
     def _nav_feedback(self, seq, msg):
         fb = msg.feedback
@@ -721,6 +1394,10 @@ class MapWeb(Node):
                 'robot_cost': None if pose is None or frame != self.map_frame else self.cost_at(pose['x'], pose['y']),
                 'nav': {**self.nav, 'server': self.nav_client.server_is_ready()},
                 'tolerance': self.tolerance.status(),
+                'approach': self.approach.status(),
+                'wall': self.wall.status(),
+                'camera': {k: {'fps': c.fps(), 'subscribed': c.sub is not None,
+                               'publishers': self.count_publishers(c.topic)} for k, c in self.cameras.items()},
                 'reloc': {**self.reloc, 'amcl': self.initialpose_pub.get_subscription_count() > 0},
             }
             self.state_json = json.dumps(state).encode()
@@ -813,6 +1490,36 @@ PAGE = """<!doctype html>
   .tol small { color:var(--muted); }
   #tolstate { font-size:13px; color:var(--muted); }
   #tolstate.ok { color:#7ddc8a; } #tolstate.err { color:#ff8a80; } #tolstate.busy { color:#ffb74c; }
+  .cam { margin-top:12px; background:var(--panel); border-radius:8px; padding:8px 10px; }
+  .cam .bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 16px; font-size:13px; color:var(--muted); margin-bottom:6px; }
+  .cam .bar label { display:flex; align-items:center; gap:5px; }
+  .cam .bar input[type=range] { width:110px; }
+  .cams { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:8px; }
+  .cams figure { margin:0; position:relative; }
+  .cams img { width:100%; aspect-ratio:4/3; display:block; background:#000; border-radius:4px; object-fit:contain; }
+  .cams figcaption { position:absolute; left:6px; top:6px; background:#000a; padding:1px 7px; border-radius:3px; font-size:12px; }
+  #camstate.err { color:#ffb74c; }
+  .cam.off .cams, .cam.off .appr { display:none; }
+  .wallap { margin-top:12px; background:var(--panel); border-radius:8px; padding:10px 12px; font-size:13px;
+            color:var(--muted); }
+  .wallap .f { display:flex; align-items:center; gap:6px; }
+  .wallap input[type=number] { width:4.6em; background:#14171c; color:var(--text); border:1px solid #ffffff22;
+                               border-radius:4px; padding:3px 4px; }
+  #lwgo { background:#69f0ae; color:#05301a; } #lwstop { background:#5a2a2a; color:#ffcdd2; }
+  #lwstate { flex-basis:100%; }
+  #lwstate.ok { color:#7ddc8a; } #lwstate.err { color:#ff8a80; } #lwstate.busy { color:#ffb74c; }
+  #camdepth { cursor:crosshair; }
+  .appr { display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; margin-top:8px; padding-top:8px;
+          border-top:1px solid #ffffff14; font-size:13px; color:var(--muted); }
+  .appr .f { display:flex; align-items:center; gap:6px; }
+  .appr input[type=range] { width:120px; }
+  .appr input[type=number] { width:4.6em; background:#14171c; color:var(--text); border:1px solid #ffffff22;
+                             border-radius:4px; padding:3px 4px; }
+  .appr button { border:0; border-radius:6px; padding:7px 14px; font:600 14px system-ui, sans-serif; cursor:pointer; }
+  #apgo { background:#69f0ae; color:#05301a; } #apstop { background:#5a2a2a; color:#ffcdd2; }
+  .appr button:disabled { opacity:.4; cursor:default; }
+  #apstate { flex-basis:100%; }
+  #apstate.ok { color:#7ddc8a; } #apstate.err { color:#ff8a80; } #apstate.busy { color:#ffb74c; }
   .labels .empty { color:var(--muted); font-size:13px; padding:6px 8px; }
 __DRIVE_CSS__
 </style></head><body>
@@ -888,6 +1595,44 @@ __DRIVE_CSS__
 __DRIVE_HTML__
 <div class="hint">지도: 드래그 = 이동, 휠/핀치 = 확대·축소 (이동하면 '따라가기'가 꺼집니다). 방향 0° = 지도 +X(오른쪽), 반시계 +.
   지도(/map)와 map 좌표계는 노트북의 SLAM/내비게이션이 실행 중일 때만 있습니다 — 없으면 odom 기준(바퀴 주행거리)으로 표시합니다.</div>
+<div class="wallap labelbar">
+  <b style="color:var(--text)">라이다 근접 이동</b>
+  <span class="f" title="정면 벽과 수직이 되도록 회전한 뒤, 차체 앞(반경 원)에서 벽까지 이 여유가 남을 때까지 전진">목표 여유
+    <input id="lwgap" type="number" min="0.02" max="0.5" step="0.001"> m <small id="lwgapt"></small></span>
+  <span class="f" title="벽과 수직 판정 허용 각도">각도 허용 <input id="lwtol" type="number" min="0.5" max="5" step="0.5"> °</span>
+  <span class="f">최대 속도 <input id="lwspd" type="number" min="0.02" max="0.10" step="0.01"> m/s</span>
+  <button id="lwgo" title="정면 벽과 수직으로 맞춘 뒤 최대한 가까이 전진">라이다 근접 이동</button>
+  <button id="lwstop">정지</button>
+  <span id="lwstate"></span>
+</div>
+<div id="cam" class="cam">
+  <div class="bar">
+    <label><input id="camon" type="checkbox" checked> 카메라 보기</label>
+    <label>깊이 최대 <input id="dmax" type="range" min="1000" max="10000" step="500" value="__DMAX__"> <span id="dmaxv">__DMAX__</span> mm</label>
+    <span id="camstate"></span>
+  </div>
+  <div class="cams">
+    <figure><img id="camrgb" alt="RGB"><figcaption id="caprgb">RGB</figcaption></figure>
+    <figure><img id="camdepth" alt="Depth" title="클릭 = 그 높이로 근접선 설정"><figcaption id="capdepth">Depth</figcaption></figure>
+  </div>
+  <div class="appr">
+    <b style="color:var(--text)">깊이 근접 이동</b>
+    <span class="f" title="깊이 영상의 y 위치(위 0% ~ 아래 100%). 장애물이 이 선 아래(로봇 쪽)로 들어오면 멈춤. 깊이 영상을 클릭해도 설정됩니다">근접선 y
+      <input id="apline" type="range" min="5" max="95" step="1"> <input id="aplinen" type="number" min="5" max="95" step="1"> %</span>
+    <span class="f" title="카메라에서 이 거리보다 가까운 깊이 = 장애물 (바닥은 약 1.3~2 m)">장애물 기준 깊이
+      <input id="apmm" type="range" min="300" max="6000" step="50"> <input id="apmmn" type="number" min="300" max="6000" step="50"> mm</span>
+    <span class="f" title="영상 아래쪽 로봇 몸체 부분은 판정에서 제외">하단 제외
+      <input id="apign" type="number" min="0" max="50" step="1"> %</span>
+    <span class="f" title="근접선 안 장애물 픽셀이 이 개수 이상이면 정지 (잡음 무시)">최소 픽셀
+      <input id="appx" type="number" min="5" max="5000" step="5"></span>
+    <span class="f">속도 <input id="apspd" type="number" min="0.02" max="0.10" step="0.01"> m/s</span>
+    <span class="f" title="라이다로 로봇 앞(폭 안)에 이 여유보다 가까운 물체가 보이면 정지. 차체 반경에 더해짐">라이다 정지 여유
+      <input id="aplid" type="number" min="0" max="1" step="0.01"> m <small id="aplidt"></small></span>
+    <button id="apgo" title="장애물이 근접선 안으로 들어올 때까지 천천히 전진">깊이 근접 이동</button>
+    <button id="apstop">정지</button>
+    <span id="apstate"></span>
+  </div>
+</div>
 <script>
 const $ = id => document.getElementById(id);
 const cv = $('cv'), ctx = cv.getContext('2d');
@@ -950,6 +1695,12 @@ function draw() {
 
   drawAxes();
   if (S.frame === 'map') drawLabels();
+  if (S.pose && S.wall && S.wall.wall) {   // fitted wall (base_link -> view frame)
+    const p = S.pose, c = Math.cos(p.yaw), s = Math.sin(p.yaw);
+    const pts = S.wall.wall.ends.map(([x, y]) => w2s(p.x + x * c - y * s, p.y + x * s + y * c));
+    ctx.beginPath(); ctx.moveTo(...pts[0]); ctx.lineTo(...pts[1]);
+    ctx.strokeStyle = '#18ffff'; ctx.lineWidth = 4; ctx.setLineDash([8, 5]); ctx.stroke(); ctx.setLineDash([]);
+  }
   if (S.pose) drawRobot(S.pose, S.robot_radius);
 }
 
@@ -972,7 +1723,7 @@ function drawAxes() {
 }
 
 function drawLabels() {
-  const target = S.nav && ['sending', 'active', 'canceling'].includes(S.nav.state) && S.nav.target ? S.nav.target.id : null;
+  const target = S.nav && ['backing', 'sending', 'active', 'canceling'].includes(S.nav.state) && S.nav.target ? S.nav.target.id : null;
   ctx.font = '12px system-ui'; ctx.textBaseline = 'middle';
   for (const lb of S.labels) {
     const [x, y] = w2s(lb.x, lb.y), sel = lb.id === selId;
@@ -1093,6 +1844,113 @@ $('fit').onclick = () => {
 };
 $('clr').onclick = () => fetch('/api/trail/clear', { method: 'POST' });
 
+// ---- camera ------------------------------------------------------------------------
+function camStreams() {
+  // streams only while shown: hidden = no MJPEG = the Pi drops the camera subscriptions
+  const on = $('camon').checked && !document.hidden;
+  $('cam').classList.toggle('off', !$('camon').checked);
+  const want = on ? ['/stream/rgb.mjpg', '/stream/depth.mjpg?max=' + $('dmax').value] : ['', ''];
+  [['camrgb', want[0]], ['camdepth', want[1]]].forEach(([id, src]) => {
+    if ($(id).dataset.src !== src) { $(id).dataset.src = src; src ? $(id).src = src : $(id).removeAttribute('src'); }
+  });
+  try { localStorage.setItem('mapweb.camon', $('camon').checked ? '1' : '0'); } catch (e) {}
+}
+try { if (localStorage.getItem('mapweb.camon') === '0') $('camon').checked = false; } catch (e) {}
+$('camon').onchange = camStreams;
+document.addEventListener('visibilitychange', camStreams);
+$('dmax').addEventListener('input', e => { $('dmaxv').textContent = e.target.value; });
+$('dmax').addEventListener('change', camStreams);
+camStreams();
+function renderCam() {
+  const c = S && S.camera; if (!c) return;
+  $('caprgb').textContent = `RGB ${c.rgb.fps ? c.rgb.fps.toFixed(0) + ' fps' : ''}`;
+  $('capdepth').textContent = `Depth ${c.depth.fps ? c.depth.fps.toFixed(0) + ' fps' : ''}`;
+  if (!$('camon').checked) { msg('camstate', ''); return; }
+  if (!c.rgb.publishers && !c.depth.publishers)
+    msg('camstate', '카메라 토픽 없음 — robot_rgbd가 꺼져 있습니다 (./scripts/remote_robot_rgbd.sh start)', 'err');
+  else if (c.rgb.subscribed && !c.rgb.fps && !c.depth.fps) msg('camstate', '영상 기다리는 중…', 'err');
+  else msg('camstate', '');
+}
+
+// ---- lidar wall approach ------------------------------------------------------------
+let lwEdited = 0;
+for (const id of ['lwgap', 'lwtol', 'lwspd']) {
+  $(id).addEventListener('input', () => { lwEdited = Date.now(); });
+  $(id).addEventListener('change', async () => {
+    try { await post('/api/wall/config', { gap: +$('lwgap').value, tol_deg: +$('lwtol').value, speed: +$('lwspd').value }); }
+    catch (e) { msg('lwstate', e.message, 'err'); }
+    lwEdited = 0;
+  });
+}
+$('lwgo').onclick = async () => {
+  const w = S && S.wall;
+  const info = w && w.wall ? `벽까지 ${w.wall.dist.toFixed(2)} m, 각도 ${w.wall.err_deg.toFixed(1)}°` : '벽 미확인';
+  if (!confirm(`정면 벽과 수직으로 회전한 뒤 목표 ${w ? w.target.toFixed(3) : '?'} m(중심 기준)까지 전진합니다.\n${info}\n주변이 안전한가요? (정지: 정지 버튼 / Space / 주행 패드)`)) return;
+  try { await post('/api/wall/start'); } catch (e) { msg('lwstate', e.message, 'err'); }
+};
+$('lwstop').onclick = () => post('/api/wall/stop').catch(e => msg('lwstate', e.message, 'err'));
+function renderWall() {
+  const a = S && S.wall; if (!a) return;
+  if (!lwEdited || Date.now() - lwEdited > 5000) { $('lwgap').value = a.gap; $('lwtol').value = a.tol_deg; $('lwspd').value = a.speed; }
+  $('lwgapt').textContent = `(차체 앞 ${a.robot_front} m + 여유 = 중심에서 ${a.target.toFixed(3)} m)`
+    + (a.target < 0.27 ? ' ⚠ 라이다 최소 거리 0.25 m 근처 — 정면 점이 안 보여 측면 점으로 판정' : '');
+  const run = a.state === 'running';
+  $('lwgo').disabled = run || !a.wall; $('lwstop').disabled = !run;
+  const wall = a.wall ? `벽 ${a.wall.dist.toFixed(3)} m · 각도 오차 ${a.wall.err_deg >= 0 ? '+' : ''}${a.wall.err_deg.toFixed(1)}° · 점 ${a.wall.inliers}개`
+                      : '정면(±40°, 3 m)에 벽 없음';
+  if (run) msg('lwstate', `${a.message} · ${wall} · ${(a.moved || 0).toFixed(2)} m 이동`, 'busy');
+  else if (a.state === 'idle') msg('lwstate', wall, '');
+  else msg('lwstate', `${a.message} · ${wall}`, a.state === 'done' ? 'ok' : 'err');
+}
+
+// ---- approach ------------------------------------------------------------------------
+let apEdited = 0;
+function apPair(r, n) {
+  $(r).addEventListener('input', () => { $(n).value = $(r).value; apEdited = Date.now(); });
+  $(n).addEventListener('input', () => { $(r).value = $(n).value; apEdited = Date.now(); });
+  for (const id of [r, n]) $(id).addEventListener('change', apSave);
+}
+apPair('apline', 'aplinen'); apPair('apmm', 'apmmn');
+for (const id of ['apign', 'appx', 'apspd', 'aplid']) {
+  $(id).addEventListener('input', () => { apEdited = Date.now(); });
+  $(id).addEventListener('change', apSave);
+}
+async function apSave() {
+  try {
+    await post('/api/approach/config', { line: $('aplinen').value / 100, obstacle_mm: +$('apmmn').value,
+      ignore_bottom: $('apign').value / 100, min_px: +$('appx').value, speed: +$('apspd').value,
+      lidar_stop_m: +$('aplid').value });
+    apEdited = 0;
+  } catch (e) { msg('apstate', e.message, 'err'); apEdited = 0; }
+}
+$('camdepth').addEventListener('click', e => {
+  const r = e.target.getBoundingClientRect();
+  const v = Math.round(Math.min(95, Math.max(5, (e.clientY - r.top) / r.height * 100)));
+  $('apline').value = $('aplinen').value = v; apSave();
+});
+$('apgo').onclick = async () => {
+  if (!confirm(`로봇이 장애물이 근접선 안으로 들어올 때까지 천천히 전진합니다.\n앞이 안전한가요? (정지: 정지 버튼 / Space / 주행 패드)`)) return;
+  try { await post('/api/approach/start'); } catch (e) { msg('apstate', e.message, 'err'); }
+};
+$('apstop').onclick = () => post('/api/approach/stop').catch(e => msg('apstate', e.message, 'err'));
+function renderApproach() {
+  const a = S && S.approach; if (!a) return;
+  if (!apEdited || Date.now() - apEdited > 5000) {
+    $('apline').value = $('aplinen').value = Math.round(a.line * 100);
+    $('apmm').value = $('apmmn').value = a.obstacle_mm;
+    $('apign').value = Math.round(a.ignore_bottom * 100);
+    $('appx').value = a.min_px; $('apspd').value = a.speed; $('aplid').value = a.lidar_stop_m;
+  }
+  $('aplidt').textContent = `(중심에서 ${(a.robot_front + a.lidar_stop_m).toFixed(2)} m` +
+    (a.lidar_front != null ? `, 지금 앞 ${a.lidar_front.toFixed(2)} m)` : ', 지금 앞 물체 없음)');
+  const run = a.state === 'running';
+  $('apgo').disabled = run; $('apstop').disabled = !run;
+  const zone = a.zone_px == null ? '깊이 영상 없음' : `근접선 안 장애물 ${a.zone_px}px (정지 기준 ${a.min_px}px)`;
+  if (run) msg('apstate', `전진 중 ${a.speed} m/s · ${(a.moved || 0).toFixed(2)} m 이동 (최대 ${a.max_m} m) · ${zone}`, 'busy');
+  else if (a.state === 'idle') msg('apstate', zone, '');
+  else msg('apstate', `${a.message} · ${zone}`, a.state === 'done' ? 'ok' : 'err');
+}
+
 // ---- arrival tolerance --------------------------------------------------------------
 let tolInit = false, tolEdited = false;
 function bindPair(r, n) {
@@ -1162,7 +2020,7 @@ let lastRows = '';
 function renderLabels() {
   const labels = S ? S.labels : [], p = S && S.frame === 'map' ? S.pose : null;
   if (!labels.some(lb => lb.id === selId)) selId = null;
-  const target = S && S.nav && ['sending', 'active', 'canceling'].includes(S.nav.state) && S.nav.target ? S.nav.target.id : null;
+  const target = S && S.nav && ['backing', 'sending', 'active', 'canceling'].includes(S.nav.state) && S.nav.target ? S.nav.target.id : null;
   const rows = labels.length ? labels.map(lb => `<tr data-id="${lb.id}" class="${lb.id === selId ? 'sel' : ''} ${lb.id === target ? 'target' : ''}">
       <td>${esc(lb.name)}${lb.cost >= 99 ? ' <span class="blocked" title="Nav2 비용지도에서 장애물/로봇 반경 안 — 갈 수 없음">⚠ 도달 불가</span>' : ''}</td><td>${lb.x.toFixed(2)}</td><td>${lb.y.toFixed(2)}</td><td>${deg(lb.yaw).toFixed(0)}°</td>
       <td>${p ? Math.hypot(lb.x - p.x, lb.y - p.y).toFixed(2) + ' m' : '-'}</td></tr>`).join('')
@@ -1178,9 +2036,11 @@ function renderLabels() {
   if (!n) return;
   const name = n.target ? `'${n.target.name}'` : '';
   if (n.state === 'idle') msg('navstate', n.server ? 'Nav2 대기 중' : 'Nav2 꺼짐 — Go to를 쓰려면 노트북에서 내비게이션 실행', n.server ? '' : 'err');
-  else if (['sending', 'active', 'canceling'].includes(n.state))
+  else if (['backing', 'sending', 'active', 'canceling'].includes(n.state))
     msg('navstate', `${name} ${n.message || ''}` + (n.distance != null ? ` · 남은 거리 ${n.distance.toFixed(2)} m` : '')
-        + (n.eta ? ` · 약 ${n.eta.toFixed(0)}초` : '') + (n.recoveries ? ` · 복구 ${n.recoveries}회` : ''), 'busy');
+        + (n.eta ? ` · 약 ${n.eta.toFixed(0)}초` : '') + (n.recoveries ? ` · 복구 ${n.recoveries}회` : '')
+        + (n.state === 'backing' && n.backed != null ? ` · ${(n.backed * 100).toFixed(0)} cm` : '')
+        + (n.note && n.state !== 'backing' ? ` · ${n.note}` : ''), 'busy');
   else msg('navstate', `${name} ${n.message || n.state}`, n.state === 'succeeded' ? 'ok' : 'err');
 }
 $('lbody').addEventListener('click', e => {
@@ -1208,7 +2068,7 @@ $('ldel').onclick = async () => {
 };
 $('lgo').onclick = async () => {
   const lb = S.labels.find(l => l.id === selId); if (!lb) return;
-  if (!confirm(`로봇이 '${lb.name}' (x ${lb.x.toFixed(2)}, y ${lb.y.toFixed(2)})까지 자율 주행합니다.\n주변이 안전한가요? (중지: 'Navi 취소' 또는 주행 패드)`)) return;
+  if (!confirm(`로봇이 먼저 30 cm 후진한 뒤 '${lb.name}' (x ${lb.x.toFixed(2)}, y ${lb.y.toFixed(2)})까지 자율 주행합니다.\n주변이 안전한가요? (중지: 'Navi 취소' 또는 주행 패드)`)) return;
   try { await post('/api/nav/goto', { id: lb.id }); msg('navstate', `'${lb.name}'(으)로 목표 전송`, 'busy'); }
   catch (e) { msg('navstate', e.message, 'err'); }
 };
@@ -1241,6 +2101,9 @@ async function poll() {
   renderLabels();
   renderReloc();
   renderTol();
+  renderCam();
+  renderApproach();
+  renderWall();
   $('pscan').textContent = S.scan_hz ? `${S.scan_hz.toFixed(1)} Hz, ${S.scan.length}점` : '없음';
   const b = $('banner');
   if (!S.frame) { b.className = 'warn'; b.textContent = 'TF 없음: 로봇 드라이버(odom→base_link)가 실행 중이 아닙니다'; }
@@ -1259,7 +2122,7 @@ __DRIVE_JS__
 def make_handler(node: MapWeb):
 
     page = (PAGE.replace('__DRIVE_CSS__', DRIVE_CSS).replace('__DRIVE_HTML__', DRIVE_HTML)
-            .replace('__DRIVE_JS__', DRIVE_JS)).encode()
+            .replace('__DRIVE_JS__', DRIVE_JS).replace('__DMAX__', str(node.depth_max_mm))).encode()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.0'
@@ -1282,6 +2145,19 @@ def make_handler(node: MapWeb):
             path = urlparse(self.path).path
             if path == '/':
                 self._send(200, page, 'text/html; charset=utf-8')
+            elif path in ('/stream/rgb.mjpg', '/stream/depth.mjpg'):
+                key = 'rgb' if 'rgb' in path else 'depth'
+                arg = None
+                if key == 'depth':
+                    try:
+                        arg = int(parse_qs(urlparse(self.path).query).get('max', [node.depth_max_mm])[0])
+                    except ValueError:
+                        arg = node.depth_max_mm
+                self.send_response(200)
+                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                node.cameras[key].watch(self.wfile, f'{key}{arg}', arg, node.cam_max_fps, node.cam_quality)
             elif path == '/api/state':
                 with node.lock:
                     body = node.state_json
@@ -1300,6 +2176,10 @@ def make_handler(node: MapWeb):
                 self._json(node.drive.status())
             elif path == '/api/nav/tolerance':
                 self._json(node.tolerance.status())
+            elif path == '/api/wall':
+                self._json(node.wall.status())
+            elif path == '/api/approach':
+                self._json(node.approach.status())
             elif path == '/api/labels':
                 self._json({'labels': node.labels.list(), 'file': node.labels.path})
             else:
@@ -1311,12 +2191,50 @@ def make_handler(node: MapWeb):
             body = self.rfile.read(length) if length else b''
             if path == '/api/drive' and node.nav_active():
                 node.request_nav(('cancel',))      # manual driving overrides Nav2
+            if path == '/api/drive/stop' and node.nav.get('state') == 'backing':
+                node.request_nav(('cancel',))      # stop = stop the Go to backup too
+            if path in ('/api/drive', '/api/drive/stop') and node.approach.running():
+                node.approach.stop('stopped', '수동 조작으로 중지')
+            if path in ('/api/drive', '/api/drive/stop') and node.wall.running():
+                node.wall.stop('stopped', '수동 조작으로 중지')
             res = node.drive.handle_post(path, body)
             if res is not None:
                 self._json(res[1], res[0])
             elif path == '/api/trail/clear':
                 node.clear_trail()
                 self._json({'ok': True})
+            elif path.startswith('/api/wall/'):
+                try:
+                    if path == '/api/wall/config':
+                        self._json(node.wall.set_config(json.loads(body or b'{}')))
+                    elif path == '/api/wall/start':
+                        node.wall.start()
+                        self._json(node.wall.status())
+                    elif path == '/api/wall/stop':
+                        node.wall.stop('stopped', '정지 버튼')
+                        self._json(node.wall.status())
+                    else:
+                        self._json({'error': 'not found'}, 404)
+                except (ValueError, TypeError, AttributeError) as exc:
+                    self._json({'error': str(exc)}, 409)
+                except OSError as exc:
+                    self._json({'error': f'저장 실패: {exc}'}, 500)
+            elif path.startswith('/api/approach/'):
+                try:
+                    if path == '/api/approach/config':
+                        self._json(node.approach.set_config(json.loads(body or b'{}')))
+                    elif path == '/api/approach/start':
+                        node.approach.start()
+                        self._json(node.approach.status())
+                    elif path == '/api/approach/stop':
+                        node.approach.stop('stopped', '정지 버튼')
+                        self._json(node.approach.status())
+                    else:
+                        self._json({'error': 'not found'}, 404)
+                except (ValueError, TypeError, AttributeError) as exc:
+                    self._json({'error': str(exc)}, 409)
+                except OSError as exc:
+                    self._json({'error': f'저장 실패: {exc}'}, 500)
             elif path in ('/api/labels', '/api/labels/delete', '/api/nav/goto'):
                 try:
                     req = json.loads(body or b'{}')
@@ -1333,6 +2251,10 @@ def make_handler(node: MapWeb):
                         if cost is not None and cost >= 99:
                             raise ValueError(f"'{label['name']}'은(는) Nav2 비용지도에서 장애물/로봇 반경 안(cost {cost})이라 "
                                              '갈 수 없습니다 — 지도에 없는 장애물이 찍혀 있으면 지도를 새로 만드세요')
+                        if node.approach.running():
+                            node.approach.stop('stopped', 'Go to로 중지')
+                        if node.wall.running():
+                            node.wall.stop('stopped', 'Go to로 중지')
                         node.request_nav(('goto', label))
                         self._json({'ok': True, 'target': label})
                 except KeyError:
