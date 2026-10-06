@@ -42,6 +42,35 @@ python hand_eye/test4.py                  # 전체 실행
 
 실행하면 REST API 도 함께 뜬다 (기본 `127.0.0.1:8765`). → [7b절](#7b-rest-api--원격에서-좌표로-집기)
 
+### 원격 파이(로봇)에서 실행 — `remote_robot_arm.sh`
+
+노트북에서 파이(`user@192.168.0.31`)의 `robot_arm.py` 를 띄운다. 파이의 tmux 세션 `robot_arm`, 로그 `~/robot_arm.log`, 웹 UI `http://192.168.0.31:8765/`.
+
+```bash
+./hand_eye/remote_robot_arm.sh start                 # 시작 (시작 질문 "다시 잡을까요?" 는 자동으로 '아니오')
+./hand_eye/remote_robot_arm.sh start --calib         # hand-eye 캘리브레이션부터 → 점 확정은 attach 해서 콘솔에 입력
+./hand_eye/remote_robot_arm.sh start SO101_PORT=/dev/ttyUSB1 PICK_STREAM_FPS=10   # 환경변수 전달
+./hand_eye/remote_robot_arm.sh status | log | attach | stop | restart
+./hand_eye/remote_robot_arm.sh pull-calib            # 파이에서 만든 캘리브레이션 파일을 이 폴더로 가져오기
+```
+- 시작할 때마다 노트북의 `robot_arm.py` 를 파이 `~/hand_eye_robot/` 에 복사해서 실행한다(파이의 git 클론은 그대로).
+  캘리브레이션 파일(`arm_calib.json`, `handeye*.json`, `color_cam.json`)은 파이에 없을 때만 복사한다 —
+  파이에서 다시 잡은 값을 덮어쓰지 않는다(덮어쓰려면 `--push-calib`).
+- 파이썬은 파이의 `~/dapier_project/.venv`, OpenNI2 런타임은 `/opt/openni2-orbbec` 를 쓴다.
+- Astra 카메라를 ROS(`remote_robot_rgbd.sh`, `remote_car2_lidar.sh --camera`)가 쓰고 있으면 시작을 거부한다 — 먼저 그쪽을 끌 것.
+- `stop` 은 SIGINT 로 끈다 → 카메라 닫기·팔 토크 해제 후 종료(안 꺼질 때만 TERM → KILL).
+
+LLM 클라이언트(`llm_client.py`)도 같은 방식으로 파이에서 띄운다 — `robot_arm.py` 가 먼저 떠 있어야 한다.
+```bash
+./hand_eye/remote_llm_client.sh start                          # 웹 UI http://192.168.0.31:8770/ 에서 지시
+./hand_eye/remote_llm_client.sh start --auto "책상 위 물건 하나만 집어봐"   # 첫 지시 + 재시도 안 묻기
+./hand_eye/remote_llm_client.sh start --cli                    # 터미널 지시 → ./hand_eye/remote_llm_client.sh attach
+./hand_eye/remote_llm_client.sh start --push-env               # 이 폴더의 .env(GEMINI_API_KEY)로 파이 것을 교체
+./hand_eye/remote_llm_client.sh status | log | attach | stop | restart
+```
+- 파이 `~/hand_eye_robot/` 에서 실행(로그 `~/llm_client.log`). 웹 UI 는 `--host 0.0.0.0` 으로 열어 노트북에서 접속 가능.
+- API 키: 파이 `~/hand_eye_robot/.env` → 없으면 파이의 `~/dapier_project/hand_eye/.env` → 없으면 이 폴더 `.env` 를 복사(권한 600, 출력 안 함).
+
 ---
 
 ## 2. 실행하면 벌어지는 일
