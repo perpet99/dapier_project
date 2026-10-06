@@ -66,7 +66,7 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
-DEFAULT_API = "http://127.0.0.1:8765"
+DEFAULT_API = "http://192.168.0.31:8765"
 MODEL_ID = os.environ.get("GEMINI_MODEL", "gemini-robotics-er-2-preview")
 VIEW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_view.jpg")
 SEND_WIDTH = 800          # 모델에 보낼 이미지 폭. 토큰을 아끼되 점을 찍을 만큼은 크게
