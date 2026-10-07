@@ -510,6 +510,27 @@ python hand_eye/llm_client.py --auto "..."             # 실패해도 안 묻는
 `--cli` 를 주면 예전처럼 터미널 `input()` 으로 받는다 — 두 방식은 같은
 `log / set_view / set_status / next_order / ask` 다섯 가지만 구현한 클래스라 나머지 코드는 같다.
 
+#### 이동 로봇 스킬 (car2, `ros2_slam/test/map_web.py`)
+
+팔이 올라간 이동 로봇의 map_web REST API(문서: `ros2_slam/test/map_web_api.md`)도 스킬로 쓴다.
+주소는 기본으로 `--api` 와 같은 호스트의 8081 포트(`--map-api URL` 로 지정, `--no-base` 면 팔만).
+시작할 때 연결되지 않으면 이 스킬들은 프롬프트에서 빠진다. 동작 스킬은 **끝날 때까지 기다린 뒤** 결과를 모델에 준다.
+
+| 스킬 | map_web API | 하는 일 |
+|---|---|---|
+| `base_state` | `GET /api/state`, `/api/drive` | 위치·방향, 라벨 목록(reachable, 거리), Nav2 상태, 정면 장애물 거리, 정면 벽 |
+| `goto_label(label)` | `POST /api/nav/goto` | 라벨 이름 → id 로 Nav2 이동, 도착/실패까지 기다림 (최대 240초) |
+| `save_label(label)` | `POST /api/labels` | 지금 위치를 라벨로 저장 |
+| `base_move(meters)` | `POST /api/drive` 반복 | 직진/후진 ±1 m, 0.08 m/s. 차체 앞/뒤 0.10 m 안에 라이다 점이 보이면 정지 |
+| `base_turn(degrees)` | `POST /api/drive` 반복 | 제자리 회전 ±180° (+ 왼쪽) |
+| `base_stop` | `/api/drive/stop`, `/api/nav/cancel`, 근접 정지 | 모든 이동 정지 |
+| `relocalize(global_search)` | `POST /api/relocalize` | 지도 위 위치 다시 잡기 (로봇은 안 움직임) |
+| `wall_approach(gap)` | `POST /api/wall/config`, `/api/wall/start` | 정면 벽과 수직으로 맞추고 차체 앞 gap m 까지 |
+| `depth_approach` | `POST /api/approach/start` | 깊이 카메라 근접선까지 전진 |
+
+몸체가 움직이고 나면 클라이언트가 팔 카메라 화면을 새로 받는다. pick/place 와 마찬가지로 **확인 없이 바로 움직인다.**
+예: `python hand_eye/llm_client.py "책상으로 가서 책상 앞에 붙은 다음 컵을 집어"`
+
 | 스킬 | REST | 비고 |
 |---|---|---|
 | `get_state` | `/get_state` | 상태를 보고 pick/place 중 무엇이 가능한지 판단 |

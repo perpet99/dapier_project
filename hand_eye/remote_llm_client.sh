@@ -23,6 +23,8 @@ set -euo pipefail
 #   --cli            orders from the terminal instead of the web UI (then: attach)
 #   --api URL        robot_arm.py REST address (default http://127.0.0.1:8765 = on the Pi)
 #   --port N         web UI port (default 8770)
+#   --map-api URL    car2 map_web REST (mobile-base skills; default: --api's host, port 8081)
+#   --no-base        no mobile-base skills (arm only)
 #
 # Examples:
 #   ./remote_robot_arm.sh start && ./remote_llm_client.sh start

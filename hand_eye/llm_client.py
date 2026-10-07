@@ -17,6 +17,19 @@ llm_client.py - Gemini Robotics-ER 이 test4.py 의 REST API 를 스킬로 쓰�
   say(message)           -                       사용자에게 한마디
   done(message)          -                       일을 마쳤다고 알리고 종료
 
+이동 로봇(car2) 스킬 (= ros2_slam/test/map_web.py 의 REST API, 문서 map_web_api.md)
+  base_state             GET /api/state, /api/drive   위치·방향, 라벨 목록, Nav2/근접 상태
+  goto_label(label)      POST /api/nav/goto           라벨 위치로 Nav2 자율 주행 (끝날 때까지 기다림)
+  save_label(label)      POST /api/labels             지금 위치를 라벨로 저장
+  base_move(meters)      POST /api/drive (반복)       직진/후진 (±1 m, 앞뒤 라이다 장애물이면 정지)
+  base_turn(degrees)     POST /api/drive (반복)       제자리 회전 (±180°, + = 왼쪽)
+  base_stop              /api/drive/stop + 취소        모든 이동 정지
+  relocalize(global)     POST /api/relocalize         라이다로 지도 위 위치 다시 잡기
+  wall_approach(gap)     POST /api/wall/*             정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진
+  depth_approach         POST /api/approach/*         깊이 카메라 근접선까지 전진
+  주소는 기본으로 --api 와 같은 호스트의 8081 포트 (--map-api 로 지정).
+  map_web 이 없으면(연결 실패 또는 --no-base) 이 스킬들은 빠진다.
+
 좌표 규약은 이 프로젝트의 다른 VLM 코드(test3.py)와 같다 - **[y, x] 순서로
 0~1000 정규화**. 클라이언트가 실제 픽셀로 바꿔서 REST 에 넘긴다. 모델이 픽셀
 크기를 몰라도 되고, 화면 크기가 바뀌어도 프롬프트를 고칠 필요가 없다.
@@ -36,6 +49,8 @@ pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고,
   python hand_eye/llm_client.py --cli                # 터미널로 지시
   python hand_eye/llm_client.py --auto "책상 위 물건 하나만 집어봐"   # 재시도도 안 묻기
   python hand_eye/llm_client.py --api http://192.168.0.10:8765 "..."
+  python hand_eye/llm_client.py --map-api http://192.168.0.31:8081 "책상으로 가서 컵을 집어"
+  python hand_eye/llm_client.py --no-base            # 이동 로봇 스킬 없이 팔만
 """
 
 from __future__ import annotations
@@ -43,6 +58,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import queue
 import sys
@@ -67,6 +83,12 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 DEFAULT_API = "http://192.168.0.31:8765"
+MAP_WEB_PORT = 8081       # ros2_slam/test/map_web.py (이동 로봇). 주소는 --api 의 호스트를 따른다
+BASE_MAX_MOVE = 1.0       # base_move 한 번의 최대 거리 (m)
+BASE_SPEED = 0.08         # base_move 속도 (m/s)
+BASE_TURN_SPEED = 0.4     # base_turn 각속도 (rad/s)
+BASE_CLEAR = 0.10         # base_move: 차체 앞/뒤에서 이 거리 안에 라이다 점이 있으면 정지 (m)
+NAV_TIMEOUT = 240.0       # goto_label 최대 대기 (s)
 MODEL_ID = os.environ.get("GEMINI_MODEL", "gemini-robotics-er-2-preview")
 VIEW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_view.jpg")
 SEND_WIDTH = 800          # 모델에 보낼 이미지 폭. 토큰을 아끼되 점을 찍을 만큼은 크게
@@ -110,18 +132,284 @@ class Api:
         return cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
 
 
+class MapApi:
+    """이동 로봇(car2)의 map_web.py REST API. 문서: ros2_slam/test/map_web_api.md
+
+    동작 스킬은 '끝날 때까지 기다렸다가 결과 요약' 을 돌려준다. 모델은 한 번에
+    스킬 하나만 부르므로, 요청만 넣고 바로 돌아오면 진행을 따라갈 수 없다.
+    """
+
+    def __init__(self, base: str, log=print, status=lambda s: None):
+        self.base = base.rstrip("/")
+        self.log, self.status = log, status
+
+    # --- HTTP -------------------------------------------------------------
+    def call(self, path: str, body: Optional[dict] = None, timeout: float = 10.0) -> dict:
+        """GET (body None) 또는 POST JSON. 오류도 예외 대신 본문({'error':...})으로."""
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(f"{self.base}{path}", data=data,
+                                     headers={"Content-Type": "application/json"} if data else {})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                code, raw = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            code, raw = e.code, e.read()
+        except (urllib.error.URLError, OSError) as e:
+            return {"ok": False, "error": f"map_web 연결 실패: {e}", "http": 0}
+        try:
+            out = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            out = {"error": raw[:200].decode("utf-8", "replace")}
+        if out is None or not isinstance(out, dict):
+            out = {"value": out}
+        out["http"] = code
+        return out
+
+    def alive(self) -> bool:
+        st = self.call("/api/drive")
+        return st.get("http") == 200
+
+    # --- 상태 -------------------------------------------------------------
+    def state(self) -> dict:
+        return self.call("/api/state")
+
+    @staticmethod
+    def _deg(rad) -> Optional[float]:
+        return None if rad is None else round(math.degrees(rad), 1)
+
+    def summary(self) -> dict:
+        """모델에게 줄 짧은 상태 (스캔 점 같은 큰 배열은 뺀다)."""
+        st, drv = self.state(), self.call("/api/drive")
+        if st.get("http") != 200:
+            return {"ok": False, "error": st.get("error", "상태를 못 읽음")}
+        p, nav, wall = st.get("pose"), st.get("nav") or {}, st.get("wall") or {}
+        w = wall.get("wall")
+        return {
+            "ok": True,
+            "frame": st.get("frame"),          # map = 지도 위 위치, odom = 지도 없음(주행거리)
+            "pose": None if not p else {"x": p["x"], "y": p["y"], "yaw_deg": self._deg(p["yaw"])},
+            "driver_connected": drv.get("driver_connected"),
+            "nav": {"state": nav.get("state"), "server": nav.get("server"),
+                    "target": (nav.get("target") or {}).get("name"), "message": nav.get("message")},
+            "labels": [{"name": lb["name"], "x": lb["x"], "y": lb["y"], "yaw_deg": self._deg(lb["yaw"]),
+                        "reachable": lb.get("cost") is None or lb.get("cost") < 99,
+                        "dist_m": (round(math.hypot(lb["x"] - p["x"], lb["y"] - p["y"]), 2)
+                                   if p and st.get("frame") == "map" else None)}
+                       for lb in st.get("labels", [])],
+            "front_clear_m": wall.get("corridor"),   # 차체 폭 안 정면 가장 가까운 점 (로봇 중심 기준)
+            "wall_ahead": None if not w else {"dist_m": w["dist"], "angle_err_deg": w["err_deg"]},
+        }
+
+    # --- Go to ------------------------------------------------------------
+    def goto_label(self, name: str) -> dict:
+        labels = self.call("/api/labels").get("labels", [])
+        exact = [lb for lb in labels if lb["name"] == name]
+        part = exact or [lb for lb in labels if name and name.lower() in lb["name"].lower()]
+        if len(part) != 1:
+            return {"ok": False, "message": ("그런 라벨이 없다" if not part else "여러 라벨이 맞는다")
+                    + f" - 있는 라벨: {[lb['name'] for lb in labels]}"}
+        lb = part[0]
+        r = self.call("/api/nav/goto", {"id": lb["id"]})
+        if r.get("http") != 200:
+            return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
+        self.log(f"    >> goto '{lb['name']}' (x {lb['x']:.2f}, y {lb['y']:.2f})")
+        t0, nav = time.time(), {}
+        while time.time() - t0 < NAV_TIMEOUT:
+            time.sleep(1.0)
+            nav = self.state().get("nav") or {}
+            if nav.get("state") not in ("backing", "sending", "active", "canceling"):
+                break
+            d = nav.get("distance")
+            self.status(f"'{lb['name']}' 로 이동 중" + (f" - 남은 거리 {d:.1f} m" if d is not None else ""))
+        else:
+            self.call("/api/nav/cancel", {})
+            return {"ok": False, "message": f"{NAV_TIMEOUT:.0f}초 안에 도착하지 못해 취소했다"}
+        out = {"ok": nav.get("state") == "succeeded", "state": nav.get("state"),
+               "message": nav.get("message"), "note": nav.get("note")}
+        p = self.state().get("pose")
+        if p:
+            out["error_m"] = round(math.hypot(p["x"] - lb["x"], p["y"] - lb["y"]), 3)
+        return out
+
+    def save_label(self, name: str) -> dict:
+        r = self.call("/api/labels", {"name": name})
+        if r.get("http") != 200:
+            return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
+        return {"ok": True, "label": {k: r.get(k) for k in ("name", "x", "y")},
+                "yaw_deg": self._deg(r.get("yaw"))}
+
+    # --- 직접 이동 (0.5초 유효한 /api/drive 를 0.2초마다 다시 보낸다) -------
+    def _rear_clear(self, st: dict) -> Optional[float]:
+        """스캔 점(지도/odom 좌표)을 로봇 좌표로 돌려 차체 뒤 가장 가까운 거리."""
+        p = st.get("pose")
+        if not p or not st.get("scan"):
+            return None
+        back = (st.get("wall") or {}).get("robot_front", 0.16)   # 뒤 길이도 앞과 같다고 본다
+        half = st.get("robot_radius", 0.26)
+        c, s_ = math.cos(-p["yaw"]), math.sin(-p["yaw"])
+        best = None
+        for wx, wy in st["scan"]:
+            dx, dy = wx - p["x"], wy - p["y"]
+            x, y = dx * c - dy * s_, dx * s_ + dy * c
+            if x < -back and abs(y) < half:
+                best = -x if best is None else min(best, -x)
+        return best
+
+    def _check_ready(self) -> Optional[dict]:
+        st = self.state()
+        if st.get("http") != 200 or not st.get("pose"):
+            return {"ok": False, "message": "로봇 위치(TF)를 모른다 - 드라이버가 꺼져 있다"}
+        if (st.get("nav") or {}).get("state") in ("backing", "sending", "active", "canceling"):
+            return {"ok": False, "message": "Nav2 이동 중이다 - 끝나거나 base_stop 후에 하라"}
+        if not self.call("/api/drive").get("driver_connected"):
+            return {"ok": False, "message": "차량 드라이버가 /cmd_vel 을 받지 않는다"}
+        return None
+
+    def move(self, meters: float) -> dict:
+        meters = max(-BASE_MAX_MOVE, min(BASE_MAX_MOVE, float(meters)))
+        bad = self._check_ready()
+        if bad:
+            return bad
+        st = self.state()
+        p0, front = st["pose"], (st.get("wall") or {}).get("robot_front", 0.16)
+        sign, moved, why, t0 = (1 if meters >= 0 else -1), 0.0, "", time.time()
+        self.log(f"    >> base_move {meters:+.2f} m")
+        try:
+            while True:
+                st = self.state()
+                p = st.get("pose")
+                if not p:
+                    why = "위치(TF)를 잃었다"
+                    break
+                moved = math.hypot(p["x"] - p0["x"], p["y"] - p0["y"])
+                if moved >= abs(meters) - 0.01:
+                    break
+                if sign > 0:
+                    clear = (st.get("wall") or {}).get("corridor")
+                    if clear is not None and clear < front + BASE_CLEAR:
+                        why = f"앞 {clear:.2f} m(중심 기준)에 장애물"
+                        break
+                else:
+                    clear = self._rear_clear(st)
+                    if clear is not None and clear < front + BASE_CLEAR:
+                        why = f"뒤 {clear:.2f} m(중심 기준)에 장애물"
+                        break
+                if time.time() - t0 > abs(meters) / BASE_SPEED * 2 + 5:
+                    why = "시간 초과 (바퀴가 안 움직인다?)"
+                    break
+                remain = abs(meters) - moved
+                self.call("/api/drive", {"linear": sign * max(0.03, min(BASE_SPEED, remain * 1.5)),
+                                         "angular": 0.0})
+                time.sleep(0.2)
+        finally:
+            self.call("/api/drive/stop", {})
+        return {"ok": not why, "moved_m": round(sign * moved, 3), "message": why or "완료"}
+
+    def turn(self, degrees: float) -> dict:
+        degrees = max(-180.0, min(180.0, float(degrees)))
+        bad = self._check_ready()
+        if bad:
+            return bad
+        target = math.radians(degrees)
+        last = self.state()["pose"]["yaw"]
+        turned, why, t0 = 0.0, "", time.time()
+        self.log(f"    >> base_turn {degrees:+.0f}°")
+        try:
+            while True:
+                p = self.state().get("pose")
+                if not p:
+                    why = "위치(TF)를 잃었다"
+                    break
+                d = p["yaw"] - last
+                turned += math.atan2(math.sin(d), math.cos(d))      # unwrap
+                last = p["yaw"]
+                remain = target - turned
+                if abs(remain) < math.radians(2):
+                    break
+                if time.time() - t0 > abs(target) / BASE_TURN_SPEED * 2 + 5:
+                    why = "시간 초과 (바퀴가 안 움직인다?)"
+                    break
+                w = max(0.15, min(BASE_TURN_SPEED, abs(remain) * 1.2))
+                self.call("/api/drive", {"linear": 0.0, "angular": math.copysign(w, remain)})
+                time.sleep(0.2)
+        finally:
+            self.call("/api/drive/stop", {})
+        return {"ok": not why, "turned_deg": round(math.degrees(turned), 1), "message": why or "완료"}
+
+    def stop(self) -> dict:
+        self.call("/api/drive/stop", {})
+        self.call("/api/nav/cancel", {})
+        self.call("/api/approach/stop", {})
+        self.call("/api/wall/stop", {})
+        return {"ok": True, "message": "정지"}
+
+    # --- 위치 다시 잡기 / 근접 이동 -------------------------------------------
+    def relocalize(self, global_search: bool) -> dict:
+        r = self.call("/api/relocalize", {"global": bool(global_search)})
+        if r.get("http") != 200:
+            return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
+        t0, rl = time.time(), {}
+        time.sleep(0.5)
+        while time.time() - t0 < 40:
+            rl = self.state().get("reloc") or {}
+            if rl.get("state") in ("done", "failed"):
+                break
+            self.status("위치 다시 잡는 중")
+            time.sleep(1.0)
+        res = rl.get("result") or {}
+        return {"ok": rl.get("state") == "done", "message": rl.get("message"),
+                "match": res.get("match"), "shift_m": res.get("shift"), "ambiguous": res.get("ambiguous")}
+
+    def _approach(self, kind: str, timeout: float) -> dict:
+        r = self.call(f"/api/{kind}/start", {})
+        if r.get("http") != 200:
+            return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
+        t0, a = time.time(), r
+        while a.get("state") == "running" and time.time() - t0 < timeout:
+            time.sleep(0.5)
+            a = self.call(f"/api/{kind}")
+            self.status(f"{kind} 근접 이동 중 - {a.get('message', '')}")
+        if a.get("state") == "running":
+            self.call(f"/api/{kind}/stop", {})
+            return {"ok": False, "message": "시간 초과로 정지했다"}
+        return {"ok": a.get("state") == "done", "state": a.get("state"), "message": a.get("message"),
+                "moved_m": a.get("moved")}
+
+    def wall_approach(self, gap: Optional[float]) -> dict:
+        if gap is not None:
+            c = self.call("/api/wall/config", {"gap": float(gap)})
+            if c.get("http") != 200:
+                return {"ok": False, "message": c.get("error", f"HTTP {c.get('http')}")}
+        return self._approach("wall", 120.0)
+
+    def depth_approach(self) -> dict:
+        return self._approach("approach", 90.0)
+
+
+BASE_SKILLS = ("base_state", "goto_label", "save_label", "base_move", "base_turn", "base_stop",
+               "relocalize", "wall_approach", "depth_approach")
+BASE_MOVING = ("goto_label", "base_move", "base_turn", "wall_approach", "depth_approach")
+
+
 # ---------------------------------------------------------------------------
 # 2. 모델이 낼 답의 형식
 # ---------------------------------------------------------------------------
 
 class SkillCall(BaseModel):
     skill: str = Field(description="get_state | get_rgb | get_depth_at | pick | place "
-                                   "| wait | say | done 중 하나")
+                                   "| wait | say | done | base_state | goto_label | save_label "
+                                   "| base_move | base_turn | base_stop | relocalize "
+                                   "| wall_approach | depth_approach 중 하나")
     point: Optional[List[int]] = Field(
         default=None,
         description="[y, x] 순서, 0~1000 정규화. get_depth_at/pick/place 에만 쓴다")
     seconds: Optional[float] = Field(default=None, description="wait 의 대기 시간(초)")
     message: Optional[str] = Field(default=None, description="say/done 에서 사용자에게 할 말")
+    label: Optional[str] = Field(default=None, description="goto_label/save_label 의 라벨 이름")
+    meters: Optional[float] = Field(default=None, description="base_move 거리 (m, + 전진, - 후진, ±1 이내)")
+    degrees: Optional[float] = Field(default=None, description="base_turn 각도 (°, + 왼쪽, ±180 이내)")
+    gap: Optional[float] = Field(default=None, description="wall_approach 에서 차체 앞과 벽 사이 남길 거리 (m)")
+    global_search: Optional[bool] = Field(default=None, description="relocalize: 지도 전체 검색이면 true")
     reason: str = Field(description="왜 이 스킬을 지금 부르는지 한 문장")
 
 
@@ -153,6 +441,28 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
     불러 message 에 이유를 적어라.
   - 한 번에 스킬 하나만 낸다. 결과를 보고 다음을 정한다.
   - 할 일이 없거나 사용자의 지시가 끝나면 done 을 불러라."""
+
+BASE_DOC = """
+팔은 이동 로봇(car2) 위에 있다. 로봇 몸체를 움직이는 스킬 (끝날 때까지 기다렸다가 결과를 준다):
+  base_state           위치(map 좌표 x,y m / 방향°), 저장된 라벨 목록(이름, reachable, 거리),
+                       Nav2 상태, 정면 장애물 거리(front_clear_m), 정면 벽(wall_ahead).
+  goto_label(label)    저장된 라벨 위치로 자율 주행 (Nav2). label 은 base_state 의 이름 그대로.
+                       reachable 이 false 인 라벨은 갈 수 없다.
+  save_label(label)    지금 위치를 새 라벨 이름으로 저장 (지도가 있을 때만).
+  base_move(meters)    똑바로 직진(+)/후진(-), 한 번에 ±1 m 이내. 앞/뒤에 장애물이 보이면 멈춘다.
+  base_turn(degrees)   제자리 회전, + 왼쪽(반시계) / - 오른쪽, ±180° 이내.
+  base_stop            모든 이동을 즉시 멈춘다.
+  relocalize           지도 위 위치가 틀린 것 같을 때 라이다로 다시 잡는다
+                       (global_search true = 지도 전체에서 찾기). 로봇은 움직이지 않는다.
+  wall_approach(gap)   정면 벽(책상 앞면 등)과 수직으로 맞추고 차체 앞이 gap m 남을 때까지 다가간다.
+                       gap 생략 시 저장된 값. 물건을 집기 전 작업대에 붙을 때 쓴다.
+  depth_approach       깊이 카메라 기준선까지 천천히 다가간다.
+
+몸체 규칙:
+  - 몸체가 움직이면 카메라 화면이 바뀐다. 움직인 뒤에는 클라이언트가 화면을 새로 받는다.
+  - 팔이 물체를 들고 있는 동안(waiting_place) 몸체를 움직여도 되지만 천천히 짧게 움직여라.
+  - 위치나 라벨 이름이 확실하지 않으면 base_state 를 먼저 불러라.
+  - 이동 결과 ok 가 false 면 message 를 읽고, 같은 이동을 그대로 반복하지 마라."""
 
 
 # ---------------------------------------------------------------------------
@@ -528,9 +838,12 @@ class WebUi:
 # ---------------------------------------------------------------------------
 
 class Agent:
-    def __init__(self, api: Api, vlm: Vlm, ui, auto: bool = False):
-        self.api, self.vlm, self.ui, self.auto = api, vlm, ui, auto
+    def __init__(self, api: Api, vlm: Vlm, ui, auto: bool = False, base: Optional[MapApi] = None):
+        self.api, self.vlm, self.ui, self.auto, self.base = api, vlm, ui, auto, base
         self.frame: Optional[np.ndarray] = None
+
+    def skill_doc(self) -> str:
+        return SKILL_DOC + (BASE_DOC if self.base else "")
 
     # --- 화면 -------------------------------------------------------------
     def look(self) -> bool:
@@ -556,9 +869,15 @@ class Agent:
     # --- 첫 인사: 무엇이 보이고 무엇을 할 수 있는지 -------------------------
     def brief(self) -> str:
         state = self.api.json("/get_state")
+        base = ""
+        if self.base:
+            bs = self.base.summary()
+            names = [lb["name"] for lb in bs.get("labels", []) if lb.get("reachable")]
+            base = ("이 팔은 이동 로봇 위에 있어서 저장된 장소로 이동할 수 있다"
+                    + (f" (장소: {', '.join(names)})" if names else "") + ".\n")
         prompt = (
             "이 사진은 로봇 팔이 보고 있는 작업대다. "
-            f"로봇 상태는 '{state.get('label', '?')}' 이다.\n"
+            f"로봇 상태는 '{state.get('label', '?')}' 이다.\n" + base +
             "1) 보이는 물체를 짧게 나열하고, 2) 지금 이 로봇으로 할 수 있는 일을 "
             "두세 가지 제안해라. 각 제안은 한 줄로, 사용자가 그대로 지시할 수 있는 "
             "문장으로 써라. 좌표는 아직 말하지 마라."
@@ -570,6 +889,8 @@ class Agent:
         s = call.skill
         if s in ("say", "done"):
             return {"ok": True, "message": call.message or ""}
+        if s in BASE_SKILLS:
+            return self.run_base(call)
         if s == "get_state":
             return self.api.json("/get_state")
         if s == "get_rgb":
@@ -583,6 +904,35 @@ class Agent:
             if s == "get_depth_at":
                 return {**self.api.json("/get_depth", {"x": x, "y": y}), "uv": [x, y]}
             return self.act(s, x, y)           # 묻지 않고 바로 한다
+        return {"ok": False, "message": f"모르는 스킬: {s}"}
+
+    def run_base(self, call: SkillCall) -> dict:
+        b, s = self.base, call.skill
+        if b is None:
+            return {"ok": False, "message": "이동 로봇(map_web)이 연결되지 않았다 - 몸체 스킬을 쓸 수 없다"}
+        self.ui.set_status(f"{s} 실행 중")
+        if s == "base_state":
+            return b.summary()
+        if s == "base_stop":
+            return b.stop()
+        if s in ("goto_label", "save_label"):
+            if not call.label:
+                return {"ok": False, "message": "label 이 필요하다"}
+            return b.goto_label(call.label) if s == "goto_label" else b.save_label(call.label)
+        if s == "base_move":
+            if call.meters is None:
+                return {"ok": False, "message": "meters 가 필요하다"}
+            return b.move(call.meters)
+        if s == "base_turn":
+            if call.degrees is None:
+                return {"ok": False, "message": "degrees 가 필요하다"}
+            return b.turn(call.degrees)
+        if s == "relocalize":
+            return b.relocalize(bool(call.global_search))
+        if s == "wall_approach":
+            return b.wall_approach(call.gap)
+        if s == "depth_approach":
+            return b.depth_approach()
         return {"ok": False, "message": f"모르는 스킬: {s}"}
 
     def act(self, action: str, x: int, y: int) -> dict:
@@ -633,7 +983,7 @@ class Agent:
             state = self.api.json("/get_state")
             self.ui.set_status(f"생각 중 ({step}/{MAX_STEPS})")
             prompt = (
-                f"{SKILL_DOC}\n\n"
+                f"{self.skill_doc()}\n\n"
                 f"사용자 지시: {order}\n"
                 f"로봇 상태: {state.get('state')} ({state.get('label')})\n"
                 + ("지금까지 한 일:\n" + "\n".join(history) + "\n" if history else "")
@@ -646,7 +996,8 @@ class Agent:
                 self.ui.log(f"[error] 모델 응답을 읽지 못했다: {type(e).__name__}: {e}")
                 return
 
-            arg = f" {call.point}" if call.point else ""
+            arg = "".join(f" {v}" for v in (call.point, call.label, call.meters, call.degrees, call.gap)
+                          if v is not None)
             self.ui.log(f"  [{step}] {call.skill}{arg}  - {call.reason}")
             if call.message:
                 self.ui.log(f"      말: {call.message}")
@@ -660,6 +1011,9 @@ class Agent:
                 return
             if call.skill in ("pick", "place") and result.get("ok"):
                 self.look()          # 움직였으면 화면이 바뀐다
+            if call.skill in BASE_MOVING and (result.get("moved_m") or result.get("turned_deg")
+                                              or result.get("state") in ("succeeded", "done")):
+                self.look()          # 몸체가 움직였으면 카메라가 보는 곳이 바뀐다
         self.ui.log("[warn] 스킬 호출 상한에 도달했다 - 지시를 더 구체적으로 주세요")
 
 
@@ -740,6 +1094,10 @@ def main() -> None:
                     help="웹 입력 UI 바인드 주소 (기본 127.0.0.1)")
     ap.add_argument("--no-browser", action="store_true",
                     help="브라우저를 자동으로 열지 않는다")
+    ap.add_argument("--map-api", default="",
+                    help=f"이동 로봇 map_web REST 주소 (기본: --api 와 같은 호스트의 {MAP_WEB_PORT} 포트)")
+    ap.add_argument("--no-base", action="store_true",
+                    help="이동 로봇 스킬을 쓰지 않는다 (팔만)")
     args = ap.parse_args()
 
     key = load_api_key()
@@ -770,7 +1128,19 @@ def main() -> None:
             print("        --port 로 다른 포트를 주거나, --cli 로 터미널을 쓰세요")
             return
 
-    agent = Agent(api, Vlm(key, ui.log), ui, auto=args.auto)
+    base = None
+    if not args.no_base:
+        if not args.map_api:          # 팔과 이동 로봇은 같은 파이에서 돈다
+            host = urllib.parse.urlparse(args.api).hostname or "127.0.0.1"
+            args.map_api = f"http://{host}:{MAP_WEB_PORT}"
+        base = MapApi(args.map_api, log=ui.log, status=ui.set_status)
+        if base.alive():
+            print(f"[base] {args.map_api} | 이동 로봇 스킬 사용 (base_state, goto_label, base_move ...)")
+        else:
+            print(f"[base] {args.map_api} 에 연결하지 못했다 - 이동 로봇 스킬 없이 팔만 쓴다")
+            base = None
+
+    agent = Agent(api, Vlm(key, ui.log), ui, auto=args.auto, base=base)
     try:
         run(agent, api, ui, " ".join(args.order))
     except KeyboardInterrupt:
