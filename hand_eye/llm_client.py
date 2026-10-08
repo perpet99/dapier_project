@@ -84,6 +84,7 @@ import json
 import math
 import os
 import queue
+import re
 import socket
 import ssl
 import subprocess
@@ -131,6 +132,12 @@ MAX_VOICE_BYTES = 4 * 1024 * 1024   # 음성 업로드 상한 (16 kHz 16bit 모�
 TTS_MODEL_ID = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
 TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
 TTS_KEEP = 30                       # 서버에 남겨 둘 최근 음성 답변 수
+# 모델 호출 시간 제한. API 가 답 없이 매달려도 에이전트가 멈추지 않게 (실측: 12분 넘게 무응답).
+# 시간 초과나 일시 오류(5xx, 429, 연결)는 MODEL_TRIES 번까지 시도한다.
+MODEL_TIMEOUT = 30.0                # 로봇 판단 / 화면 설명 한 번
+STT_TIMEOUT = 30.0                  # 일괄 받아쓰기 한 번
+TTS_TIMEOUT = 20.0                  # 음성 답변 한 번 (실패하면 브라우저 내장 음성)
+MODEL_TRIES = 2
 VOICE_MIN_PEAK = 800                # 이보다 작으면(16bit, 약 -32 dBFS) 말이 없다고 본다
 TLS_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_tls_cert.pem")
 TLS_KEY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_tls_key.pem")
@@ -624,6 +631,59 @@ BASE_DOC = """
 # 3. 모델 호출
 # ---------------------------------------------------------------------------
 
+class ModelTimeout(Exception):
+    """모델이 시간 제한 안에 답하지 않았다."""
+
+
+def with_deadline(fn, seconds: float):
+    """fn() 을 별도 스레드에서 돌려 seconds 까지만 기다린다. SDK 가 안에서 재시도하거나
+    연결이 매달려도 부른 쪽은 반드시 돌아온다 (남은 스레드는 SDK 시간 제한으로 곧 끝난다)."""
+    box: dict = {}
+
+    def run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:            # 부른 쪽 스레드로 넘긴다
+            box["e"] = e
+
+    th = threading.Thread(target=run, daemon=True, name="model-call")
+    th.start()
+    th.join(seconds)
+    if th.is_alive():
+        raise ModelTimeout(f"{seconds:.0f}초 안에 응답이 없다")
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
+
+
+def quota_message(e: BaseException) -> Optional[str]:
+    """일일 할당량을 다 쓴 429 면 사람이 읽을 설명, 아니면 None.
+    (무료 등급 gemini-robotics-er-2-preview 는 하루 20회 - 다시 해도 소용없다)"""
+    text = str(e)
+    if not ("429" in text or "RESOURCE_EXHAUSTED" in text or "too_many_requests" in text):
+        return None
+    if not re.search(r"per day|PerDay|quota", text, re.I):
+        return None                             # 분당 한도 같은 짧은 제한은 다시 해 볼 만하다
+    m = re.search(r"limit: (\d+)[^.]*?per day", text) or re.search(r"limit: (\d+)", text)
+    wait = re.search(r"retry in ([0-9hms.]+)", text)
+    return ("모델 일일 할당량을 다 썼다"
+            + (f" (하루 {m.group(1)}회)" if m else "")
+            + (f" - {re.sub(r'\.\d+s$', 's', wait.group(1))} 뒤에 다시 쓸 수 있다" if wait else ""))
+
+
+def is_transient(e: BaseException) -> bool:
+    """다시 해 볼 만한 오류인가 (시간 초과, 서버 5xx, 짧은 429, 연결)."""
+    if isinstance(e, ModelTimeout):
+        return True
+    if quota_message(e):
+        return False
+    name = type(e).__name__
+    if any(k in name for k in ("Timeout", "Connection", "Server", "RateLimit", "Unavailable")):
+        return True
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    return isinstance(code, int) and (code == 429 or code >= 500)
+
+
 class Vlm:
     """test3.py 와 같은 호출 방식(interactions + JSON 스키마)을 쓴다."""
 
@@ -631,6 +691,13 @@ class Vlm:
                  stt_model: str = STT_MODEL_ID, live_model: Optional[str] = LIVE_STT_MODEL_ID,
                  tts_model: Optional[str] = TTS_MODEL_ID):
         self.client = genai.Client(api_key=api_key)
+        # interactions 클라이언트는 기본으로 429/5xx 를 최대 1시간 동안 조용히 재시도한다 -
+        # 할당량 초과(429)가 '응답 없음' 으로 보이게 된다. 재시도는 _call 이 한 번만 한다.
+        try:
+            from google.genai._gaos.utils.retries import RetryConfig
+            self.client.interactions.sdk_configuration.retry_config = RetryConfig("none", None, False)
+        except Exception:                      # SDK 내부 구조가 바뀌면 그냥 기본값으로
+            pass
         self.model = model
         self.stt_model = stt_model
         self.live_model = live_model          # None 이면 실시간 없이 일괄 받아쓰기만
@@ -641,17 +708,33 @@ class Vlm:
         """음성 하나를 실시간으로 받아 적는 세션을 연다 (웹 녹음 시작 때)."""
         return LiveStt(self, job)
 
+    def _call(self, fn, timeout: float, job: Optional[str], what: str, tries: int = MODEL_TRIES):
+        """모델 호출 하나에 시간 제한과 재시도를 건다. fn(timeout) 은 SDK 에도 같은 제한을 넘긴다."""
+        for attempt in range(1, tries + 1):
+            try:
+                return with_deadline(lambda: fn(timeout), timeout + 5)
+            except Exception as e:
+                if attempt >= tries or not is_transient(e):
+                    raise
+                why = "시간 초과" if isinstance(e, ModelTimeout) else type(e).__name__
+                self.log(f"      ({what} {why} - 다시 시도 {attempt + 1}/{tries})")
+                TRACE.add(job, f"{what} 다시 시도", f"{why}: {e}"[:200] + f" ({attempt + 1}/{tries})",
+                          level="warn")
+                time.sleep(1.0)
+
     def tts(self, text: str, job: Optional[str] = None) -> bytes:
         """음성 답변용 WAV. 재생은 브라우저가 한다."""
         TRACE.add(job, "음성 답변 만들기", f"{self.tts_model}: {text}")
         t0 = time.perf_counter()
         try:
-            r = self.client.models.generate_content(
+            r = self._call(lambda t: self.client.models.generate_content(
                 model=self.tts_model, contents=text,
                 config=genai_types.GenerateContentConfig(
                     response_modalities=["AUDIO"],
+                    http_options=genai_types.HttpOptions(timeout=int(t * 1000)),
                     speech_config=genai_types.SpeechConfig(voice_config=genai_types.VoiceConfig(
-                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)))))
+                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=TTS_VOICE))))),
+                TTS_TIMEOUT, job, "음성 답변", tries=1)    # 실패하면 브라우저 내장 음성이 대신한다
             part = r.candidates[0].content.parts[0].inline_data
             data = part.data
             if data[:4] != b"RIFF":                # 날 PCM 이면 WAV 로 싼다 (24 kHz 16bit)
@@ -687,13 +770,15 @@ class Vlm:
                   detail=prompt)
         t0 = time.perf_counter()
         try:
-            res = self.client.interactions.create(
+            audio_b64 = base64.b64encode(wav).decode()
+            res = self._call(lambda t: self.client.interactions.create(
                 model=self.stt_model,
                 input=[
                     {"type": "text", "text": prompt},
-                    {"type": "audio", "data": base64.b64encode(wav).decode(), "mime_type": "audio/wav"},
+                    {"type": "audio", "data": audio_b64, "mime_type": "audio/wav"},
                 ],
-            )
+                timeout=t,
+            ), STT_TIMEOUT, job, "받아쓰기")
         except Exception as e:
             TRACE.add(job, "받아쓰기 오류", f"{type(e).__name__}: {e}", level="error",
                       ms=(time.perf_counter() - t0) * 1000)
@@ -764,7 +849,8 @@ class Vlm:
                                        "schema": schema}
         t0 = time.perf_counter()
         try:
-            res = self.client.interactions.create(**body)
+            res = self._call(lambda t: self.client.interactions.create(**body, timeout=t),
+                             MODEL_TIMEOUT, job, f"{label}모델")
         except Exception as e:
             TRACE.add(job, f"{label}모델 오류", f"{type(e).__name__}: {e}", level="error",
                       ms=(time.perf_counter() - t0) * 1000)
@@ -2400,7 +2486,12 @@ class Agent:
                 call = SkillCall(**json.loads(raw))
             except Exception as e:
                 self.ui.log(f"[error] 모델 응답을 읽지 못했다: {type(e).__name__}: {e}")
-                self.speak("죄송해요, 지금은 처리하지 못했어요.", job)
+                quota = quota_message(e)
+                if quota:
+                    self.ui.log(f"[error] {quota}")
+                self.speak("오늘 쓸 수 있는 모델 사용량을 다 써서 지금은 할 수 없어요." if quota
+                           else "모델 응답이 너무 늦어 멈췄어요. 다시 말씀해 주세요."
+                           if isinstance(e, ModelTimeout) else "죄송해요, 지금은 처리하지 못했어요.", job)
                 TRACE.add(job, f"{step}단계 응답 해석 실패", f"{type(e).__name__}: {e}", level="error",
                           detail=raw, end=True, ms=(time.perf_counter() - t0) * 1000)
                 return
@@ -2451,6 +2542,17 @@ class Agent:
 # 6. 실행
 # ---------------------------------------------------------------------------
 
+def safe_brief(agent: Agent) -> str:
+    """화면 설명이 실패해도(시간 초과 등) 프로그램은 계속 지시를 받는다."""
+    try:
+        return agent.brief()
+    except Exception as e:
+        quota = quota_message(e)
+        if quota:
+            return f"[error] 화면 설명을 받지 못했다 - {quota}"
+        return f"[error] 화면 설명을 받지 못했다 ({type(e).__name__}: {e}) - 지시는 그대로 할 수 있다"
+
+
 def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
     """지시 하나를 끝내면 화면을 새로 받고 다음 지시를 기다린다."""
     if not agent.look():
@@ -2458,7 +2560,7 @@ def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
 
     ui.set_status("화면 살펴보는 중")
     ui.log("[화면 설명]")
-    ui.log(agent.brief())
+    ui.log(safe_brief(agent))
     ui.log("")
     ui.log("무엇을 시킬까요? ('r' 화면 다시 보기, 'q' 종료)")
 
@@ -2468,7 +2570,11 @@ def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
             order, pending = pending, ""
             ui.log("")
             ui.log(f"[지시] {order}")
-            agent.follow(order, getattr(ui, "last_job", None))
+            try:
+                agent.follow(order, getattr(ui, "last_job", None))
+            except Exception as e:             # 한 지시가 실패해도 다음 지시는 받는다
+                ui.log(f"[error] 지시를 처리하다 멈췄다: {type(e).__name__}: {e}")
+                agent.speak("문제가 생겨 지시를 멈췄어요.")
             # 명령이 끝났으니 화면을 새로 보고 다음 명령을 기다린다
             ui.set_status("화면 갱신 중")
             agent.look()
@@ -2486,7 +2592,7 @@ def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
         if order.lower() == "r":
             ui.set_status("화면 다시 보는 중")
             agent.look()
-            ui.log(agent.brief())
+            ui.log(safe_brief(agent))
             continue
         pending = order
 
