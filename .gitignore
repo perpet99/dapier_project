@@ -4,4 +4,8 @@ __pycache__/
 *.pyc
 .env
 .venv/
-*.dbhand_eye/llm_skills.json
+*.db
+hand_eye/llm_skills.json
+hand_eye/llm_tls_*.pem
+hand_eye/llm_trace.jsonl*
+
