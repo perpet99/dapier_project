@@ -1,0 +1,7 @@
+{
+  "disabled": [
+    "depth_approach",
+    "relocalize",
+    "save_label"
+  ]
+}

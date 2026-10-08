@@ -91,6 +91,7 @@ BASE_CLEAR = 0.10         # base_move: 차체 앞/뒤에서 이 거리 안에 �
 NAV_TIMEOUT = 240.0       # goto_label 최대 대기 (s)
 MODEL_ID = os.environ.get("GEMINI_MODEL", "gemini-robotics-er-2-preview")
 VIEW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_view.jpg")
+SKILLS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_skills.json")  # 웹에서 끈 스킬
 SEND_WIDTH = 800          # 모델에 보낼 이미지 폭. 토큰을 아끼되 점을 찍을 만큼은 크게
 MAX_STEPS = 12            # 한 지시당 스킬 호출 상한 (무한루프 방지)
 MAX_RETRY = 3             # pick/place 가 실패했을 때 다시 해볼 최대 횟수
@@ -390,6 +391,30 @@ BASE_SKILLS = ("base_state", "goto_label", "save_label", "base_move", "base_turn
                "relocalize", "wall_approach", "depth_approach")
 BASE_MOVING = ("goto_label", "base_move", "base_turn", "wall_approach", "depth_approach")
 
+# 웹 UI 의 '등록된 스킬' 표 (이름, 인자, REST, 설명)
+ARM_SKILL_LIST = [
+    ("get_state", "", "GET /get_state", "지금 무엇을 하는 중인지"),
+    ("get_rgb", "", "GET /get_rgb", "화면을 다시 본다"),
+    ("get_depth_at", "point", "GET /get_depth", "그 점의 깊이/로봇좌표/집기 가능 여부"),
+    ("pick", "point", "GET /pick", "그 점의 물체를 집는다"),
+    ("place", "point", "GET /place", "그 점에 내려놓는다"),
+    ("wait", "seconds", "/get_state 폴링", "동작이 끝날 때까지 기다린다"),
+    ("say", "message", "-", "사용자에게 한마디"),
+    ("done", "message", "-", "일을 마쳤다고 알리고 종료"),
+]
+BASE_SKILL_LIST = [
+    ("base_state", "", "GET /api/state", "위치·방향, 라벨 목록, Nav2/근접 상태"),
+    ("goto_label", "label", "POST /api/nav/goto", "라벨 위치로 Nav2 자율 주행"),
+    ("save_label", "label", "POST /api/labels", "지금 위치를 라벨로 저장"),
+    ("base_move", "meters", "POST /api/drive", "직진/후진 (±1 m, 장애물이면 정지)"),
+    ("base_turn", "degrees", "POST /api/drive", "제자리 회전 (±180°, + = 왼쪽)"),
+    ("base_stop", "", "/api/drive/stop + 취소", "모든 이동 정지"),
+    ("relocalize", "global_search", "POST /api/relocalize", "라이다로 지도 위 위치 다시 잡기"),
+    ("wall_approach", "gap", "POST /api/wall/*", "정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진"),
+    ("depth_approach", "", "POST /api/approach/*", "깊이 카메라 근접선까지 전진"),
+]
+LOCKED_SKILLS = ("done",)     # 끌 수 없다 - 이게 없으면 지시를 끝낼 방법이 없다
+
 
 # ---------------------------------------------------------------------------
 # 2. 모델이 낼 답의 형식
@@ -579,6 +604,29 @@ PAGE = """<!doctype html>
            background: #1d4f80; color: #fff; font-size: 14px; cursor: pointer; }
   button.no { background: #3a2027; border-color: #7a3646; }
   .hint { color: #8b939c; font-size: 12.5px; margin-top: 8px; }
+  details { margin-top: 14px; background: #0e1013; border: 1px solid #262a30;
+            border-radius: 8px; padding: 8px 12px; }
+  summary { cursor: pointer; font-weight: bold; }
+  .grp { margin: 10px 0 4px; color: #7ec8ff; font-size: 13px; }
+  .grp.off { color: #8b939c; }
+  .tbl { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  td, th { text-align: left; padding: 4px 8px; border-top: 1px solid #262a30; vertical-align: top; }
+  th { color: #8b939c; font-weight: normal; }
+  td code { color: #ffc46b; }
+  td.rest { color: #8b939c; white-space: nowrap; }
+  tr.off td { opacity: .45; }
+  tr.off td:first-child { opacity: 1; }
+  .sw { position: relative; display: inline-block; width: 34px; height: 18px; }
+  .sw input { opacity: 0; width: 0; height: 0; }
+  .sw span { position: absolute; inset: 0; background: #3a2027; border-radius: 999px;
+             cursor: pointer; transition: background .15s; }
+  .sw span::before { content: ""; position: absolute; left: 2px; top: 2px; width: 14px;
+                     height: 14px; border-radius: 50%; background: #e6e6e6; transition: transform .15s; }
+  .sw input:checked + span { background: #1d4f80; }
+  .sw input:checked + span::before { transform: translateX(16px); }
+  .sw input:disabled + span { cursor: not-allowed; opacity: .6; }
+  .grp button { padding: 2px 8px; font-size: 12px; margin-left: 6px; }
 </style>
 <div class="wrap">
   <h1>로봇 조종 <span id="state" class="chip">-</span>
@@ -603,6 +651,10 @@ PAGE = """<!doctype html>
   </form>
   <div class="hint">지시 하나가 끝나면 화면을 새로 받고 다음 지시를 기다린다.
     pick/place 는 묻지 않고 바로 실행하고, 실패했을 때만 위에서 다시 할지 묻는다.</div>
+  <details id="skills" open>
+    <summary>등록된 스킬 <span id="skillCount"></span></summary>
+    <div id="skillBody" class="hint">불러오는 중...</div>
+  </details>
 </div>
 <script>
 let since = 0, viewSeq = -1, asking = 0;
@@ -654,7 +706,77 @@ function answer(v) {
   $('ask').hidden = true;
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+  });
+}
+
+function renderSkills(groups) {
+  let html = '', on = 0, total = 0;
+  groups.forEach(function (g, gi) {
+    const k = g.skills.filter(function (s) { return s.on; }).length;
+    html += '<div class="grp' + (g.enabled ? '' : ' off') + '">' + esc(g.name);
+    if (g.enabled) {
+      html += ' (' + k + '/' + g.skills.length + ' 켜짐)'
+            + '<button type="button" onclick="toggleGroup(' + gi + ', true)">모두 켜기</button>'
+            + '<button type="button" class="no" onclick="toggleGroup(' + gi + ', false)">모두 끄기</button>';
+    } else {
+      html += ' - ' + esc(g.note || '사용 안 함');
+    }
+    html += '</div>';
+    if (!g.enabled) return;
+    on += k; total += g.skills.length;
+    html += '<div class="tbl"><table><tr><th>사용</th><th>스킬</th><th>인자</th><th>REST</th><th>설명</th></tr>';
+    g.skills.forEach(function (s) {
+      html += '<tr class="' + (s.on ? '' : 'off') + '"><td><label class="sw" title="'
+            + (s.locked ? '끌 수 없다 (지시를 끝내는 스킬)' : '켜기/끄기') + '">'
+            + '<input type="checkbox" data-skill="' + esc(s.name) + '"' + (s.on ? ' checked' : '')
+            + (s.locked ? ' disabled' : '') + ' onchange="toggleSkill(this)"><span></span></label></td>'
+            + '<td><code>' + esc(s.name) + '</code></td><td>' + esc(s.args || '-')
+            + '</td><td class="rest">' + esc(s.rest) + '</td><td>' + esc(s.desc) + '</td></tr>';
+    });
+    html += '</table></div>';
+  });
+  html += '<div class="hint">끈 스킬은 모델에게 알려주지 않고, 불러도 거부한다. 진행 중인 지시에도 다음 단계부터 바로 적용되고, 설정은 hand_eye/llm_skills.json 에 저장돼 재시작해도 유지된다.</div>';
+  skillGroups = groups;
+  $('skillBody').className = '';
+  $('skillBody').innerHTML = html;
+  $('skillCount').textContent = '(' + on + '/' + total + ')';
+}
+
+let skillGroups = [];
+
+async function setSkills(names, on) {
+  try {
+    const r = await fetch('/skill_toggle?on=' + (on ? 1 : 0) + '&names='
+                          + encodeURIComponent(names.join(',')));
+    const d = await r.json();
+    renderSkills(d.groups);
+  } catch (e) {
+    loadSkills();
+  }
+}
+
+function toggleSkill(el) { setSkills([el.dataset.skill], el.checked); }
+
+function toggleGroup(gi, on) {
+  setSkills(skillGroups[gi].skills.map(function (s) { return s.name; }), on);
+}
+
+async function loadSkills() {
+  // 이동 로봇 연결 여부는 시작 직후에 정해지므로, 준비될 때까지 다시 묻는다
+  try {
+    const d = await (await fetch('/skills')).json();
+    if (!d.ready) { setTimeout(loadSkills, 1000); return; }
+    renderSkills(d.groups);
+  } catch (e) {
+    setTimeout(loadSkills, 2000);
+  }
+}
+
 poll();
+loadSkills();
 </script>
 """
 
@@ -701,6 +823,17 @@ def _make_handler(ui: "WebUi"):
                     self._send(404, "text/plain; charset=utf-8", b"no view yet")
             elif u.path == "/poll":
                 self._json(ui.snapshot(self._int(q, "since")))
+            elif u.path == "/skills":
+                ready = ui.skills_fn is not None
+                self._json({"ready": ready, "groups": ui.skills_fn() if ready else []})
+            elif u.path == "/skill_toggle":
+                if ui.skills_fn is None or ui.toggle_fn is None:
+                    self._json({"ok": False, "groups": []})
+                    return
+                names = [n for n in (q.get("names", [""])[0] or "").split(",") if n]
+                on = q.get("on", ["1"])[0] == "1"
+                changed = ui.toggle_fn(names, on)
+                self._json({"ok": True, "changed": changed, "groups": ui.skills_fn()})
             elif u.path == "/order":
                 text = (q.get("text", [""])[0] or "").strip()
                 if text:
@@ -738,6 +871,9 @@ class WebUi:
         self.state_fn = state_fn
         self._state: dict = {}
         self._state_at = 0.0
+        # Agent 가 만들어지면 채운다 (skill_groups / set_skills). 그 전엔 None
+        self.skills_fn = None
+        self.toggle_fn = None
 
         self.srv = ThreadingHTTPServer((host, port), _make_handler(self))
         self.srv.daemon_threads = True
@@ -841,9 +977,69 @@ class Agent:
     def __init__(self, api: Api, vlm: Vlm, ui, auto: bool = False, base: Optional[MapApi] = None):
         self.api, self.vlm, self.ui, self.auto, self.base = api, vlm, ui, auto, base
         self.frame: Optional[np.ndarray] = None
+        self.disabled: set[str] = self._load_disabled()   # 웹 UI 에서 끈 스킬 (재시작해도 유지)
+        if self.disabled:
+            self.ui.log(f"[skill] 꺼 둔 스킬 (저장된 설정): {', '.join(sorted(self.disabled))}")
+
+    # --- 스킬 켜기/끄기 설정 (SKILLS_PATH 에 저장) ----------------------------
+    @staticmethod
+    def _load_disabled() -> set[str]:
+        try:
+            with open(SKILLS_PATH, encoding="utf-8") as f:
+                names = json.load(f).get("disabled", [])
+        except FileNotFoundError:
+            return set()
+        except (OSError, ValueError, AttributeError) as e:
+            print(f"[skill] {SKILLS_PATH} 를 읽지 못해 모든 스킬을 켠다: {e}")
+            return set()
+        known = {s[0] for s in ARM_SKILL_LIST + BASE_SKILL_LIST}
+        return {n for n in names if n in known and n not in LOCKED_SKILLS}
+
+    def _save_disabled(self) -> None:
+        tmp = SKILLS_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"disabled": sorted(self.disabled)}, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, SKILLS_PATH)       # 쓰다 죽어도 이전 파일은 멀쩡하게
+        except OSError as e:
+            self.ui.log(f"[skill] 설정 저장 실패 ({SKILLS_PATH}): {e}")
 
     def skill_doc(self) -> str:
-        return SKILL_DOC + (BASE_DOC if self.base else "")
+        doc = SKILL_DOC + (BASE_DOC if self.base else "")
+        off = sorted(self.disabled)
+        if off:
+            doc += ("\n\n사용자가 다음 스킬을 꺼 두었다 - 부르지 마라 (불러도 거부된다): "
+                    + ", ".join(off) + "\n이 스킬 없이는 할 수 없는 일이면 done 으로 이유를 알려라.")
+        return doc
+
+    def set_skills(self, names: List[str], on: bool) -> List[str]:
+        """스킬을 켜거나 끈다. 실제로 바뀐 이름만 돌려준다 (done 은 끌 수 없다)."""
+        known = {s[0] for s in ARM_SKILL_LIST + BASE_SKILL_LIST}
+        disabled, changed = set(self.disabled), []
+        for n in names:
+            if n not in known or n in LOCKED_SKILLS or (n in disabled) != on:
+                continue
+            (disabled.discard if on else disabled.add)(n)
+            changed.append(n)
+        self.disabled = disabled             # 통째로 바꿔서 에이전트 스레드가 반쯤 바뀐 걸 보지 않게
+        if changed:
+            self._save_disabled()
+            self.ui.log(f"[skill] {'켬' if on else '끔'}: {', '.join(changed)}")
+        return changed
+
+    def skill_groups(self) -> list:
+        """스킬 목록과 켜짐 여부 (웹 UI 표시용)."""
+        off = self.disabled
+
+        def rows(lst):
+            return [{"name": n, "args": a, "rest": r, "desc": d,
+                     "on": n not in off, "locked": n in LOCKED_SKILLS} for n, a, r, d in lst]
+        return [
+            {"name": f"로봇 팔 - {self.api.base}", "enabled": True, "skills": rows(ARM_SKILL_LIST)},
+            {"name": "이동 로봇 (car2)" + (f" - {self.base.base}" if self.base else ""),
+             "enabled": self.base is not None, "skills": rows(BASE_SKILL_LIST),
+             "note": "map_web 미연결 또는 --no-base"},
+        ]
 
     # --- 화면 -------------------------------------------------------------
     def look(self) -> bool:
@@ -887,6 +1083,8 @@ class Agent:
     # --- 스킬 실행 ---------------------------------------------------------
     def run_skill(self, call: SkillCall) -> dict:
         s = call.skill
+        if s in self.disabled:
+            return {"ok": False, "message": f"{s} 는 사용자가 꺼 둔 스킬이다 - 다른 방법을 쓰거나 done"}
         if s in ("say", "done"):
             return {"ok": True, "message": call.message or ""}
         if s in BASE_SKILLS:
@@ -1141,6 +1339,9 @@ def main() -> None:
             base = None
 
     agent = Agent(api, Vlm(key, ui.log), ui, auto=args.auto, base=base)
+    if isinstance(ui, WebUi):
+        ui.toggle_fn = agent.set_skills
+        ui.skills_fn = agent.skill_groups
     try:
         run(agent, api, ui, " ".join(args.order))
     except KeyboardInterrupt:
