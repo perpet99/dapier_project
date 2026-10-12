@@ -115,14 +115,30 @@ IK_MARGIN = 0.008            # 완전신전(특이점) 근처를 피하기 위�
 # --- 작업 영역 제한 [m] (로봇 베이스 기준) ------------------------------------
 # 이건 거친 안전 박스일 뿐이다. 실제 도달 가능 여부는 IK 가 판정한다.
 WS_R_MIN, WS_R_MAX = 0.08, 0.25   # 베이스 축으로부터의 수평 거리
-WS_Z_MIN, WS_Z_MAX = 0.005, 0.24  # 테이블면 위 높이
+# 테이블면 높이 [m] (로봇 베이스 바닥 = 0). 베이스를 받침대에 올려 테이블이 베이스보다
+# 낮으면 음수. pick_settings.json 의 table_z_mm 로 바꾼다. 아래 기본 인자(z_min=WS_Z_MIN)가
+# 정의 시점에 묶이므로 import 시점에 읽어야 한다.
+PICK_SETTINGS_PATH = os.path.join(_HERE, "pick_settings.json")
+
+
+def _read_pick_settings() -> dict:
+    try:
+        with open(PICK_SETTINGS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+TABLE_Z = float(_read_pick_settings().get("table_z_mm", 0.0)) / 1000.0
+WS_Z_MIN, WS_Z_MAX = TABLE_Z + 0.005, 0.24  # 테이블면 위 높이
 
 # 캘리브레이션 중에만 z 를 이만큼 더 허용한다 [m].
 # 영점이 조금 틀어져 있으면 그리퍼를 테이블에 댔을 때 FK 가 z 를 음수로 보고한다.
 # 그 값을 거부해 버리면 정작 영점을 고치는 데 필요한 점을 하나도 못 모은다.
 # 실제 집기(pick/place)에는 적용하지 않는다 - 거기서는 테이블을 파고들면 안 된다.
 CALIB_Z_TOL = 0.030
-CALIB_Z_MIN = -CALIB_Z_TOL        # 테이블면(z=0) 기준으로 이만큼 아래까지 허용
+CALIB_Z_MIN = TABLE_Z - CALIB_Z_TOL  # 테이블면 기준으로 이만큼 아래까지 허용
 
 # --- 파지 파라미터 [m] --------------------------------------------------------
 # 접근/상승 높이는 "희망값"이다. 반경이 클수록 팔이 위로 뻗을 여유가 줄기 때문에
@@ -131,6 +147,40 @@ APPROACH_H = 0.06    # 목표 위에서 정렬하고 싶은 높이
 GRASP_SINK = 0.012   # 표면에서 얼마나 더 내려가 잡을지
 LIFT_H = 0.08        # 파지 후 들어올리고 싶은 높이
 PLACE_CLEAR = 0.050  # 놓을 때 표면에서 띄울 높이 - 여기서 그리퍼를 연다
+
+# GRASP_SINK 는 웹 UI 에서 바꿀 수 있고, 바꾸면 pick_settings.json 에 바로 저장된다.
+GRASP_SINK_MIN, GRASP_SINK_MAX = -0.020, 0.100   # 허용 범위 [m] (음수 = 표면 위에서 멈춤)
+
+
+def set_grasp_sink(meters: float, save: bool = True) -> float:
+    """pick 하강 깊이를 바꾸고(범위로 자른다) 저장한다. 실제로 적용된 값을 돌려준다."""
+    global GRASP_SINK
+    GRASP_SINK = float(np.clip(float(meters), GRASP_SINK_MIN, GRASP_SINK_MAX))
+    if save:
+        try:
+            d = _read_pick_settings()            # table_z_mm 등 다른 항목은 유지
+            d.update({"grasp_sink_mm": round(GRASP_SINK * 1000, 1),
+                      "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+            with open(PICK_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=2)
+            print(f"[settings] pick 하강 offset {GRASP_SINK * 1000:.1f}mm 저장")
+        except OSError as e:
+            print(f"[settings] 저장 실패: {e}")
+    return GRASP_SINK
+
+
+def load_pick_settings() -> None:
+    print(f"[settings] 테이블면 z={TABLE_Z * 1000:+.0f}mm (pick 하한 {WS_Z_MIN * 1000:+.0f}mm)")
+    d = _read_pick_settings()
+    if "grasp_sink_mm" not in d:
+        return
+    try:
+        mm = float(d["grasp_sink_mm"])
+    except (ValueError, TypeError) as e:
+        print(f"[settings] {PICK_SETTINGS_PATH} 읽기 실패: {e}")
+        return
+    set_grasp_sink(mm / 1000.0, save=False)
+    print(f"[settings] pick 하강 offset {GRASP_SINK * 1000:.1f}mm (pick_settings.json)")
 
 # 그리퍼를 "연다"고 할 때 얼마나 벌릴지 (0=닫힘, 1=기계적 최대).
 # 최대로 벌리면 필요 이상으로 크게 벌어져 주변 물체를 건드리고 여닫는 시간도 길다.
@@ -1461,7 +1511,7 @@ def clamp_z(x: float, y: float, z_wanted: float, z_floor: float,
 def tcp_sanity(tcp: Optional[Sequence[float]]) -> Optional[str]:
     """팔이 스스로 보고한 위치가 물리적으로 가능한가. 가능하면 None.
 
-    팔이 테이블 위에 놓여 있으면 그리퍼가 테이블면(z=0) 아래로 갈 수 없다.
+    그리퍼는 테이블면(z=TABLE_Z, pick_settings.json 의 table_z_mm) 아래로 갈 수 없다.
     그런 값이 나온다면 카메라가 아니라 관절 영점(arm_calib.json)이 틀린 것이다.
     이걸 모르고 hand-eye 를 아무리 다시 잡아도 맞지 않는다 - FK 가 자세마다
     다르게 틀리면 그 오차는 하나의 강체변환으로 흡수되지 않기 때문이다.
@@ -1470,9 +1520,10 @@ def tcp_sanity(tcp: Optional[Sequence[float]]) -> Optional[str]:
         return None
     z = float(tcp[2])
     if z < CALIB_Z_MIN:
-        return (f"팔이 보고한 높이 z={z*1000:.0f}mm 가 테이블면보다 "
-                f"{CALIB_Z_TOL*1000:.0f}mm 넘게 아래다. "
-                f"관절 영점이 틀렸다 - calibrate_arm.py 를 다시 돌릴 것")
+        return (f"팔이 보고한 높이 z={z*1000:.0f}mm 가 테이블면(z={TABLE_Z*1000:.0f}mm)보다 "
+                f"{(TABLE_Z - z)*1000:.0f}mm 아래다 (허용 {CALIB_Z_TOL*1000:.0f}mm). "
+                f"관절 영점이 틀렸거나 table_z_mm 가 실제와 다르다 - "
+                f"pick_settings.json 확인 후 calibrate_arm.py 를 다시 돌릴 것")
     return None
 
 
@@ -2297,7 +2348,7 @@ def plane_camera_pose(n_cam: np.ndarray, pts_cam: np.ndarray) -> tuple[float, fl
 
 
 def align_to_plane(he: HandEye, n_cam: np.ndarray, pts_cam: np.ndarray) -> np.ndarray:
-    """테이블면이 로봇계에서 z=0 수평면이 되도록 roll/pitch/tz 를 맞춘 변환.
+    """테이블면이 로봇계에서 z=TABLE_Z 수평면이 되도록 roll/pitch/tz 를 맞춘 변환.
 
     로봇이 테이블 위에 있다는 사실만으로 6자유도 중 3개가 정해진다.
     남는 자유도는 yaw(평면 안에서의 회전)와 tx, ty 뿐이고, 그건 지금 값을 유지한다.
@@ -2321,7 +2372,7 @@ def align_to_plane(he: HandEye, n_cam: np.ndarray, pts_cam: np.ndarray) -> np.nd
     T = np.eye(4)
     T[:3, :3] = R
     T[:3, 3] = he.T[:3, 3].copy()
-    T[2, 3] = -float((R @ pts_cam.mean(0))[2])               # 평면이 z=0 이 되도록
+    T[2, 3] = TABLE_Z - float((R @ pts_cam.mean(0))[2])      # 평면이 z=TABLE_Z 가 되도록
     return T
 
 
@@ -2960,6 +3011,125 @@ class HandEyePanel:
         self.msg_col = P_FG
         self.print_quality()
 
+    # --- 점 하나씩 고치기 (웹 UI 표) ---------------------------------------
+    # 모두 run 루프 스레드에서 불린다 (App.call_main). 실패하면 ValueError 를
+    # 던지고, 그 메시지가 그대로 웹 화면에 뜬다.
+    def points_table(self) -> dict:
+        """웹 UI 표에 보여줄 점 목록. 길이는 mm 단위."""
+        q = point_set_quality(self.pairs)
+        gaps = q.get("per_point")
+        rows = []
+        for i, rec in enumerate(self.records):
+            cam = np.array(rec["cam"], float)
+            tcp = np.array(rec["tcp"], float)
+            err = float(np.linalg.norm(self.app.he.cam_to_base(cam) - tcp))
+            rows.append({
+                "i": i + 1,
+                "uv": rec.get("uv"),
+                "cam": [round(v * 1000, 1) for v in cam],
+                "tcp": [round(v * 1000, 1) for v in tcp],
+                "err": round(err * 1000, 1),
+                "gap": None if gaps is None else round(float(gaps[i]) * 1000, 1),
+                "counts": bool(rec.get("counts")),
+            })
+        return {"points": rows, "gap_tol": round(GAP_TOL * 1000, 1),
+                "has_click": self.last_cam is not None,
+                "last_uv": list(self.last_uv) if self.last_uv else None,
+                "msg": self.msg}
+
+    def _sync_pairs(self) -> None:
+        self.pairs = [(np.array(r["cam"], float), np.array(r["tcp"], float))
+                      for r in self.records]
+
+    def _rec(self, n: int) -> dict:
+        if not 1 <= n <= len(self.records):
+            raise ValueError(f"{n}번 점이 없습니다 (1~{len(self.records)})")
+        return self.records[n - 1]
+
+    @staticmethod
+    def _mm3(v) -> list[float]:
+        try:
+            xs = [float(a) / 1000.0 for a in v]
+        except (TypeError, ValueError):
+            raise ValueError("좌표는 숫자 3개(mm)여야 합니다")
+        if len(xs) != 3 or not all(math.isfinite(a) for a in xs):
+            raise ValueError("좌표는 숫자 3개(mm)여야 합니다")
+        return xs
+
+    def edit_point(self, n: int, cam=None, tcp=None) -> str:
+        """숫자를 직접 고친다.
+
+        cam 을 고치면 화면 위치(uv)는 그 좌표를 되투영해서 다시 정한다.
+        tcp 를 고치면 서보 카운트를 지운다. 그대로 두면 '점 읽기' 때 카운트로
+        tcp 를 다시 계산하면서(refresh_tcp_from_counts) 고친 값을 덮어쓴다.
+        """
+        rec = self._rec(n)
+        changed = []
+        if cam is not None:
+            new = self._mm3(cam)
+            if new[2] <= 0:
+                raise ValueError("카메라 z(깊이)는 0보다 커야 합니다")
+            if not np.allclose(new, rec["cam"], atol=5e-5):
+                rec["cam"] = new
+                rec["uv"] = None
+                changed.append("카메라좌표")
+        if tcp is not None:
+            new = self._mm3(tcp)
+            if not np.allclose(new, rec["tcp"], atol=5e-5):
+                rec["tcp"] = new
+                rec.pop("counts", None)
+                changed.append("로봇좌표")
+        if not changed:
+            return f"{n}번 점: 바뀐 값이 없습니다"
+        self._sync_pairs()
+        self.msg = f"{n}번 점 {'/'.join(changed)} 수정됨 - 자동풀기로 다시 푸세요"
+        self.msg_col = P_FG
+        print(f"[calib] {self.msg}")
+        return self.msg
+
+    def delete_point(self, n: int) -> str:
+        self._rec(n)
+        del self.records[n - 1]
+        self._sync_pairs()
+        self.msg = f"{n}번 점 삭제, {len(self.records)}개 남음"
+        self.msg_col = P_FG
+        print(f"[calib] {self.msg}")
+        return self.msg
+
+    def point_from_click(self, n: int) -> str:
+        """카메라 쪽을 방금 화면에서 클릭한 지점으로 바꾼다 (로봇좌표는 그대로)."""
+        rec = self._rec(n)
+        if self.last_cam is None:
+            raise ValueError("먼저 화면에서 지점을 클릭하세요")
+        rec["cam"] = [float(v) for v in self.last_cam]
+        rec["uv"] = list(self.last_uv) if self.last_uv else None
+        self._sync_pairs()
+        self.msg = f"{n}번 점 카메라좌표를 클릭한 지점 {rec['uv']} 으로 교체"
+        self.msg_col = P_FG
+        print(f"[calib] {self.msg}")
+        return self.msg
+
+    def point_from_arm(self, n: int) -> str:
+        """로봇 쪽을 지금 팔의 TCP(와 서보 카운트)로 바꾼다 (카메라좌표는 그대로)."""
+        rec = self._rec(n)
+        tcp = self.app.arm.get_tcp()
+        if tcp is None:
+            raise ValueError("팔이 연결되지 않아 로봇좌표를 읽을 수 없습니다")
+        why = tcp_sanity(tcp)
+        if why:
+            raise ValueError(why)
+        rec["tcp"] = [float(v) for v in tcp]
+        counts = self.app.arm.get_joint_counts()
+        if counts:
+            rec["counts"] = counts
+        else:
+            rec.pop("counts", None)
+        self._sync_pairs()
+        self.msg = f"{n}번 점 로봇좌표를 현재 TCP 로 교체"
+        self.msg_col = P_FG
+        print(f"[calib] {self.msg}")
+        return self.msg
+
     def toggle_points(self) -> None:
         self.show_points = not self.show_points
         self.msg = ("점을 화면에 표시합니다" if self.show_points
@@ -2995,8 +3165,20 @@ class HandEyePanel:
             col = P_OK if err < 0.01 else (P_ACC if err < 0.03 else (60, 60, 255))
             cv2.drawMarker(frame, uv, col, cv2.MARKER_TILTED_CROSS, 14, 2)
             cv2.circle(frame, uv, 9, col, 1)
-            put_text(frame, f"{i} {err*1000:.0f}mm", (uv[0] + 11, uv[1] - 8),
-                        0.4, col, 1)
+            # 번호는 웹 UI 표의 # 과 같다. 어느 줄을 고칠지 화면에서 바로 찾을 수
+            # 있게, 배경과 상관없이 읽히는 배지로 그린다.
+            num, sc = str(i), 0.5
+            tw, th = text_size(num, sc, 1)
+            bx, by = uv[0] + 10, uv[1] - 12 - th          # 배지 왼쪽 위
+            bw, bh = max(tw + 8, th + 8), th + 8
+            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (25, 25, 25), -1)
+            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), col, 1)
+            put_text(frame, num, (bx + (bw - tw) // 2, by + bh - 4), sc, (255, 255, 255), 1)
+            et = f"{err*1000:.0f}mm"
+            ew, eh = text_size(et, 0.38, 1)
+            ex, ey = bx + bw + 3, by + bh - 4
+            cv2.rectangle(frame, (ex - 2, ey - eh - 3), (ex + ew + 2, ey + 3), (25, 25, 25), -1)
+            put_text(frame, et, (ex, ey), 0.38, col, 1)
 
     # --- 재현성 검증 -------------------------------------------------------
     def verify_points(self) -> None:
@@ -3319,7 +3501,7 @@ class HandEyePanel:
             t("테이블면 검증: 평면을 찾지 못함", (12, y + 12), 0.4, P_DIM)
         else:
             tilt, zm, zs = st
-            good = tilt < 5.0 and abs(zm) < 20.0
+            good = tilt < 5.0 and abs(zm - TABLE_Z * 1000) < 20.0
             col = P_OK if good else P_BAD
             t("테이블면 검증 (0 에 가까워야 정상)", (12, y + 12), 0.38, P_DIM)
             t(f"기울기 {tilt:5.1f} deg", (12, y + 32), 0.46, col)
@@ -3429,6 +3611,8 @@ class App:
         self._calib_pending: Optional[tuple] = None      # (x, y, p_cam) 확정 대기 중
         self._console_thread: Optional[threading.Thread] = None
         self._stdin_eof = False
+        # force_reset() 이 올린다. 리셋 전에 시작한 작업이 끝나면서 상태를 되돌려 놓지 않게 한다.
+        self._reset_gen = 0
 
     # --- 로봇 동작 워커 (UI 프리즈 방지) ----------------------------------
     def _worker_loop(self) -> None:
@@ -3441,13 +3625,20 @@ class App:
             prev_mode = self.st.mode
             self.st.mode = STATE_BUSY
             self.current_job = job.kind
+            gen = self._reset_gen
             try:
                 job.fn(*job.args)
+                if gen != self._reset_gen:      # 도는 사이 강제 리셋됨 - 결과로 상태를 덮지 않는다
+                    print(f"[reset] 리셋 전에 시작한 {job.kind} 작업이 끝남 (상태는 그대로 IDLE)")
+                    continue
                 self.st.mode = job.done_mode or prev_mode
                 self.st.status = job.done_msg or self.st.status
                 if job.clear_markers:
                     self.st.markers = []
             except Exception as e:
+                if gen != self._reset_gen:
+                    print(f"[reset] 리셋 전에 시작한 {job.kind} 작업 실패: {e}")
+                    continue
                 self.st.mode = prev_mode
                 self.st.status = f"실패: {e}"
                 self.last_error = str(e)
@@ -3459,6 +3650,36 @@ class App:
     def _submit(self, job: Job) -> None:
         self.jobs.put(job)
 
+    def force_reset(self) -> dict:
+        """기본 상태(IDLE, 손 빔)로 강제로 되돌린다. run() 루프 스레드에서 불러야 한다.
+
+        대기 중인 작업은 버리고, 캘리브레이션 중이면 모은 점을 버리고 빠져나온다
+        (handeye.json 은 건드리지 않는다). 이미 움직이는 중인 동작은 중간에 끊으면
+        팔이 어중간한 자세로 서므로 끝까지 가게 두고, 끝나도 상태는 덮어쓰지 않는다.
+        """
+        with self._cmd_lock:
+            dropped = 0
+            while True:
+                try:
+                    self.jobs.get_nowait()
+                except queue.Empty:
+                    break
+                self.jobs.task_done()
+                dropped += 1
+            self._reset_gen += 1
+            running = self.current_job
+            self.st.mode = STATE_IDLE
+            self.st.markers.clear()
+            self.st.calibrating = False
+            self.st.calib_cam.clear()
+            self.st.calib_base.clear()
+            self._calib_pending = None
+            self.last_error = None
+            self.st.status = "강제 리셋됨 - 물체를 클릭하면 집습니다"
+        print(f"[reset] 강제 리셋 (대기 작업 {dropped}개 버림"
+              + (f", 진행 중인 {running} 은 끝까지 감)" if running else ")"))
+        return {"dropped_jobs": dropped, "running_job": running}
+
     # --- 웹 UI 입력/출력 -----------------------------------------------------
     def enqueue_mouse(self, event: int, x: int, y: int) -> None:
         """HTTP 핸들러 스레드에서 호출. run() 루프가 다음 턴에 처리한다."""
@@ -3466,6 +3687,22 @@ class App:
 
     def enqueue_key(self, code: int) -> None:
         self._input_events.put(("key", code))
+
+    def call_main(self, fn, timeout: float = 5.0):
+        """HTTP 핸들러 스레드에서 호출. fn 을 run() 루프 스레드에서 실행하고 결과를 돌려준다.
+
+        패널의 점 목록은 run 루프가 매 프레임 읽고 고치므로, 웹에서 고칠 때도
+        같은 스레드를 거쳐야 그리는 도중에 목록이 바뀌는 일이 없다.
+        fn 이 던진 예외는 그대로 다시 던진다. 시간 안에 못 돌면 TimeoutError.
+        """
+        box: dict = {}
+        done = threading.Event()
+        self._input_events.put(("call", fn, box, done))
+        if not done.wait(timeout):
+            raise TimeoutError("화면 루프가 응답하지 않습니다 (작업 중일 수 있음)")
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
 
     def latest_display(self) -> Optional[np.ndarray]:
         """MJPEG 스트림용 최신 합성 화면 (카메라 뷰 + 우측 패널)."""
@@ -3971,6 +4208,14 @@ class App:
                     self.running = False
             elif kind == "console":
                 self._on_console_line(item[1])
+            elif kind == "call":
+                _, fn, box, done = item
+                try:
+                    box["result"] = fn()
+                except Exception as e:      # 호출한 HTTP 스레드로 넘긴다
+                    box["error"] = e
+                finally:
+                    done.set()
 
     def handle_key(self, key: int) -> bool:
         """웹 UI에서 넘어온 키 1개 처리. False 를 돌려주면 앱을 종료한다.
@@ -4218,6 +4463,130 @@ MJPEG_BOUNDARY = "so101frame"
 # 입력을 좌표/코드로 바꿔 보내기만 한다.
 _FPS_OPTIONS = "".join(f'<option value="{v}">{v} fps</option>' for v in (1, 2, 5, 10, 15, 20, 30))
 _Q_OPTIONS = "".join(f'<option value="{v}">{v}</option>' for v in (40, 60, 80, 95))
+# 웹 UI 아래쪽 캘리브레이션 점 표. UI_HTML 은 f-string 이라 중괄호를 겹쳐 써야 해서
+# JS 가 긴 이 부분은 일반 문자열로 따로 둔다. 서버 쪽은 _ApiHandler._route_calib.
+CALIB_HTML = """
+<details id="calib" open>
+  <summary>캘리브레이션 점 (<span id="cn">0</span>개)
+    <button data-op="refresh">새로고침</button>
+    <button data-op="load">점 읽기</button>
+    <button data-op="save">점 저장</button>
+  </summary>
+  <div id="cmsg"></div>
+  <div class="wrap"><table id="ct">
+    <thead><tr>
+      <th>#</th><th>uv</th>
+      <th colspan="3">카메라 x y z [mm]</th>
+      <th colspan="3">로봇(TCP) x y z [mm]</th>
+      <th>오차</th><th>불일치</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <div class="note">숫자를 고친 뒤 '적용'. '클릭점' = 카메라좌표를 화면에서 방금 클릭한 지점으로,
+    '현재TCP' = 로봇좌표를 지금 팔 위치로 바꾼다. 로봇좌표를 손으로 고치면 서보 카운트는 지워진다.
+    고친 뒤에는 패널의 '자동풀기' 로 변환을 다시 풀고, '점 저장' 해야 파일에 남는다.</div>
+</details>
+<style>
+  #calib { padding: 4px 8px; font-size: 12px; }
+  #calib summary { cursor: pointer; }
+  #calib button { background: #2a2a30; color: #ddd; border: 1px solid #555; font: inherit;
+                  padding: 1px 6px; cursor: pointer; }
+  #calib button:hover { background: #3a3a44; }
+  #calib button.dirty { background: #5a4a20; border-color: #c90; }
+  #calib button.del { color: #f88; }
+  #ct { border-collapse: collapse; margin-top: 4px; }
+  #ct th, #ct td { padding: 2px 4px; border-bottom: 1px solid #2a2a2a; text-align: right; white-space: nowrap; }
+  #ct th { color: #999; font-weight: normal; }
+  #ct input { width: 6.5ch; background: #1c1c20; color: #ddd; border: 1px solid #444; font: inherit; text-align: right; }
+  #ct input.dirty { border-color: #c90; }
+  #ct td.ok { color: #6d6; } #ct td.mid { color: #fc4; } #ct td.bad { color: #f66; }
+  #cmsg { margin: 4px 0; min-height: 1em; }
+  #cmsg.err { color: #f66; }
+  #calib .note { opacity: .6; margin-top: 4px; max-width: 900px; }
+  #calib .wrap { overflow-x: auto; }
+</style>
+<script>
+(() => {
+  const tb = document.querySelector('#ct tbody'), cmsg = document.getElementById('cmsg');
+  const fmt = v => (v === null || v === undefined) ? '-' : v.toFixed(1);
+  const cls = (v, a, b) => v === null ? '' : (v < a ? 'ok' : (v < b ? 'mid' : 'bad'));
+  function say(t, err) { cmsg.textContent = t || ''; cmsg.className = err ? 'err' : ''; }
+  function busy() {      // 입력 중이거나 고치다 만 줄이 있으면 자동 갱신으로 덮지 않는다
+    const a = document.activeElement;
+    return (a && a.tagName === 'INPUT' && tb.contains(a)) || tb.querySelector('input.dirty');
+  }
+  function render(d) {
+    document.getElementById('cn').textContent = d.points.length;
+    tb.innerHTML = '';
+    for (const p of d.points) {
+      const tr = document.createElement('tr');
+      tr.dataset.i = p.i;
+      const inp = (k, j, v) => `<td><input data-k="${k}" data-j="${j}" value="${v.toFixed(1)}"
+                                  data-v="${v.toFixed(1)}"></td>`;
+      tr.innerHTML =
+        `<td>${p.i}</td><td title="${p.uv ? '' : '카메라좌표에서 되투영'}">${p.uv ? p.uv.join(',') : '(투영)'}</td>` +
+        p.cam.map((v, j) => inp('cam', j, v)).join('') +
+        p.tcp.map((v, j) => inp('tcp', j, v)).join('') +
+        `<td class="${cls(p.err, 10, 30)}">${fmt(p.err)}</td>` +
+        `<td class="${cls(p.gap, d.gap_tol, 1e9)}">${fmt(p.gap)}</td>` +
+        `<td><button data-op="edit">적용</button>
+             <button data-op="from_click" ${d.has_click ? '' : 'disabled'}
+               title="${d.last_uv ? '클릭 지점 ' + d.last_uv.join(',') : '먼저 화면을 클릭'}">클릭점</button>
+             <button data-op="from_arm" title="${p.counts ? '' : '서보 카운트 없음'}">현재TCP</button>
+             <button data-op="delete" class="del">삭제</button></td>`;
+      tb.appendChild(tr);
+    }
+  }
+  async function call(path, body) {
+    try {
+      const r = await fetch(path, body === undefined ? {} :
+        {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+      const d = await r.json();
+      if (!d.ok) { say(d.error || '실패', true); return; }
+      render(d);
+      if (d.message !== undefined) say(d.message);
+    } catch (e) { say('요청 실패: ' + e, true); }
+  }
+  const refresh = () => call('/calib/points');
+  tb.addEventListener('input', e => {
+    const t = e.target;
+    if (t.tagName !== 'INPUT') return;
+    t.classList.toggle('dirty', t.value !== t.dataset.v);
+    const tr = t.closest('tr');
+    tr.querySelector('[data-op=edit]').classList.toggle('dirty', !!tr.querySelector('input.dirty'));
+  });
+  tb.addEventListener('keydown', e => {      // 입력칸에서 Enter = 적용
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT')
+      e.target.closest('tr').querySelector('[data-op=edit]').click();
+  });
+  tb.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    const tr = b.closest('tr'), i = +tr.dataset.i, op = b.dataset.op;
+    if (op === 'edit') {
+      const get = k => [...tr.querySelectorAll(`input[data-k=${k}]`)].map(x => parseFloat(x.value));
+      const v = {cam: get('cam'), tcp: get('tcp')};
+      if ([...v.cam, ...v.tcp].some(x => !isFinite(x))) { say('숫자가 아닌 칸이 있습니다', true); return; }
+      call('/calib/edit', {i, ...v});
+    } else if (op === 'delete') {
+      if (confirm(`${i}번 점을 삭제할까요?`)) call('/calib/delete', {i});
+    } else {
+      call('/calib/' + op, {i});
+    }
+  });
+  document.querySelector('#calib summary').addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    e.preventDefault();                       // details 접힘 토글 방지
+    if (b.dataset.op === 'refresh') refresh();
+    else call('/calib/' + b.dataset.op, {});
+  });
+  refresh();
+  setInterval(() => { if (document.getElementById('calib').open && !busy()) refresh(); }, 2000);
+})();
+</script>
+"""
+
 UI_HTML = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{WINDOW}</title>
 <style>
@@ -4225,16 +4594,23 @@ UI_HTML = f"""<!doctype html>
   #v {{ display: block; max-width: 100vw; height: auto; cursor: crosshair; }}
   #hint {{ padding: 4px 8px; font-size: 12px; opacity: .75; }}
   #bar {{ padding: 4px 8px; font-size: 12px; }}
-  #bar select {{ background: #222; color: #ddd; border: 1px solid #555; font: inherit; }}
+  #bar select, #bar input {{ background: #222; color: #ddd; border: 1px solid #555; font: inherit; }}
+  #bar input {{ width: 5em; }}
+  #bar button {{ background: #522; color: #ddd; border: 1px solid #855; font: inherit; cursor: pointer; }}
 </style></head>
 <body>
   <img id="v">
   <div id="bar">전송 프레임
     <select id="fps">{_FPS_OPTIONS}</select>
     화질 <select id="q">{_Q_OPTIONS}</select>
+    &nbsp;| pick 하강 offset <input id="sink" type="number" step="1"
+      min="{GRASP_SINK_MIN * 1000:g}" max="{GRASP_SINK_MAX * 1000:g}"> mm
+    <span id="sinkMsg"></span>
+    &nbsp;| <button id="reset">리셋</button> <span id="resetMsg"></span>
   </div>
   <div id="hint">클릭 = pick/place/캘리브 점 | 키(포커스가 이 탭에 있을 때):
     q 종료  h 홈  o/c 그리퍼  r 리셋  d 뷰전환  w 도달영역  k 캘리브  t 토크  s 저장</div>
+  {CALIB_HTML}
 <script>
 const img = document.getElementById('v');
 const fpsSel = document.getElementById('fps'), qSel = document.getElementById('q');
@@ -4254,6 +4630,33 @@ function restartStream() {{
 fpsSel.addEventListener('change', restartStream);
 qSel.addEventListener('change', restartStream);
 restartStream();
+// pick 하강 offset: 바꾸면 잠시 뒤 자동 저장 (서버의 pick_settings.json)
+const sinkInp = document.getElementById('sink'), sinkMsg = document.getElementById('sinkMsg');
+function showSink(d) {{ sinkInp.value = d.grasp_sink_mm; }}
+fetch('/settings').then(r => r.json()).then(showSink).catch(() => {{}});
+let sinkTimer = null;
+sinkInp.addEventListener('input', () => {{
+  clearTimeout(sinkTimer);
+  sinkMsg.textContent = '…';
+  sinkTimer = setTimeout(() => {{
+    const v = parseFloat(sinkInp.value);
+    if (!isFinite(v)) {{ sinkMsg.textContent = '숫자를 넣으세요'; return; }}
+    fetch('/settings', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                         body: JSON.stringify({{grasp_sink_mm: v}})}})
+      .then(r => r.json()).then(d => {{
+        if (!d.ok) {{ sinkMsg.textContent = d.error || '실패'; return; }}
+        if (d.grasp_sink_mm !== v) showSink(d);   // 범위 밖이면 잘린 값을 보여준다
+        sinkMsg.textContent = '저장됨';
+      }}).catch(() => {{ sinkMsg.textContent = '저장 실패'; }});
+  }}, 500);
+}});
+const resetMsg = document.getElementById('resetMsg');
+document.getElementById('reset').addEventListener('click', () => {{
+  resetMsg.textContent = '…';
+  fetch('/reset', {{method: 'POST'}}).then(r => r.json())
+    .then(d => {{ resetMsg.textContent = d.ok ? d.message : (d.error || '실패'); }})
+    .catch(() => {{ resetMsg.textContent = '리셋 실패'; }});
+}});
 function toImageXY(e) {{
   const r = img.getBoundingClientRect();
   const sx = img.naturalWidth / r.width, sy = img.naturalHeight / r.height;
@@ -4272,7 +4675,8 @@ img.addEventListener('mousemove', e => {{
   fetch(`/hover?x=${{x}}&y=${{y}}`);
 }});
 document.addEventListener('keydown', e => {{
-  if (e.repeat || e.target.tagName === 'SELECT') return;   // 선택 칸 조작은 단축키가 아니다
+  // 선택 칸/입력 칸/버튼 조작은 단축키가 아니다
+  if (e.repeat || ['SELECT', 'INPUT', 'TEXTAREA', 'BUTTON'].includes(e.target.tagName)) return;
   const code = e.key === 'Escape' ? 'Escape' : e.key;
   fetch(`/key?code=${{encodeURIComponent(code)}}`);
 }});
@@ -4486,6 +4890,36 @@ class _ApiHandler(BaseHTTPRequestHandler):
             self._stream_mjpeg(app, params)
             return
 
+        if path == "/reset":
+            try:
+                info = app.call_main(app.force_reset)
+            except TimeoutError:
+                self._send(503, {"ok": False, "error": "앱이 응답하지 않습니다"})
+                return
+            msg = "기본 상태로 리셋됨"
+            if info["running_job"]:
+                msg += f" (진행 중인 {info['running_job']} 동작은 끝까지 감)"
+            self._send(200, {"ok": True, "message": msg, **info, **app.snapshot()})
+            return
+
+        if path == "/settings":
+            if "grasp_sink_mm" in params:
+                try:
+                    mm = float(params["grasp_sink_mm"])
+                    if not math.isfinite(mm):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self._send(400, {"ok": False, "error": "grasp_sink_mm 를 숫자로 주세요"})
+                    return
+                set_grasp_sink(mm / 1000.0)
+            self._send(200, {"ok": True, "grasp_sink_mm": round(GRASP_SINK * 1000, 1),
+                             "min_mm": GRASP_SINK_MIN * 1000, "max_mm": GRASP_SINK_MAX * 1000})
+            return
+
+        if path.startswith("/calib/"):
+            self._route_calib(app, path, params)
+            return
+
         if path == "/":
             self._send_html(200, UI_HTML)
             return
@@ -4500,12 +4934,58 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 "GET /get_state  (= /status) 지금 무엇을 하는 중인지",
                 "GET|POST /pick   x,y (화면 픽셀)",
                 "GET|POST /place  x,y (화면 픽셀)",
+                "GET|POST /reset   기본 상태(IDLE, 손 빔)로 강제 리셋 - 대기 작업/캘리브 점 버림",
+                "GET|POST /settings [grasp_sink_mm] - pick 시 표면에서 더 내려갈 깊이(mm), 바꾸면 자동 저장",
                 "GET /get_rgb    [?format=png] [?overlay=1]",
                 "GET /get_depth  [?format=color] - 기본은 16bit PNG(mm)",
-                "GET /get_depth?x=&y= - 그 화소의 depth/로봇좌표 (JSON)"]})
+                "GET /get_depth?x=&y= - 그 화소의 depth/로봇좌표 (JSON)",
+                "GET /calib/points       캘리브레이션 점 목록 (mm)",
+                "POST /calib/edit        {i, cam:[x,y,z], tcp:[x,y,z]} (mm, 둘 중 하나만도 됨)",
+                "POST /calib/delete      {i}",
+                "POST /calib/from_click  {i} - 카메라좌표를 마지막 클릭 지점으로",
+                "POST /calib/from_arm    {i} - 로봇좌표를 현재 팔 TCP 로",
+                "POST /calib/load | /calib/save  점 파일 읽기/저장 (변환은 그대로)"]})
             return
 
         self._send(404, {"ok": False, "error": f"없는 경로: {path}"})
+
+    def _route_calib(self, app: "App", path: str, params: dict) -> None:
+        """웹 UI 의 캘리브레이션 점 표. 실제 변경은 run 루프 스레드에서 한다."""
+        panel = app.panel
+        if path == "/calib/points":
+            fn = panel.points_table
+        else:
+            if self.command != "POST":
+                self._send(405, {"ok": False, "error": "POST 로 보내세요"})
+                return
+            try:
+                n = int(params.get("i", 0))
+            except (TypeError, ValueError):
+                n = 0
+            actions = {
+                "/calib/edit": lambda: panel.edit_point(n, params.get("cam"),
+                                                         params.get("tcp")),
+                "/calib/delete": lambda: panel.delete_point(n),
+                "/calib/from_click": lambda: panel.point_from_click(n),
+                "/calib/from_arm": lambda: panel.point_from_arm(n),
+                "/calib/load": lambda: (panel.load_points(), panel.msg)[1],
+                "/calib/save": lambda: (panel.save_points_only(), panel.msg)[1],
+            }
+            if path not in actions:
+                self._send(404, {"ok": False, "error": f"없는 경로: {path}"})
+                return
+            act = actions[path]
+            # 고친 뒤의 표를 같이 돌려줘서 페이지가 한 번에 갱신되게 한다.
+            fn = lambda: {"message": act(), **panel.points_table()}
+        try:
+            res = app.call_main(fn)
+        except ValueError as e:
+            self._send(400, {"ok": False, "error": str(e)})
+            return
+        except TimeoutError as e:
+            self._send(503, {"ok": False, "error": str(e)})
+            return
+        self._send(200, {"ok": True, **res})
 
 
 def start_api(app: "App") -> Optional[ThreadingHTTPServer]:
@@ -4539,6 +5019,7 @@ def main() -> None:
     source = open_depth_source()
     arm = setup_arm()                  # 1/2: 팔 캘리브레이션 읽기
     calib_now = want_handeye_calib(arm)   # 2/2: 카메라-로봇 캘리브레이션 확인/실행
+    load_pick_settings()
     handeye = HandEye.load()
     app = App(source, arm, handeye)
     app.calib_on_start = calib_now

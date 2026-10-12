@@ -13,6 +13,7 @@ llm_client.py - Gemini Robotics-ER 이 test4.py 의 REST API 를 스킬로 쓰�
   get_depth_at(y, x)     GET /get_depth?x=&y=    그 점의 깊이/로봇좌표/집기 가능 여부
   pick(y, x)             GET /pick?x=&y=         그 점의 물체를 집는다
   place(y, x)            GET /place?x=&y=        그 점에 내려놓는다
+  reset                  GET /reset              기본 상태(손 빔, waiting_pick)로 강제 리셋
   wait(seconds)          (/get_state 폴링)       동작이 끝날 때까지 기다린다
   say(message)           -                       사용자에게 한마디
   done(message)          -                       일을 마쳤다고 알리고 종료
@@ -536,6 +537,7 @@ ARM_SKILL_LIST = [
     ("get_depth_at", "point", "GET /get_depth", "그 점의 깊이/로봇좌표/집기 가능 여부"),
     ("pick", "point", "GET /pick", "그 점의 물체를 집는다"),
     ("place", "point", "GET /place", "그 점에 내려놓는다"),
+    ("reset", "", "GET /reset", "기본 상태(손 빔)로 강제 리셋"),
     ("wait", "seconds", "/get_state 폴링", "동작이 끝날 때까지 기다린다"),
     ("say", "message", "-", "사용자에게 한마디"),
     ("done", "message", "-", "일을 마쳤다고 알리고 종료"),
@@ -560,7 +562,7 @@ LOCKED_SKILLS = ("done",)     # 끌 수 없다 - 이게 없으면 지시를 끝�
 
 class SkillCall(BaseModel):
     skill: str = Field(description="get_state | get_rgb | get_depth_at | pick | place "
-                                   "| wait | say | done | base_state | goto_label | save_label "
+                                   "| reset | wait | say | done | base_state | goto_label | save_label "
                                    "| base_move | base_turn | base_stop | relocalize "
                                    "| wall_approach | depth_approach 중 하나")
     point: Optional[List[int]] = Field(
@@ -593,6 +595,9 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
                        팔은 움직이지 않는다. pick 전에 확인하는 습관이 좋다.
   pick(point)          그 점의 물체를 집는다. waiting_pick 상태에서만 된다.
   place(point)         그 점에 내려놓는다. waiting_place 상태에서만 된다.
+  reset                상태를 기본(waiting_pick, 손 빔)으로 강제로 되돌린다. 팔은 움직이지
+                       않고 그리퍼도 열지 않는다. 상태가 실제와 어긋나 pick/place 가 계속
+                       거부될 때(예: 손이 비었는데 waiting_place)만 쓴다.
   wait(seconds)        동작이 끝날 때까지 기다린다 (picking/placing 이면 필요).
   say(message)         사용자에게 한마디 하고 계속한다.
   done(message)        일이 끝났거나 더 할 수 없을 때. 이유를 message 에 적는다.
@@ -2465,6 +2470,8 @@ class Agent:
             return self.api.json("/get_state")
         if s == "get_rgb":
             return {"ok": self.look(), "note": "새 화면을 받았다"}
+        if s == "reset":
+            return self.api.json("/reset")
         if s == "wait":
             return self.wait_idle(float(call.seconds or 3.0))
         if s in ("get_depth_at", "pick", "place"):
