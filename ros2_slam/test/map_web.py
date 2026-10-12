@@ -25,7 +25,10 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
   POST /api/labels/delete {"id": "..."}
   POST /api/nav/goto {"id": "..."}    Nav2 NavigateToPose to the label; when the label is
                                 behind the robot (bearing > 90 deg) back up goto_backup_m
-                                (0.30 m) first
+                                (0.30 m) first. A label inside an obstacle / the robot radius on
+                                Nav2's global costmap is driven to the closest reachable point
+                                (within 1.5 m) instead; an abort mid-route retries up to twice when
+                                that point has moved (obstacle seen on the way)
   POST /api/nav/cancel          cancel the Nav2 goal (manual driving cancels it too)
   GET  /api/nav/tolerance       JSON: arrival tolerance saved here / active in Nav2, limits
   POST /api/nav/tolerance {"xy": 0.05, "yaw_deg": 14}
@@ -1066,6 +1069,44 @@ class MapWeb(Node):
             return -1
         return int(grid[j, i])
 
+    def nearest_reachable(self, x, y, max_m=1.5):
+        """Closest costmap cell to (x, y) the robot can stand on (cost < 99) and drive to from where it is
+        now (same free region), as (x, y, shift m); None without a fresh costmap or no such cell in max_m."""
+        cm = self.costmap
+        if cm is None or time.time() - cm[5] > 30.0:
+            return None
+        grid, res, ox, oy = cm[:4]
+        free = ((grid >= 0) & (grid < 99)).astype(np.uint8)
+        _, comp = cv2.connectedComponents(free, connectivity=8)
+        cur = self.cur_pose
+        if cur is not None and time.time() - cur[4] < 2.0 and cur[0] == self.map_frame:
+            ri, rj = int((cur[1] - ox) / res), int((cur[2] - oy) / res)
+            if 0 <= ri < grid.shape[1] and 0 <= rj < grid.shape[0] and comp[rj, ri] > 0:
+                free = (comp == comp[rj, ri]).astype(np.uint8)   # only cells connected to the robot
+        js, is_ = np.nonzero(free)
+        if js.size == 0:
+            return None
+        cx, cy = ox + (is_ + 0.5) * res, oy + (js + 0.5) * res
+        d = np.hypot(cx - x, cy - y)
+        k = int(d.argmin())
+        if d[k] > max_m:
+            return None
+        return round(float(cx[k]), 3), round(float(cy[k]), 3), round(float(d[k]), 3)
+
+    def reachable_goal(self, label):
+        """The label itself, or -- when it sits in an obstacle / within the robot radius on Nav2's
+        costmap -- a copy moved to the closest reachable point (keeps the label's heading).
+        Returns (goal, note); goal None when nothing reachable is near."""
+        cost = self.cost_at(label['x'], label['y'])
+        if cost is None or cost < 99:
+            return label, ''
+        near = self.nearest_reachable(label['x'], label['y'])
+        if near is None:
+            return None, f'라벨 위치가 비용지도에서 막혀 있고(cost {cost}) 1.5 m 안에 갈 수 있는 곳이 없습니다'
+        x, y, shift = near
+        return ({**label, 'x': x, 'y': y, 'orig': {'x': label['x'], 'y': label['y']}, 'shift': shift},
+                f'라벨 위치가 막혀 있어(cost {cost}) {shift * 100:.0f} cm 떨어진 가장 가까운 지점으로')
+
     def _on_scan(self, msg: LaserScan):
         now = time.time()
         self.scan = (msg, now)
@@ -1262,6 +1303,11 @@ class MapWeb(Node):
                     self.goal_handle.cancel_goal_async()
                     self.nav = {**self.nav, 'state': 'canceling', 'message': '취소 요청'}
                 continue
+            if req[0] == 'retry':        # aborted goal whose reachable point moved: try once more
+                _, seq, label, note, retries = req
+                if seq == self.nav_seq and self.nav.get('state') == 'active':   # not canceled / replaced meanwhile
+                    self._send_goal(label, note, retries)
+                continue
             label = req[1]
             self.nav_seq += 1
             if not self.nav_client.server_is_ready():
@@ -1298,20 +1344,31 @@ class MapWeb(Node):
         b = math.atan2(dy, dx) - cur[3]
         return math.atan2(math.sin(b), math.cos(b))
 
-    def _send_goal(self, label, note):
+    def _send_goal(self, label, note, retries=0):
+        """Send the label as a Nav2 goal; a label inside an obstacle / the robot radius on the
+        costmap is replaced by the closest reachable point (reachable_goal)."""
         self.nav_seq += 1
+        target, adj = self.reachable_goal(label)
+        note = ' · '.join(s for s in (note, adj) if s)
+        if target is None:
+            self.nav = {'state': 'aborted', 'target': label, 'label': label, 'started': self.nav.get('started', time.time()),
+                        'note': note, 'message': f'실패: {adj}', 'finished': time.time()}
+            self.get_logger().info(f"nav goal '{label['name']}': {adj}")
+            return
         goal = NavigateToPose.Goal()
-        goal.pose.header.frame_id = label.get('frame', self.map_frame)
-        goal.pose.pose.position.x = float(label['x'])
-        goal.pose.pose.position.y = float(label['y'])
-        goal.pose.pose.orientation.z = math.sin(label['yaw'] / 2)
-        goal.pose.pose.orientation.w = math.cos(label['yaw'] / 2)
+        goal.pose.header.frame_id = target.get('frame', self.map_frame)
+        goal.pose.pose.position.x = float(target['x'])
+        goal.pose.pose.position.y = float(target['y'])
+        goal.pose.pose.orientation.z = math.sin(target['yaw'] / 2)
+        goal.pose.pose.orientation.w = math.cos(target['yaw'] / 2)
         seq = self.nav_seq
-        self.nav = {'state': 'sending', 'target': label, 'started': self.nav.get('started', time.time()),
+        self.nav = {'state': 'sending', 'target': target, 'label': label, 'retries': retries,
+                    'started': self.nav.get('started', time.time()),
                     'backed': self.nav.get('backed'), 'note': note, 'message': '목표 전송 중'}
         fut = self.nav_client.send_goal_async(goal, feedback_callback=lambda fb, s=seq: self._nav_feedback(s, fb))
         fut.add_done_callback(lambda f, s=seq: self._nav_accepted(s, f))
-        self.get_logger().info(f"nav goal '{label['name']}' x {label['x']:.2f} y {label['y']:.2f}")
+        self.get_logger().info(f"nav goal '{label['name']}' x {target['x']:.2f} y {target['y']:.2f}"
+                               + (f' (label blocked, moved {target["shift"]:.2f} m)' if 'shift' in target else ''))
 
     def _nav_feedback(self, seq, msg):
         fb = msg.feedback
@@ -1344,6 +1401,18 @@ class MapWeb(Node):
             if left > self.tolerance.arrive_check():
                 state, msg = 'failed', (f'Nav2가 도착이라고 했지만 목표까지 {left:.2f} m 남음 — 목표가 장애물 영역이라 '
                                         '가까운 지점에서 멈췄거나 TF 지연 오판')
+        label = self.nav.get('label')
+        if state == 'aborted' and label and seq == self.nav_seq and self.nav.get('retries', 0) < 2:
+            # an obstacle seen on the way (e.g. the desk at the label) can block the goal mid-route:
+            # if the closest reachable point is somewhere else now, go there instead of giving up
+            nxt, _ = self.reachable_goal(label)
+            if nxt is not None and target and math.hypot(nxt['x'] - target['x'], nxt['y'] - target['y']) > 0.05:
+                self._set_nav(seq, message=f'{msg} — 가장 가까운 지점으로 다시 시도')
+                self.request_nav(('retry', seq, label, '막혀서 다시 시도', self.nav.get('retries', 0) + 1))
+                self.get_logger().info('nav aborted, retrying to the closest reachable point')
+                return
+        if state == 'succeeded' and target and 'shift' in target:
+            msg = f"라벨 위치가 막혀 있어 {target['shift'] * 100:.0f} cm 떨어진 가장 가까운 지점에 도착"
         self._set_nav(seq, state=state, message=msg + (f': {err}' if err else ''), finished=time.time())
         self.get_logger().info(f'nav result: {state} {err}')
 
@@ -2046,7 +2115,7 @@ function renderLabels() {
   if (!labels.some(lb => lb.id === selId)) selId = null;
   const target = S && S.nav && ['backing', 'sending', 'active', 'canceling'].includes(S.nav.state) && S.nav.target ? S.nav.target.id : null;
   const rows = labels.length ? labels.map(lb => `<tr data-id="${lb.id}" class="${lb.id === selId ? 'sel' : ''} ${lb.id === target ? 'target' : ''}">
-      <td>${esc(lb.name)}${lb.cost >= 99 ? ' <span class="blocked" title="Nav2 비용지도에서 장애물/로봇 반경 안 — 갈 수 없음">⚠ 도달 불가</span>' : ''}</td><td>${lb.x.toFixed(2)}</td><td>${lb.y.toFixed(2)}</td><td>${deg(lb.yaw).toFixed(0)}°</td>
+      <td>${esc(lb.name)}${lb.cost >= 99 ? ' <span class="blocked" title="Nav2 비용지도에서 장애물/로봇 반경 안 — Go to는 가장 가까운 갈 수 있는 지점까지 가서 멈춤">⚠ 도달 불가 (근처까지)</span>' : ''}</td><td>${lb.x.toFixed(2)}</td><td>${lb.y.toFixed(2)}</td><td>${deg(lb.yaw).toFixed(0)}°</td>
       <td>${p ? Math.hypot(lb.x - p.x, lb.y - p.y).toFixed(2) + ' m' : '-'}</td></tr>`).join('')
     : '<tr><td colspan="5" class="empty">등록된 라벨이 없습니다 — 로봇을 원하는 곳에 두고 이름을 입력해 추가하세요</td></tr>';
   if (rows !== lastRows) { $('lbody').innerHTML = rows; lastRows = rows; }
@@ -2274,10 +2343,9 @@ def make_handler(node: MapWeb):
                         label = node.labels.get(req.get('id'))
                         if label is None:
                             raise KeyError(req.get('id'))
-                        cost = node.cost_at(label['x'], label['y'])
-                        if cost is not None and cost >= 99:
-                            raise ValueError(f"'{label['name']}'은(는) Nav2 비용지도에서 장애물/로봇 반경 안(cost {cost})이라 "
-                                             '갈 수 없습니다 — 지도에 없는 장애물이 찍혀 있으면 지도를 새로 만드세요')
+                        if node.reachable_goal(label)[0] is None:   # blocked label: goes to the nearest free point
+                            raise ValueError(f"'{label['name']}'은(는) Nav2 비용지도에서 장애물/로봇 반경 안이고 "
+                                             '1.5 m 안에 갈 수 있는 곳이 없습니다 — 지도에 없는 장애물이 찍혀 있으면 지도를 새로 만드세요')
                         if node.approach.running():
                             node.approach.stop('stopped', 'Go to로 중지')
                         if node.wall.running():

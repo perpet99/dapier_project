@@ -365,6 +365,8 @@ class MapApi:
             return {"ok": False, "message": f"{NAV_TIMEOUT:.0f}초 안에 도착하지 못해 취소했다"}
         out = {"ok": nav.get("state") == "succeeded", "state": nav.get("state"),
                "message": nav.get("message"), "note": nav.get("note")}
+        if (nav.get("target") or {}).get("shift") is not None:   # label blocked -> closest reachable point
+            out["stopped_short_m"] = nav["target"]["shift"]
         p = self.state().get("pose")
         if p:
             out["error_m"] = round(math.hypot(p["x"] - lb["x"], p["y"] - lb["y"]), 3)
@@ -617,7 +619,8 @@ BASE_DOC = """
   base_state           위치(map 좌표 x,y m / 방향°), 저장된 라벨 목록(이름, reachable, 거리),
                        Nav2 상태, 정면 장애물 거리(front_clear_m), 정면 벽(wall_ahead).
   goto_label(label)    저장된 라벨 위치로 자율 주행 (Nav2). label 은 base_state 의 이름 그대로.
-                       reachable 이 false 인 라벨은 갈 수 없다.
+                       reachable 이 false 인 라벨은 그 자리가 막혀 있어서, 가장 가까운 갈 수 있는
+                       지점까지 가서 멈춘다 (결과 메시지에 떨어진 거리가 나온다).
   save_label(label)    지금 위치를 새 라벨 이름으로 저장 (지도가 있을 때만).
   base_move(meters)    똑바로 직진(+)/후진(-), 한 번에 ±1 m 이내. 앞/뒤에 장애물이 보이면 멈춘다.
   base_turn(degrees)   제자리 회전, + 왼쪽(반시계) / - 오른쪽, ±180° 이내.
@@ -2440,7 +2443,7 @@ class Agent:
         base = ""
         if self.base:
             bs = self.base.summary()
-            names = [lb["name"] for lb in bs.get("labels", []) if lb.get("reachable")]
+            names = [lb["name"] for lb in bs.get("labels", [])]
             base = ("이 팔은 이동 로봇 위에 있어서 저장된 장소로 이동할 수 있다"
                     + (f" (장소: {', '.join(names)})" if names else "") + ".\n")
         prompt = (
