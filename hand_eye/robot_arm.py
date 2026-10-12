@@ -2668,6 +2668,7 @@ def draw_overlay(frame: np.ndarray, st: AppState, depth: np.ndarray,
 
 
 PANEL_W = 340
+PANEL_MAX_H = 640   # 패널을 그릴 임시 캔버스 높이 (실제 내용은 ~480px)
 
 # 패널 색 (BGR)
 P_BG = (28, 28, 30)
@@ -3247,7 +3248,9 @@ class HandEyePanel:
 
     # --- 그리기 -----------------------------------------------------------
     def draw(self, h: int) -> np.ndarray:
-        img = np.full((h, PANEL_W, 3), P_BG, np.uint8)
+        """패널을 그린다. 높이는 최소 h 이고, 내용이 더 길면 그만큼 늘린다
+        (카메라 해상도가 낮으면 아래쪽 버튼이 잘려 눌 수 없게 되므로)."""
+        img = np.full((max(h, PANEL_MAX_H), PANEL_W, 3), P_BG, np.uint8)
         self.buttons = []
 
         def t(s, xy, sc=0.42, c=P_FG):
@@ -3322,8 +3325,8 @@ class HandEyePanel:
             t(f"기울기 {tilt:5.1f} deg", (12, y + 32), 0.46, col)
             t(f"z평균 {zm:+6.0f} mm", (150, y + 32), 0.46, col)
             if self._plane is not None:
-                h, ct = plane_camera_pose(*self._plane)
-                t(f"실측 카메라 높이 {h:.0f}mm  기울기 {ct:.0f}deg", (12, y + 50), 0.38, P_DIM)
+                cam_h, ct = plane_camera_pose(*self._plane)
+                t(f"실측 카메라 높이 {cam_h:.0f}mm  기울기 {ct:.0f}deg", (12, y + 50), 0.38, P_DIM)
             ba = PanelButton(228, y + 38, 100, 20, "평면정렬", self.align_plane,
                              (58, 76, 96), 0.38)
             self.buttons.append(ba)
@@ -3358,7 +3361,7 @@ class HandEyePanel:
             b = PanelButton(x, y, w, 26, lbl, act, col)
             self.buttons.append(b)
             b.draw(img)
-        y += 32
+        y += 44
 
         # 풀기 전에 데이터가 성한지부터 보인다. RMS 는 푼 뒤에야 나오지만
         # 거리 불일치는 점만 있으면 바로 알 수 있고, 원인도 그쪽에 있다.
@@ -3368,7 +3371,7 @@ class HandEyePanel:
             y += 14
         for i, line in enumerate(_wrap(self.msg, 44)[:1]):
             t(line, (12, y + i * 16), 0.38, self.msg_col)
-        return img
+        return img[:max(h, y + 10)]
 
 
 def _wrap(s: str, n: int) -> list[str]:
@@ -3502,6 +3505,8 @@ class App:
         if x >= cam_w:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self.panel.on_click(x - cam_w, y)
+            return
+        if y >= self.src.intr.height:      # 패널이 길어서 덧붙인 영상 아래 빈칸
             return
 
         if event == cv2.EVENT_MOUSEMOVE:
@@ -4121,7 +4126,11 @@ class App:
                     draw_depth_scale(frame, lo, hi)
                 self.last_frame = frame
                 self._save_color, self._save_depth = color, depth   # 's' 키용
-                display = np.hstack([frame, self.panel.draw(frame.shape[0])])
+                panel = self.panel.draw(frame.shape[0])
+                if panel.shape[0] > frame.shape[0]:   # 패널이 더 길면 영상 아래를 채운다
+                    frame = cv2.copyMakeBorder(frame, 0, panel.shape[0] - frame.shape[0],
+                                               0, 0, cv2.BORDER_CONSTANT, value=P_BG)
+                display = np.hstack([frame, panel])
                 with self._display_cond:
                     self.last_display = display
                     self._display_seq += 1
