@@ -240,12 +240,20 @@ class Api:
         self.base = base.rstrip("/")
 
     def _get(self, path: str, params: Optional[dict] = None) -> tuple[int, dict, bytes]:
+        """접속 실패도 예외 대신 (0, {}, 오류 JSON) 으로 돌려준다 - 웹 UI 가 죽지 않게."""
         q = f"?{urllib.parse.urlencode(params)}" if params else ""
         try:
             with urllib.request.urlopen(f"{self.base}{path}{q}", timeout=10) as r:
                 return r.status, dict(r.headers), r.read()
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers), e.read()
+        except (urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            return 0, {}, json.dumps({"ok": False, "error": f"{self.base} 접속 실패: {reason}"},
+                                     ensure_ascii=False).encode()
+
+    def connected(self) -> bool:
+        return bool(self.json("/get_state").get("ok"))
 
     def json(self, path: str, params: Optional[dict] = None) -> dict:
         code, _, body = self._get(path, params)
@@ -690,6 +698,14 @@ class Vlm:
     def __init__(self, api_key: str, log=None, model: str = MODEL_ID,
                  stt_model: str = STT_MODEL_ID, live_model: Optional[str] = LIVE_STT_MODEL_ID,
                  tts_model: Optional[str] = TTS_MODEL_ID):
+        self._make_client(api_key)
+        self.model = model
+        self.stt_model = stt_model
+        self.live_model = live_model          # None 이면 실시간 없이 일괄 받아쓰기만
+        self.tts_model = tts_model            # None 이면 음성 답변은 브라우저 내장 음성으로
+        self.log = log or print
+
+    def _make_client(self, api_key: str) -> None:
         self.client = genai.Client(api_key=api_key)
         # interactions 클라이언트는 기본으로 429/5xx 를 최대 1시간 동안 조용히 재시도한다 -
         # 할당량 초과(429)가 '응답 없음' 으로 보이게 된다. 재시도는 _call 이 한 번만 한다.
@@ -698,11 +714,14 @@ class Vlm:
             self.client.interactions.sdk_configuration.retry_config = RetryConfig("none", None, False)
         except Exception:                      # SDK 내부 구조가 바뀌면 그냥 기본값으로
             pass
-        self.model = model
-        self.stt_model = stt_model
-        self.live_model = live_model          # None 이면 실시간 없이 일괄 받아쓰기만
-        self.tts_model = tts_model            # None 이면 음성 답변은 브라우저 내장 음성으로
-        self.log = log or print
+
+    def reload_key(self, api_key: str) -> None:
+        """.env 를 고친 뒤 Gemini 재연결 - 프로세스를 다시 띄우지 않고 새 키로 바꾼다."""
+        self._make_client(api_key)
+
+    def check(self) -> None:
+        """키와 모델 접근 권한만 확인한다 (모델 정보 조회 - 토큰을 쓰지 않는다). 실패하면 예외."""
+        with_deadline(lambda: self.client.models.get(model=self.model), 15)
 
     def live(self, job: str) -> "LiveStt":
         """음성 하나를 실시간으로 받아 적는 세션을 연다 (웹 녹음 시작 때)."""
@@ -1032,6 +1051,9 @@ class LiveStt:
 class ConsoleUi:
     """예전 방식. --cli 일 때 쓴다."""
 
+    def set_conn(self, conn: dict) -> None:
+        pass
+
     def speak(self, text: str, job: Optional[str] = None) -> None:
         print(f"    (음성 답변) {text}")        # 터미널에는 소리 대신 글로
 
@@ -1092,6 +1114,17 @@ PAGE = """<!doctype html>
            background: #1d4f80; color: #fff; font-size: 14px; cursor: pointer; }
   button.no { background: #3a2027; border-color: #7a3646; }
   .hint { color: #8b939c; font-size: 12.5px; margin-top: 8px; }
+  button.small { padding: 4px 12px; font-size: 13px; }
+  .conns { display: grid; grid-template-columns: auto 1fr auto auto; gap: 6px 12px; align-items: center;
+           background: #1a1d22; border: 1px solid #262a30; border-radius: 8px; padding: 8px 12px;
+           margin: 0 0 12px; font-size: 13px; }
+  .conns b { font-weight: 600; white-space: nowrap; }
+  .conns code { color: #9fb3c8; font-size: 12.5px; word-break: break-all; }
+  .conns .st { white-space: nowrap; border-radius: 999px; padding: 2px 10px; background: #1f3a26; color: #8fe39f; }
+  .conns .st.bad { background: #3a2027; color: #ff9aa8; }
+  .conns .st.off { background: #26292e; color: #8b939c; }
+  .conns .st.wait { background: #3a2d18; color: #ffc46b; }
+  .conns button:disabled { opacity: .4; cursor: default; }
   details { margin-top: 14px; background: #0e1013; border: 1px solid #262a30;
             border-radius: 8px; padding: 8px 12px; }
   summary { cursor: pointer; font-weight: bold; }
@@ -1155,7 +1188,10 @@ PAGE = """<!doctype html>
 </style>
 <div class="wrap">
   <h1>로봇 조종 <span id="state" class="chip">-</span>
-      <span id="status" class="chip busy" hidden></span></h1>
+      <span id="status" class="chip busy" hidden></span>
+      <button type="button" class="small" onclick="reconnect('all')"
+              title="모두 다시 접속하고 화면을 새로 받아 설명을 다시 듣는다">전체 재연결</button></h1>
+  <div id="conns" class="conns"></div>
   <div class="row">
     <img id="view" src="/view.jpg?v=0" alt="현재 화면">
     <div class="side">
@@ -1185,7 +1221,9 @@ PAGE = """<!doctype html>
     <span id="voiceMsg"></span>
   </div>
   <div class="hint">지시 하나가 끝나면 화면을 새로 받고 다음 지시를 기다린다.
-    pick/place 는 묻지 않고 바로 실행하고, 실패했을 때만 위에서 다시 할지 묻는다.</div>
+    pick/place 는 묻지 않고 바로 실행하고, 실패했을 때만 위에서 다시 할지 묻는다.
+    팔(robot_arm.py)·이동 로봇(map_web)·Gemini 연결이 끊겨도 이 화면은 유지된다 — 위 연결 패널의 '재연결'.
+    진행 중인 지시가 있으면 재연결은 그 지시가 끝난 뒤에 한다.</div>
   <details id="traceBox" open>
     <summary>처리 단계 로그 <span id="traceCount"></span></summary>
     <div class="tracebar">
@@ -1233,6 +1271,7 @@ async function poll() {
       $('view').src = '/view.jpg?v=' + viewSeq;
     }
     $('state').textContent = d.state || '-';
+    renderConns(d.conn || []);
     $('status').textContent = d.status || '';
     $('status').hidden = !d.status;
     if (d.ask) {
@@ -1329,6 +1368,31 @@ function vtrace(job, stage, msg, level, end) {
 }
 
 function quick(v) { fetch('/order?text=' + encodeURIComponent(v)); }
+
+function reconnect(target) { fetch('/reconnect?target=' + target); }
+
+// 연결 패널: 이름 | 주소 | 상태 | [재연결]. 매 poll 마다 통째로 다시 그린다(행 3개뿐).
+function renderConns(list) {
+  const box = $('conns');
+  box.textContent = '';
+  list.forEach(function (c) {
+    const name = document.createElement('b'); name.textContent = c.name;
+    const addr = document.createElement('code'); addr.textContent = c.addr || '-';
+    const st = document.createElement('span');
+    st.className = 'st ' + c.cls; st.textContent = c.text; st.title = c.detail || '';
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'small'; btn.textContent = '재연결';
+    btn.disabled = !c.can; btn.title = c.can ? c.name + ' 에 다시 접속' : '이 연결은 꺼져 있다 (--no-base)';
+    btn.onclick = function () { reconnect(c.key); };
+    [name, addr, st, btn].forEach(function (el) { box.appendChild(el); });
+    if (c.detail && c.cls !== '') {          // 실패 이유는 한 줄 더
+      const why = document.createElement('div');
+      why.style.cssText = 'grid-column: 2 / -1; color: #8b939c; font-size: 12px; margin-top: -4px';
+      why.textContent = c.detail;
+      box.appendChild(why);
+    }
+  });
+}
 
 function answer(v) {
   fetch('/answer?id=' + asking + '&v=' + v);
@@ -1812,6 +1876,13 @@ def _make_handler(ui: "WebUi"):
                     src = q.get("src", [""])[0]
                     ui.put_order(text, src if valid_job(src, "V") else "")
                 self._json({"ok": bool(text)})
+            elif u.path == "/reconnect":
+                target = q.get("target", ["all"])[0]
+                if target not in ("all", "arm", "base", "gemini"):
+                    target = "all"
+                ui.mark_waiting(target)
+                ui.put_order(f"{RECONNECT}:{target}")
+                self._json({"ok": True, "target": target})
             elif u.path == "/answer":
                 ok = ui.answer(self._int(q, "id"), q.get("v", ["n"])[0] == "y")
                 self._json({"ok": ok})
@@ -1944,6 +2015,7 @@ class WebUi:
         self.state_fn = state_fn
         self._state: dict = {}
         self._state_at = 0.0
+        self.conn: list = []                 # 연결 패널 행 (set_conn)
         # Agent 가 만들어지면 채운다 (skill_groups / set_skills). 그 전엔 None
         self.skills_fn = None
         self.toggle_fn = None
@@ -2032,8 +2104,17 @@ class WebUi:
                 "speech": [] if ssince < 0 else
                           [{"id": it["id"], "text": it["text"]} for it in self.speech if it["id"] > ssince],
                 "sseq": self._speech_seq,
+                "conn": [dict(r) for r in self.conn],
             }
         out["state"] = self._robot_state()
+        # 팔 REST 행은 0.5초마다 하는 상태 조회 결과로 바로 갱신한다
+        for r in out["conn"]:
+            if r["key"] == "arm" and r["cls"] != "wait" and self._state:
+                if self._state.get("ok", True):
+                    r.update(ok=True, text="● 연결됨", cls="", detail=self._state.get("label", ""))
+                else:
+                    r.update(ok=False, text="✕ 실패", cls="bad",
+                             detail=self._state.get("error", "응답 없음"))
         return out
 
     def _robot_state(self) -> str:
@@ -2045,7 +2126,31 @@ class WebUi:
             except Exception:
                 self._state = {"label": "?"}
             self._state_at = now
+        if not self._state.get("ok", True):
+            return "팔 연결 안 됨"
         return self._state.get("label", "-")
+
+    CONN_NAMES = (("arm", "팔 REST"), ("base", "이동 로봇 map_web"), ("gemini", "Gemini"))
+
+    def set_conn(self, conn: dict) -> None:
+        """conn = {key: (ok True|False|None, detail, address)}  key = arm | base | gemini"""
+        rows = []
+        for key, name in self.CONN_NAMES:
+            ok, detail, addr = conn.get(key, (None, "", ""))
+            off = ok is None and key == "base"
+            rows.append({"key": key, "name": name, "addr": addr, "detail": detail or "",
+                         "ok": ok, "can": not (off and detail == "--no-base"),
+                         "text": "● 연결됨" if ok else ("꺼짐" if off else ("? 미확인" if ok is None else "✕ 실패")),
+                         "cls": "" if ok else ("off" if ok is None else "bad")})
+        with self.lock:
+            self.conn = rows
+
+    def mark_waiting(self, target: str) -> None:
+        """재연결을 누른 행을 바로 '재연결 중' 으로 보여준다 (실제 확인은 메인 루프가 한다)."""
+        with self.lock:
+            for r in self.conn:
+                if (target == "all" or r["key"] == target) and r["can"]:
+                    r.update(text="… 재연결 중", cls="wait")
 
     # --- 사람에게서 받는 쪽 --------------------------------------------------
     def voice(self, wav: bytes, job: str = "") -> dict:
@@ -2165,7 +2270,7 @@ class WebUi:
     def put_order(self, text: str, src: str = "") -> None:
         """src: 음성 입력에서 바로 보낸 지시면 그 처리 단계 로그 id (V3 ...)."""
         job = None
-        if text.strip().lower() not in ("r", "q", "quit", "exit", "종료"):
+        if text.strip().lower() not in ("r", "c", "q", "quit", "exit", "종료") and not text.startswith(RECONNECT):
             job = TRACE.new_job("O")
             TRACE.add(job, "지시 접수", text + (f"  (음성 {src} 에서)" if src else "")
                       + (f" - 앞에 {self.orders.qsize()}개 대기" if self.orders.qsize() else ""))
@@ -2294,7 +2399,7 @@ class Agent:
         t0 = time.perf_counter()
         frame = self.api.rgb()
         if frame is None:
-            self.ui.log("[error] /get_rgb 실패 - test4.py 가 떠 있는지 확인하세요")
+            self.ui.log("[error] /get_rgb 실패 - robot_arm.py 가 떠 있는지 확인하고 '재연결'")
             TRACE.add(self.job, "화면 받기", "/get_rgb 실패", level="error",
                       ms=(time.perf_counter() - t0) * 1000)
             return False
@@ -2542,8 +2647,118 @@ class Agent:
 # 6. 실행
 # ---------------------------------------------------------------------------
 
+RECONNECT = "\x00reconnect"      # 웹 '재연결' 버튼 / CLI 'c' 가 넣는 내부 명령
+
+
+class Links:
+    """팔 REST / 이동 로봇 map_web / Gemini 의 연결 상태. 끊겨도 프로세스는 계속 산다."""
+
+    def __init__(self, agent: "Agent", api: Api, ui, map_api: str, use_base: bool):
+        self.agent, self.api, self.ui = agent, api, ui
+        self.map_api, self.use_base = map_api, use_base
+        self.arm = (False, "")
+        self.base_state: tuple = (None, "")
+        self.gemini: tuple = (None, "아직 확인 안 함")
+        self._base_obj = MapApi(map_api, log=ui.log, status=ui.set_status) if use_base else None
+
+    def connect_arm(self) -> bool:
+        st = self.api.json("/get_state")
+        if st.get("ok"):
+            self.arm = (True, st.get("label", ""))
+            self.ui.log(f"[api] {self.api.base} | 로봇 상태: {st.get('label')} ({st.get('state')})")
+            if st.get("state") == "not_calibrated":
+                self.ui.log("      주의: hand-eye 미보정이라 pick 이 거부된다")
+        else:
+            self.arm = (False, st.get("error", "응답 없음"))
+            self.ui.log(f"[error] 팔 REST {self.api.base} 에 연결하지 못했다 - robot_arm.py 를 켠 뒤 '재연결'")
+        self.publish()
+        return self.arm[0]
+
+    def connect_base(self) -> None:
+        if self._base_obj is None:
+            return
+        if self._base_obj.alive():
+            self.agent.base = self._base_obj
+            self.base_state = (True, "")
+            self.ui.log(f"[base] {self.map_api} | 이동 로봇 스킬 사용 (base_state, goto_label, base_move ...)")
+        else:
+            self.agent.base = None
+            self.base_state = (False, "map_web 응답 없음 - remote_map_web.sh start 확인")
+            self.ui.log(f"[base] {self.map_api} 에 연결하지 못했다 - 이동 로봇 스킬 없이 진행 (켠 뒤 '재연결')")
+        self.publish()
+
+    def connect_gemini(self, reload_key: bool = True) -> bool:
+        """키(.env 다시 읽기)와 모델 접근을 확인한다. 토큰은 쓰지 않는다."""
+        if reload_key:
+            key = load_api_key()
+            if not key:
+                self.gemini_result(False, f"GEMINI_API_KEY 가 없다 ({ENV_FILE})")
+                self.ui.log(f"[gemini] GEMINI_API_KEY 가 없다 - {ENV_FILE} 확인")
+                return False
+            self.agent.vlm.reload_key(key)
+        try:
+            self.agent.vlm.check()
+        except Exception as e:
+            self.gemini_result(False, _model_error(e))
+            self.ui.log(f"[gemini] 확인 실패: {_model_error(e)}")
+            return False
+        self.gemini_result(True, "")
+        self.ui.log(f"[gemini] {self.agent.vlm.model} 사용 가능")
+        return True
+
+    def gemini_result(self, ok: bool, detail: str = "") -> None:
+        self.gemini = (ok, detail)
+        self.publish()
+
+    def publish(self) -> None:
+        if self._base_obj is None:
+            base = (None, "--no-base", "(사용 안 함)")
+        else:
+            base = (self.base_state[0], self.base_state[1], self.map_api)
+        self.ui.set_conn({
+            "arm": (*self.arm, self.api.base),
+            "base": base,
+            "gemini": (*self.gemini, f"{self.agent.vlm.model} @ generativelanguage.googleapis.com"),
+        })
+
+
+def _model_error(e: BaseException) -> str:
+    quota = quota_message(e)
+    if quota:
+        return quota
+    msg = f"{type(e).__name__}: {e}"
+    if any(k in msg for k in ("401", "UNAUTHENTICATED", "AuthenticationError", "API_KEY_INVALID",
+                              "API key not valid")):
+        return ("Gemini API 키 오류 - .env 의 GEMINI_API_KEY 가 올바른 API 키(AIza...)인지 확인 후 '재연결'. "
+                + msg[:160])
+    return msg[:300]
+
+
+def start_session(agent: "Agent", links: Links, ui, reload_key: bool = False) -> None:
+    """(재)연결 직후: 셋 다 확인하고 화면을 받아 설명을 듣는다. 실패해도 계속 산다."""
+    arm_ok = links.connect_arm()
+    links.connect_base()
+    gem_ok = links.connect_gemini(reload_key=reload_key)
+    if not arm_ok or not agent.look():
+        return
+    if not gem_ok:
+        ui.log("[화면 설명] 생략 - Gemini 연결을 고친 뒤 Gemini '재연결'")
+        return
+    ui.set_status("화면 살펴보는 중")
+    ui.log("[화면 설명]")
+    try:
+        ui.log(agent.brief())
+        links.gemini_result(True, "")
+    except Exception as e:                   # 키 오류, 할당량, 시간 초과 - 웹 UI 는 유지
+        links.gemini_result(False, _model_error(e))
+        ui.log(f"[error] 화면 설명을 받지 못했다 - {_model_error(e)}")
+    ui.set_status("")
+
+
 def safe_brief(agent: Agent) -> str:
     """화면 설명이 실패해도(시간 초과 등) 프로그램은 계속 지시를 받는다."""
+    if agent.frame is None:
+        return "[error] 화면이 없어 설명할 수 없다 - 팔 REST 연결 후 '재연결'"
     try:
         return agent.brief()
     except Exception as e:
@@ -2553,16 +2768,15 @@ def safe_brief(agent: Agent) -> str:
         return f"[error] 화면 설명을 받지 못했다 ({type(e).__name__}: {e}) - 지시는 그대로 할 수 있다"
 
 
-def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
-    """지시 하나를 끝내면 화면을 새로 받고 다음 지시를 기다린다."""
-    if not agent.look():
-        return
+def run(agent: Agent, api: Api, ui, links: Links, first_order: str = "") -> None:
+    """지시 하나를 끝내면 화면을 새로 받고 다음 지시를 기다린다.
 
-    ui.set_status("화면 살펴보는 중")
-    ui.log("[화면 설명]")
-    ui.log(safe_brief(agent))
+    팔/이동 로봇/Gemini 연결이 실패해도 끝내지 않는다 - 로그에 남기고 '재연결'
+    (웹 연결 패널, CLI 는 'c') 이나 다음 지시를 기다린다.
+    """
+    start_session(agent, links, ui)
     ui.log("")
-    ui.log("무엇을 시킬까요? ('r' 화면 다시 보기, 'q' 종료)")
+    ui.log("무엇을 시킬까요? ('r' 화면 다시 보기, 'c' 재연결, 'q' 종료)")
 
     pending = (first_order or "").strip()
     while True:
@@ -2570,22 +2784,48 @@ def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
             order, pending = pending, ""
             ui.log("")
             ui.log(f"[지시] {order}")
+            if not api.connected():
+                links.connect_arm()
+                ui.log("[error] 팔 REST 에 연결되어 있지 않다 - robot_arm.py 를 켠 뒤 '재연결'")
+                continue
+            if agent.frame is None and not agent.look():
+                continue
             try:
                 agent.follow(order, getattr(ui, "last_job", None))
             except Exception as e:             # 한 지시가 실패해도 다음 지시는 받는다
-                ui.log(f"[error] 지시를 처리하다 멈췄다: {type(e).__name__}: {e}")
+                ui.log(f"[error] 지시를 처리하다 멈췄다: {_model_error(e)}")
+                if "genai" in type(e).__module__ or isinstance(e, ModelTimeout):
+                    links.gemini_result(False, _model_error(e))     # 모델 쪽 오류면 연결 패널에도
+                if agent.base is not None:
+                    agent.base.stop()          # 몸체가 움직이던 중이면 세운다
                 agent.speak("문제가 생겨 지시를 멈췄어요.")
             # 명령이 끝났으니 화면을 새로 보고 다음 명령을 기다린다
             ui.set_status("화면 갱신 중")
             agent.look()
             st = api.json("/get_state")
+            ui.set_status("")
             ui.log("")
-            ui.log(f"[완료] 로봇 상태: {st.get('label', '?')} - 다음 지시를 기다립니다")
+            ui.log(f"[완료] 로봇 상태: {st.get('label', st.get('error', '?'))} - 다음 지시를 기다립니다")
             continue
 
         order = ui.next_order()
         if order is None:
             break
+        if order.startswith(RECONNECT) or order.strip().lower() in ("c", "재연결"):
+            target = order.partition(":")[2] if order.startswith(RECONNECT) else "all"
+            ui.log("")
+            ui.log(f"[재연결] {dict(all='전체', arm='팔 REST', base='이동 로봇', gemini='Gemini').get(target, target)}")
+            if target == "arm":
+                if links.connect_arm():
+                    agent.look()
+            elif target == "base":
+                links.connect_base()
+            elif target == "gemini":
+                links.connect_gemini(reload_key=True)
+            else:
+                start_session(agent, links, ui, reload_key=True)
+            links.publish()
+            continue
         order = order.strip()
         if not order or order.lower() in ("q", "quit", "exit", "종료"):
             break
@@ -2654,14 +2894,7 @@ def main() -> None:
               "(이 저장소의 test3.py 가 쓰는 키와 같은 것을 쓰면 된다)")
         return
 
-    api = Api(args.api)
-    state = api.json("/get_state")
-    if not state.get("ok"):
-        print(f"[error] {args.api} 에 연결하지 못했다 - test4.py 를 먼저 실행하세요")
-        return
-    print(f"[api] {args.api} | 로봇 상태: {state.get('label')} ({state.get('state')})")
-    if state.get("state") == "not_calibrated":
-        print("      주의: hand-eye 미보정이라 pick 이 거부된다")
+    api = Api(args.api)       # 연결 확인은 run() 이 한다 - 실패해도 웹 UI 는 뜬다
 
     if args.cli:
         ui = ConsoleUi()
@@ -2676,26 +2909,19 @@ def main() -> None:
             print("        --port 로 다른 포트를 주거나, --cli 로 터미널을 쓰세요")
             return
 
-    base = None
-    if not args.no_base:
-        if not args.map_api:          # 팔과 이동 로봇은 같은 파이에서 돈다
-            host = urllib.parse.urlparse(args.api).hostname or "127.0.0.1"
-            args.map_api = f"http://{host}:{MAP_WEB_PORT}"
-        base = MapApi(args.map_api, log=ui.log, status=ui.set_status)
-        if base.alive():
-            print(f"[base] {args.map_api} | 이동 로봇 스킬 사용 (base_state, goto_label, base_move ...)")
-        else:
-            print(f"[base] {args.map_api} 에 연결하지 못했다 - 이동 로봇 스킬 없이 팔만 쓴다")
-            base = None
+    if not args.no_base and not args.map_api:   # 팔과 이동 로봇은 같은 파이에서 돈다
+        host = urllib.parse.urlparse(args.api).hostname or "127.0.0.1"
+        args.map_api = f"http://{host}:{MAP_WEB_PORT}"
 
     TRACE.add(TRACE.new_job("S"), "시작",
               f"모델 {MODEL_ID}, 실시간 받아쓰기 {args.live_model}, 일괄 받아쓰기 {args.stt_model}, "
               f"음성 답변 {args.tts_model}, 팔 {args.api}, "
-              f"이동 로봇 {args.map_api if base else '없음'}, 로그 {TRACE.path}", end=True)
+              f"이동 로봇 {'없음' if args.no_base else args.map_api}, 로그 {TRACE.path}", end=True)
     vlm = Vlm(key, ui.log, stt_model=args.stt_model,
               live_model=None if args.live_model.lower() in ("", "none", "off") else args.live_model,
               tts_model=None if args.tts_model.lower() in ("", "none", "off") else args.tts_model)
-    agent = Agent(api, vlm, ui, auto=args.auto, base=base)
+    agent = Agent(api, vlm, ui, auto=args.auto)       # 이동 로봇은 Links 가 연결되면 붙인다
+    links = Links(agent, api, ui, args.map_api, use_base=not args.no_base)
     if isinstance(ui, WebUi):
         ui.toggle_fn = agent.set_skills
         ui.skills_fn = agent.skill_groups
@@ -2703,7 +2929,7 @@ def main() -> None:
         ui.live_fn = vlm.live
         ui.tts_fn = vlm.tts if vlm.tts_model else None
     try:
-        run(agent, api, ui, " ".join(args.order))
+        run(agent, api, ui, links, " ".join(args.order))
     except KeyboardInterrupt:
         print()
     finally:

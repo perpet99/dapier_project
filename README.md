@@ -8,9 +8,17 @@
 노트북
 
 ros2_slam
+
 ./scripts/remote_car2_lidar.sh start
 ./scripts/remote_map_web.sh start
 ./scripts/run_lidar_navigation.sh ./maps/lidarmap.yaml
 
+hand_eye
+
+./llm_client.py
+
 라즈베리파이
-ha
+
+hand_eye
+
+./robot_arm.py
