@@ -123,6 +123,9 @@ BASE_SPEED = 0.08         # base_move 속도 (m/s)
 BASE_TURN_SPEED = 0.4     # base_turn 각속도 (rad/s)
 BASE_CLEAR = 0.10         # base_move: 차체 앞/뒤에서 이 거리 안에 라이다 점이 있으면 정지 (m)
 NAV_TIMEOUT = 240.0       # goto_label 최대 대기 (s)
+# 긴급 정지 (웹 '긴급 정지' 버튼). 켜지면 진행 중인 지시는 다음 확인 지점에서 끝나고, 몸체 이동
+# 대기 루프는 바로 멈춘다. 새 지시가 들어오면 꺼진다.
+ESTOP = threading.Event()
 MODEL_ID = os.environ.get("GEMINI_MODEL", "gemini-robotics-er-2-preview")
 # 음성 명령 받아쓰기. 실시간(Live API)이 기본이고, Live 가 안 되면 일괄 모델로 대신한다.
 # 측정 (Pi, 6.4초 한국어): Live = 말 끝나고 ~2초 안에 확정 / flash-lite 일괄 4~6초 /
@@ -381,6 +384,9 @@ class MapApi:
         t0, nav = time.time(), {}
         while time.time() - t0 < NAV_TIMEOUT:
             time.sleep(1.0)
+            if ESTOP.is_set():
+                self.stop()
+                return {"ok": False, "message": "긴급 정지로 이동을 멈췄다"}
             nav = self.state().get("nav") or {}
             if nav.get("state") not in ("backing", "sending", "active", "canceling"):
                 break
@@ -396,7 +402,8 @@ class MapApi:
         if wall and out["ok"]:
             # 도착 뒤 map_web 이 0.5초 쉬고(벽 못 찾으면 3초까지 재시도) 라이다 근접 이동을 시작한다
             t1 = time.time()
-            while nav.get("then_state") in (None, "pending") and time.time() - t1 < 6.0:
+            while nav.get("then_state") in (None, "pending") and time.time() - t1 < 6.0 \
+                    and not ESTOP.is_set():
                 time.sleep(0.5)
                 nav = self.state().get("nav") or {}
             ts = nav.get("then_state")
@@ -459,6 +466,9 @@ class MapApi:
         self.log(f"    >> base_move {meters:+.2f} m")
         try:
             while True:
+                if ESTOP.is_set():
+                    why = "긴급 정지"
+                    break
                 st = self.state()
                 p = st.get("pose")
                 if not p:
@@ -499,6 +509,9 @@ class MapApi:
         self.log(f"    >> base_turn {degrees:+.0f}°")
         try:
             while True:
+                if ESTOP.is_set():
+                    why = "긴급 정지"
+                    break
                 p = self.state().get("pose")
                 if not p:
                     why = "위치(TF)를 잃었다"
@@ -533,7 +546,7 @@ class MapApi:
             return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
         t0, rl = time.time(), {}
         time.sleep(0.5)
-        while time.time() - t0 < 40:
+        while time.time() - t0 < 40 and not ESTOP.is_set():
             rl = self.state().get("reloc") or {}
             if rl.get("state") in ("done", "failed"):
                 break
@@ -553,6 +566,9 @@ class MapApi:
         t0 = time.time()
         while a.get("state") == "running" and time.time() - t0 < timeout:
             time.sleep(0.5)
+            if ESTOP.is_set():
+                self.stop()
+                return {"ok": False, "message": "긴급 정지로 근접 이동을 멈췄다"}
             a = self.call(f"/api/{kind}")
             self.status(f"{kind} 근접 이동 중 - {a.get('message', '')}")
         if a.get("state") == "running":
@@ -590,8 +606,8 @@ ARM_SKILL_LIST = [
 ]
 BASE_SKILL_LIST = [
     ("base_state", "", "GET /api/state", "위치·방향, 라벨 목록, Nav2/근접 상태"),
-    ("goto_label", "label", "POST /api/nav/goto", "라벨 위치로 Nav2 자율 주행"),
-    ("goto_label_wall", "label, gap", "POST /api/nav/goto_wall", "라벨로 이동한 뒤 정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진"),
+    ("goto_label", "label", "POST /api/nav/goto", "라벨 위치로 Nav2 자율 주행만 (붙지 말라고 할 때만 - 기본은 goto_label_wall)"),
+    ("goto_label_wall", "label, gap", "POST /api/nav/goto_wall", "이동 기본: 라벨로 이동한 뒤 정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진"),
     ("save_label", "label", "POST /api/labels", "지금 위치를 라벨로 저장"),
     ("base_move", "meters", "POST /api/drive", "직진/후진 (±1 m, 장애물이면 정지)"),
     ("base_turn", "degrees", "POST /api/drive", "제자리 회전 (±180°, + = 왼쪽)"),
@@ -629,7 +645,7 @@ class SkillCall(BaseModel):
     plan: Optional[List[str]] = Field(
         default=None,
         description="첫 스킬에서 지도 정보와 화면을 보고 세운 전체 실행 계획 (단계마다 짧은 한 문장, "
-                    "예: '책상으로 이동해 앞에 붙는다'). 계획을 바꿀 때만 다시 쓰고, 그 밖에는 비운다")
+                    "예: '책상으로 이동해 앞에 붙는다 (goto_label_wall)'). 계획을 바꿀 때만 다시 쓰고, 그 밖에는 비운다")
     reason: str = Field(description="왜 이 스킬을 지금 부르는지 한 문장")
 
 
@@ -672,13 +688,14 @@ BASE_DOC = """
 팔은 이동 로봇(car2) 위에 있다. 로봇 몸체를 움직이는 스킬 (끝날 때까지 기다렸다가 결과를 준다):
   base_state           위치(map 좌표 x,y m / 방향°), 저장된 라벨 목록(이름, reachable, 거리),
                        Nav2 상태, 정면 장애물 거리(front_clear_m), 정면 벽(wall_ahead).
-  goto_label(label)    저장된 라벨 위치로 자율 주행 (Nav2). label 은 base_state 의 이름 그대로.
-                       reachable 이 false 인 라벨은 그 자리가 막혀 있어서, 가장 가까운 갈 수 있는
-                       지점까지 가서 멈춘다 (결과 메시지에 떨어진 거리가 나온다).
   goto_label_wall(label, gap)
-                       goto_label 로 간 뒤 이어서 wall_approach(gap) 까지 한 번에 한다.
-                       "책상으로 가서 책상 앞에 붙어" 처럼 라벨 앞 작업대/벽에 붙어야 할 때 쓴다
-                       (라벨 방향이 그 벽을 보고 있어야 한다). gap 생략 시 저장된 값.
+                       ** 라벨로 이동할 때 기본으로 쓰는 스킬 **. 라벨 위치로 자율 주행(Nav2)한 뒤
+                       이어서 정면 벽(작업대 앞면)과 수직으로 맞추고 차체 앞이 gap m 남을 때까지
+                       붙는다 (= goto_label + wall_approach). label 은 지도 정보/base_state 의 이름 그대로.
+                       gap 생략 시 저장된 값. reachable 이 false 인 라벨도 가장 가까운 갈 수 있는
+                       지점까지 간 뒤 붙는다.
+  goto_label(label)    라벨 위치로 자율 주행만 하고 벽에 붙지 않는다. 직접 쓰지 마라 - 아래 이동 규칙의
+                       예외일 때만 쓴다.
   save_label(label)    지금 위치를 새 라벨 이름으로 저장 (지도가 있을 때만).
   base_move(meters)    똑바로 직진(+)/후진(-), 한 번에 ±1 m 이내. 앞/뒤에 장애물이 보이면 멈춘다.
   base_turn(degrees)   제자리 회전, + 왼쪽(반시계) / - 오른쪽, ±180° 이내.
@@ -696,6 +713,14 @@ BASE_DOC = """
   x_max, y_max]), nav(Nav2 상태), wall_ahead(정면 벽). 좌표 단위 m, 각도 °, yaw 0 = +x, 반시계 +.
   지시에 나온 장소는 labels 의 이름과 맞춰 보고, 어느 라벨로 갈지 계획을 세워라.
   맞는 라벨이 없으면 지어내지 말고 say/done 으로 사용자에게 물어라.
+
+이동 규칙 (중요):
+  - 이동 명령("~로 가", "~에서 집어", "~에 놓아" 처럼 다른 장소가 필요한 일)은 goto_label 이 아니라
+    항상 goto_label_wall 로 한다. 팔이 작업대에 닿으려면 도착 뒤 작업대에 붙어야 하기 때문이다.
+  - goto_label 은 사용자가 "붙지 말고", "근처까지만" 처럼 붙지 말라고 했거나, 라벨 앞에 붙을
+    벽/작업대가 없다고 말했을 때만 쓴다.
+  - goto_label_wall 결과에서 state 가 succeeded 인데 벽을 못 찾아 ok 가 false 면, 라벨까지 이동은
+    된 것이다. 같은 이동을 다시 부르지 말고 화면을 보고 다음 일을 하거나, 필요하면 wall_approach 를 따로 불러라.
 
 몸체 규칙:
   - 몸체가 움직이면 카메라 화면이 바뀐다. 움직인 뒤에는 클라이언트가 화면을 새로 받는다.
@@ -1137,7 +1162,9 @@ class ConsoleUi:
 
     def next_order(self) -> Optional[str]:
         try:
-            return input("> ")
+            text = input("> ")
+            ESTOP.clear()
+            return text
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -1182,6 +1209,8 @@ PAGE = """<!doctype html>
   button { padding: 10px 16px; border-radius: 8px; border: 1px solid #2f6fb0;
            background: #1d4f80; color: #fff; font-size: 14px; cursor: pointer; }
   button.no { background: #3a2027; border-color: #7a3646; }
+  button.estop { background: #c62828; border-color: #ff5252; font-weight: 700; }
+  button.estop:active { background: #8e0000; }
   .hint { color: #8b939c; font-size: 12.5px; margin-top: 8px; }
   button.small { padding: 4px 12px; font-size: 13px; }
   .conns { display: grid; grid-template-columns: auto 1fr auto auto; gap: 6px 12px; align-items: center;
@@ -1258,6 +1287,8 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <h1>로봇 조종 <span id="state" class="chip">-</span>
       <span id="status" class="chip busy" hidden></span>
+      <button type="button" class="small estop" onclick="estop()"
+              title="대기 중인 지시를 모두 지우고, 이동 중이면 바로 멈추고, 진행 중인 지시를 끝낸다 (Esc)">■ 긴급 정지</button>
       <button type="button" class="small" onclick="reconnect('all')"
               title="모두 다시 접속하고 화면을 새로 받아 설명을 다시 듣는다">전체 재연결</button></h1>
   <div id="conns" class="conns"></div>
@@ -1439,6 +1470,12 @@ function vtrace(job, stage, msg, level, end) {
 function quick(v) { fetch('/order?text=' + encodeURIComponent(v)); }
 
 function reconnect(target) { fetch('/reconnect?target=' + target); }
+
+function estop() {
+  if (window.speechSynthesis) speechSynthesis.cancel();
+  fetch('/estop').catch(function () {});
+}
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') estop(); });
 
 // 연결 패널: 이름 | 주소 | 상태 | [재연결]. 매 poll 마다 통째로 다시 그린다(행 3개뿐).
 function renderConns(list) {
@@ -1945,6 +1982,8 @@ def _make_handler(ui: "WebUi"):
                     src = q.get("src", [""])[0]
                     ui.put_order(text, src if valid_job(src, "V") else "")
                 self._json({"ok": bool(text)})
+            elif u.path == "/estop":
+                self._json(ui.estop())
             elif u.path == "/reconnect":
                 target = q.get("target", ["all"])[0]
                 if target not in ("all", "arm", "base", "gemini"):
@@ -2088,6 +2127,7 @@ class WebUi:
         # Agent 가 만들어지면 채운다 (skill_groups / set_skills). 그 전엔 None
         self.skills_fn = None
         self.toggle_fn = None
+        self.estop_fn = None                 # 긴급 정지 때 몸체를 세우는 함수 (Agent 가 채운다)
         self.transcribe_fn = None            # Vlm.transcribe - (WAV bytes, job) -> 글
         self.live_fn = None                  # Vlm.live - job -> LiveStt (실시간 받아쓰기)
         self.live: dict = {}                 # job -> 진행 중인 LiveStt
@@ -2336,10 +2376,40 @@ class WebUi:
             ls.cancel()
         return {"ok": True}
 
+    def estop(self) -> dict:
+        """긴급 정지: 대기 중인 지시를 모두 지우고, 몸체 이동을 세우고, 진행 중인 지시를 끝낸다."""
+        ESTOP.set()
+        dropped, keep = [], []
+        while True:
+            try:
+                item = self.orders.get_nowait()
+            except queue.Empty:
+                break
+            (keep if item[0].startswith(RECONNECT) else dropped).append(item)
+        for item in keep:                    # 재연결 요청은 지시가 아니라 남긴다
+            self.orders.put(item)
+        for text, job in dropped:
+            TRACE.add(job, "긴급 정지로 취소", text, level="warn", end=True)
+        with self.lock:
+            asking = self.pending is not None
+            if asking:                       # 재시도 질문에 '아니오'
+                self._answer = False
+                self._answered.set()
+        err = ""
+        if self.estop_fn is not None:
+            try:
+                self.estop_fn()
+            except Exception as e:           # 몸체에 못 보내도 지시는 멈춘다
+                err = f"{type(e).__name__}: {e}"
+        self.log(f"[긴급 정지] 대기 지시 {len(dropped)}개 삭제, 이동 정지"
+                 + (f" (몸체 정지 실패: {err})" if err else ""))
+        return {"ok": True, "dropped": len(dropped), "error": err or None}
+
     def put_order(self, text: str, src: str = "") -> None:
         """src: 음성 입력에서 바로 보낸 지시면 그 처리 단계 로그 id (V3 ...)."""
         job = None
         if text.strip().lower() not in ("r", "c", "q", "quit", "exit", "종료") and not text.startswith(RECONNECT):
+            ESTOP.clear()                    # 긴급 정지 뒤에 새로 넣은 지시는 실행한다
             job = TRACE.new_job("O")
             TRACE.add(job, "지시 접수", text + (f"  (음성 {src} 에서)" if src else "")
                       + (f" - 앞에 {self.orders.qsize()}개 대기" if self.orders.qsize() else ""))
@@ -2618,7 +2688,7 @@ class Agent:
         """동작이 끝날 때까지 상태를 지켜본다."""
         t0 = time.time()
         last = {}
-        while time.time() - t0 < timeout:
+        while time.time() - t0 < timeout and not ESTOP.is_set():
             last = self.api.json("/get_state")
             if last.get("state") not in ("picking", "placing", "homing", "busy"):
                 return {"ok": True, "state": last.get("state"), "label": last.get("label")}
@@ -2640,10 +2710,21 @@ class Agent:
         finally:
             self.job = None                  # 끝난 일에 화면 갱신 같은 줄이 붙지 않게
 
+    def _estopped(self, job: str, t0: float) -> None:
+        if self.base is not None:
+            self.base.stop()                 # 버튼에서도 세웠지만, 그 뒤에 보낸 이동이 있을 수 있다
+        self.ui.log("[긴급 정지] 지시를 멈췄다")
+        self.speak("긴급 정지했어요.", job)
+        TRACE.add(job, "긴급 정지", "사용자가 긴급 정지를 눌러 지시를 멈췄다", level="warn", end=True,
+                  ms=(time.perf_counter() - t0) * 1000)
+
     def _follow(self, order: str, job: str, t0: float) -> None:
         history: list[str] = []
         plan: list[str] = []
         for step in range(1, MAX_STEPS + 1):
+            if ESTOP.is_set():
+                self._estopped(job, t0)
+                return
             state = self.api.json("/get_state")
             self.ui.set_status(f"생각 중 ({step}/{MAX_STEPS})")
             info = self.base.map_info() if self.base else None    # 매 단계 새로: 움직이면 바뀐다
@@ -2704,6 +2785,9 @@ class Agent:
             elif step == 1:
                 self.speak(call.speech or "네, 시작할게요.", job)
 
+            if ESTOP.is_set():                # 모델이 답하는 동안 눌렸으면 스킬을 실행하지 않는다
+                self._estopped(job, t0)
+                return
             ts = time.perf_counter()
             result = self.run_skill(call)
             res_txt = json.dumps(result, ensure_ascii=False)
@@ -2715,6 +2799,9 @@ class Agent:
                       ms=(time.perf_counter() - ts) * 1000, detail=res_txt)
             history.append(f"- {call.skill}{arg} -> {res_txt[:160]}")
 
+            if ESTOP.is_set():
+                self._estopped(job, t0)
+                return
             if call.skill == "done":
                 TRACE.add(job, "지시 완료", call.message or "", level="ok", end=True,
                           ms=(time.perf_counter() - t0) * 1000)
@@ -3012,6 +3099,7 @@ def main() -> None:
     if isinstance(ui, WebUi):
         ui.toggle_fn = agent.set_skills
         ui.skills_fn = agent.skill_groups
+        ui.estop_fn = lambda: agent.base.stop() if agent.base is not None else None
         ui.transcribe_fn = vlm.transcribe
         ui.live_fn = vlm.live
         ui.tts_fn = vlm.tts if vlm.tts_model else None
