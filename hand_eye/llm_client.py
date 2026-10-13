@@ -142,7 +142,7 @@ TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
 TTS_KEEP = 30                       # 서버에 남겨 둘 최근 음성 답변 수
 # 모델 호출 시간 제한. API 가 답 없이 매달려도 에이전트가 멈추지 않게 (실측: 12분 넘게 무응답).
 # 시간 초과나 일시 오류(5xx, 429, 연결)는 MODEL_TRIES 번까지 시도한다.
-MODEL_TIMEOUT = 30.0                # 로봇 판단 / 화면 설명 한 번
+MODEL_TIMEOUT = 60.0                # 로봇 판단 / 화면 설명 한 번
 STT_TIMEOUT = 30.0                  # 일괄 받아쓰기 한 번
 TTS_TIMEOUT = 20.0                  # 음성 답변 한 번 (실패하면 브라우저 내장 음성)
 MODEL_TRIES = 2
@@ -770,7 +770,20 @@ def quota_message(e: BaseException) -> Optional[str]:
     wait = re.search(r"retry in ([0-9hms.]+)", text)
     return ("모델 일일 할당량을 다 썼다"
             + (f" (하루 {m.group(1)}회)" if m else "")
-            + (f" - {re.sub(r'\.\d+s$', 's', wait.group(1))} 뒤에 다시 쓸 수 있다" if wait else ""))
+            + (f" - {re.sub(r'\.\d+s$', 's', wait.group(1).rstrip('.'))} 뒤에 다시 쓸 수 있다" if wait else ""))
+
+
+def quota_retry_s(e: BaseException) -> Optional[float]:
+    """할당량 오류의 'retry in 1h2m3.4s' / retryDelay '3600s' 를 초로 (없으면 None)."""
+    text = str(e)
+    m = re.search(r"retry in ((?:\d+h)?(?:\d+m)?(?:[\d.]+s)?)", text) or \
+        re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?((?:\d+h)?(?:\d+m)?(?:[\d.]+s))", text)
+    if not m or not m.group(1):
+        return None
+    sec = 0.0
+    for num, unit in re.findall(r"([\d.]+)([hms])", m.group(1)):
+        sec += float(num) * {"h": 3600, "m": 60, "s": 1}[unit]
+    return sec or None
 
 
 def is_transient(e: BaseException) -> bool:
@@ -798,6 +811,17 @@ class Vlm:
         self.live_model = live_model          # None 이면 실시간 없이 일괄 받아쓰기만
         self.tts_model = tts_model            # None 이면 음성 답변은 브라우저 내장 음성으로
         self.log = log or print
+        # 일일 할당량을 다 쓴 모델: model -> {what, message, at, until}. 그 모델 호출이 성공하거나
+        # 다시 쓸 수 있는 시각(until)이 지나면 빠진다. 웹 UI 가 경고로 보여 준다.
+        self.quota: dict = {}
+        self.quota_lock = threading.Lock()
+
+    def quota_list(self) -> List[dict]:
+        now = time.time()
+        with self.quota_lock:
+            for m in [m for m, q in self.quota.items() if q["until"] and q["until"] < now]:
+                del self.quota[m]
+            return [{"model": m, **q} for m, q in self.quota.items()]
 
     def _make_client(self, api_key: str) -> None:
         self.client = genai.Client(api_key=api_key)
@@ -821,12 +845,28 @@ class Vlm:
         """음성 하나를 실시간으로 받아 적는 세션을 연다 (웹 녹음 시작 때)."""
         return LiveStt(self, job)
 
-    def _call(self, fn, timeout: float, job: Optional[str], what: str, tries: int = MODEL_TRIES):
-        """모델 호출 하나에 시간 제한과 재시도를 건다. fn(timeout) 은 SDK 에도 같은 제한을 넘긴다."""
+    def _call(self, fn, timeout: float, job: Optional[str], what: str, tries: int = MODEL_TRIES,
+              model: Optional[str] = None):
+        """모델 호출 하나에 시간 제한과 재시도를 건다. fn(timeout) 은 SDK 에도 같은 제한을 넘긴다.
+        model: 할당량 경고에 쓸 모델 이름."""
         for attempt in range(1, tries + 1):
             try:
-                return with_deadline(lambda: fn(timeout), timeout + 5)
+                out = with_deadline(lambda: fn(timeout), timeout + 5)
+                if model and model in self.quota:
+                    with self.quota_lock:
+                        self.quota.pop(model, None)     # 다시 쓸 수 있게 됐다
+                return out
             except Exception as e:
+                quota = quota_message(e)
+                if quota and model:
+                    wait = quota_retry_s(e)
+                    with self.quota_lock:
+                        use = {self.model: "지시 처리·화면 설명이 안 됨",
+                               self.stt_model: "음성 받아쓰기가 안 됨 (글로 입력하세요)",
+                               self.tts_model: "음성 답변은 브라우저 내장 음성으로 대신함"}.get(model, what.strip())
+                        self.quota[model] = {"what": use, "message": quota, "at": time.time(),
+                                             "until": time.time() + wait if wait else None}
+                    TRACE.add(job, "할당량 소진", f"{model}: {quota}", level="error")
                 if attempt >= tries or not is_transient(e):
                     raise
                 why = "시간 초과" if isinstance(e, ModelTimeout) else type(e).__name__
@@ -847,7 +887,7 @@ class Vlm:
                     http_options=genai_types.HttpOptions(timeout=int(t * 1000)),
                     speech_config=genai_types.SpeechConfig(voice_config=genai_types.VoiceConfig(
                         prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=TTS_VOICE))))),
-                TTS_TIMEOUT, job, "음성 답변", tries=1)    # 실패하면 브라우저 내장 음성이 대신한다
+                TTS_TIMEOUT, job, "음성 답변", tries=1, model=self.tts_model)    # 실패하면 브라우저 내장 음성이 대신한다
             part = r.candidates[0].content.parts[0].inline_data
             data = part.data
             if data[:4] != b"RIFF":                # 날 PCM 이면 WAV 로 싼다 (24 kHz 16bit)
@@ -891,7 +931,7 @@ class Vlm:
                     {"type": "audio", "data": audio_b64, "mime_type": "audio/wav"},
                 ],
                 timeout=t,
-            ), STT_TIMEOUT, job, "받아쓰기")
+            ), STT_TIMEOUT, job, "받아쓰기", model=self.stt_model)
         except Exception as e:
             TRACE.add(job, "받아쓰기 오류", f"{type(e).__name__}: {e}", level="error",
                       ms=(time.perf_counter() - t0) * 1000)
@@ -963,7 +1003,7 @@ class Vlm:
         t0 = time.perf_counter()
         try:
             res = self._call(lambda t: self.client.interactions.create(**body, timeout=t),
-                             MODEL_TIMEOUT, job, f"{label}모델")
+                             MODEL_TIMEOUT, job, f"{label}모델", model=self.model)
         except Exception as e:
             TRACE.add(job, f"{label}모델 오류", f"{type(e).__name__}: {e}", level="error",
                       ms=(time.perf_counter() - t0) * 1000)
@@ -1210,6 +1250,10 @@ PAGE = """<!doctype html>
            background: #1d4f80; color: #fff; font-size: 14px; cursor: pointer; }
   button.no { background: #3a2027; border-color: #7a3646; }
   button.estop { background: #c62828; border-color: #ff5252; font-weight: 700; }
+  .quota { background: #4a1414; border: 1px solid #c62828; color: #ffd6d6; border-radius: 8px;
+           padding: 10px 12px; margin: 0 0 12px; font-size: 14px; }
+  .quota b { color: #ff8a80; }
+  .quota small { color: #e0a8a8; }
   button.estop:active { background: #8e0000; }
   .hint { color: #8b939c; font-size: 12.5px; margin-top: 8px; }
   button.small { padding: 4px 12px; font-size: 13px; }
@@ -1291,6 +1335,7 @@ PAGE = """<!doctype html>
               title="대기 중인 지시를 모두 지우고, 이동 중이면 바로 멈추고, 진행 중인 지시를 끝낸다 (Esc)">■ 긴급 정지</button>
       <button type="button" class="small" onclick="reconnect('all')"
               title="모두 다시 접속하고 화면을 새로 받아 설명을 다시 듣는다">전체 재연결</button></h1>
+  <div id="quota" class="quota" hidden></div>
   <div id="conns" class="conns"></div>
   <div class="row">
     <img id="view" src="/view.jpg?v=0" alt="현재 화면">
@@ -1372,6 +1417,7 @@ async function poll() {
     }
     $('state').textContent = d.state || '-';
     renderConns(d.conn || []);
+    renderQuota(d.quota || [], d.now);
     $('status').textContent = d.status || '';
     $('status').hidden = !d.status;
     if (d.ask) {
@@ -1478,6 +1524,20 @@ function estop() {
 document.addEventListener('keydown', function (e) { if (e.key === 'Escape') estop(); });
 
 // 연결 패널: 이름 | 주소 | 상태 | [재연결]. 매 poll 마다 통째로 다시 그린다(행 3개뿐).
+function renderQuota(list, now) {
+  const el = $('quota');
+  el.hidden = !list.length;
+  if (!list.length) return;
+  const hm = function (sec) { const h = Math.floor(sec / 3600), m = Math.ceil(sec % 3600 / 60);
+                              return (h ? h + '시간 ' : '') + m + '분'; };
+  el.innerHTML = list.map(function (q) {
+    const at = new Date(q.at * 1000).toLocaleTimeString();
+    const left = q.until ? ' · 약 ' + hm(Math.max(0, q.until - now)) + ' 뒤 다시 쓸 수 있음' : '';
+    return '<div>⚠ <b>모델 일일 할당량을 다 썼습니다</b> - ' + esc(q.model) + ': ' + esc(q.what)
+         + '<br><small>' + esc(q.message) + ' · ' + at + ' 발생' + left + '</small></div>';
+  }).join('');
+}
+
 function renderConns(list) {
   const box = $('conns');
   box.textContent = '';
@@ -2128,6 +2188,7 @@ class WebUi:
         self.skills_fn = None
         self.toggle_fn = None
         self.estop_fn = None                 # 긴급 정지 때 몸체를 세우는 함수 (Agent 가 채운다)
+        self.quota_fn = None                 # Vlm.quota_list - 일일 할당량을 다 쓴 모델 (경고 띠)
         self.transcribe_fn = None            # Vlm.transcribe - (WAV bytes, job) -> 글
         self.live_fn = None                  # Vlm.live - job -> LiveStt (실시간 받아쓰기)
         self.live: dict = {}                 # job -> 진행 중인 LiveStt
@@ -2216,6 +2277,7 @@ class WebUi:
                 "conn": [dict(r) for r in self.conn],
             }
         out["state"] = self._robot_state()
+        out["quota"] = self.quota_fn() if self.quota_fn else []
         # 팔 REST 행은 0.5초마다 하는 상태 조회 결과로 바로 갱신한다
         for r in out["conn"]:
             if r["key"] == "arm" and r["cls"] != "wait" and self._state:
@@ -3100,6 +3162,7 @@ def main() -> None:
         ui.toggle_fn = agent.set_skills
         ui.skills_fn = agent.skill_groups
         ui.estop_fn = lambda: agent.base.stop() if agent.base is not None else None
+        ui.quota_fn = vlm.quota_list
         ui.transcribe_fn = vlm.transcribe
         ui.live_fn = vlm.live
         ui.tts_fn = vlm.tts if vlm.tts_model else None
