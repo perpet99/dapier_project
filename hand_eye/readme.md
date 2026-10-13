@@ -536,6 +536,13 @@ python hand_eye/llm_client.py --auto "..."             # 실패해도 안 묻는
 | `wall_approach(gap)` | `POST /api/wall/config`, `/api/wall/start` | 정면 벽과 수직으로 맞추고 차체 앞 gap m 까지 |
 | `depth_approach` | `POST /api/approach/start` | 깊이 카메라 근접선까지 전진 |
 
+**지도 정보로 계획 세우기**
+- 지시를 처리하는 매 단계에 map_web의 `GET /api/get_map_info` 요약을 프롬프트에 "지도 정보"로 넣는다.
+  요약에는 내 위치, 라벨의 위치·거리·방향·reachable, 탐색된 지도 범위, Nav2 상태, 정면 벽이 들어 있다.
+- 첫 단계에서 모델은 이 정보와 화면을 보고 전체 실행 계획을 `plan`(단계별 문장 목록)으로 낸다.
+- 계획은 로그와 처리 단계 로그에 "실행 계획"으로 남고, 다음 단계 프롬프트에 "세운 계획"으로 들어간다.
+- 모델이 계획을 바꾸면 새 `plan`을 낸다.
+
 몸체가 움직이고 나면 클라이언트가 팔 카메라 화면을 새로 받는다. pick/place 와 마찬가지로 **확인 없이 바로 움직인다.**
 예: `python hand_eye/llm_client.py "책상으로 가서 책상 앞에 붙은 다음 컵을 집어"`
 

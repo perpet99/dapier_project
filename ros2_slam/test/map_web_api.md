@@ -87,6 +87,7 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | GET | `/` | 웹 UI 페이지 | |
 | GET | `/api/state` | 전체 상태 (위치, 스캔, 지도, 라벨, Nav2, 설정 등) | |
 | GET | `/api/map/meta` | 지도 정보 | |
+| GET | `/api/get_map_info` | 계획용 요약: 내 위치, 라벨(거리·방향·도달 가능), 지도 범위, Nav2 상태 | |
 | GET | `/map.png` | 지도 이미지 | |
 | GET | `/stream/rgb.mjpg` | RGB 카메라 MJPEG | |
 | GET | `/stream/depth.mjpg` | 깊이 영상 MJPEG (근접 이동 표시 포함) | |
@@ -97,6 +98,7 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | GET | `/api/labels` | 위치 라벨 목록 | |
 | POST | `/api/labels` | 라벨 추가 (현재 위치 또는 지정 좌표) | |
 | POST | `/api/labels/delete` | 라벨 삭제 | |
+| POST | `/api/labels/rename` | 라벨 이름 변경 | |
 | POST | `/api/nav/goto` | 라벨 위치로 Nav2 자율 주행 (목표가 뒤쪽이면 먼저 30 cm 후진) | **예** |
 | POST | `/api/nav/goto_wall` | Go to 후 도착하면 라이다 근접 이동 | **예** |
 | POST | `/api/nav/cancel` | Nav2 목표 취소 | |
@@ -160,6 +162,30 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | `nav` | Go to 상태 (아래 `/api/nav/goto` 참고). `server` = Nav2 `navigate_to_pose` 사용 가능 여부 |
 | `reloc` | 위치 다시 잡기 상태 (아래 `/api/relocalize` 참고). `amcl` = `/initialpose` 구독자(AMCL) 유무 |
 | `camera` | 영상별 수신 `fps`, 구독 중인지(`subscribed`), 토픽 발행자 수(`publishers`, 0이면 robot_rgbd 꺼짐) |
+
+### GET `/api/get_map_info`
+LLM 같은 계획기에 넘기려고 만든 작은 요약이다. 스캔, 궤적, 지도 이미지는 넣지 않는다.
+`hand_eye/llm_client.py`는 지시를 처리하는 매 단계에 이것을 읽어 프롬프트에 넣는다.
+```json
+{"frame": "map",
+ "pose": {"frame": "map", "x": -3.18, "y": 1.358, "yaw": 0.0357, "yaw_deg": 2.0},
+ "robot_cost": 0,
+ "robot": {"radius": 0.26, "front": 0.16, "back": 0.16},
+ "labels": [{"id": "1b4a6030", "name": "책상", "x": -3.975, "y": 0.822, "yaw": -3.1256, "yaw_deg": -179.1,
+             "cost": 99, "reachable": false, "dist_m": 0.96, "bearing_deg": -146.0}],
+ "map": {"frame": "map", "resolution": 0.05, "width_m": 14.55, "height_m": 9.45, "origin": [-8.455, -6.202, 0.0],
+         "bounds": [-8.2, -5.9, 5.6, 3.0], "known_m2": 56.6, "age_s": 12.3},
+ "nav": {"server": true, "state": "idle", "target": null, "message": null},
+ "wall_ahead": {"dist_m": 1.938, "err_deg": 51.0},
+ "units": "..."}
+```
+| 필드 | 설명 |
+|---|---|
+| `pose` | 로봇 위치. 2초 넘게 갱신이 없으면 `null`. `frame`이 `odom`이면 지도가 없다는 뜻 |
+| `labels[].reachable` | 비용지도 값이 99 미만이거나 비용지도가 없으면 `true`. `false`여도 Go to는 가장 가까운 지점까지 간다 |
+| `labels[].dist_m`, `bearing_deg` | 로봇에서 라벨까지 거리와 방향 (0 = 정면, + = 왼쪽, ±180 = 뒤). map 좌표일 때만 있다. 이때 목록은 가까운 순서다 |
+| `map.bounds` | 탐색된(unknown이 아닌) 칸의 범위 `[x_min, y_min, x_max, y_max]` (m) |
+| `wall_ahead` | 정면에 맞춘 벽 (2초 안의 결과만, 없으면 `null`) |
 
 ### GET `/api/map/meta`
 마지막으로 받은 `/map` 정보다. 지도를 아직 받지 못했으면 `null`.
@@ -269,6 +295,16 @@ curl -X POST http://192.168.0.31:8081/api/labels -d '{"name":"문 앞","x":1.2,"
 
 ### POST `/api/labels/delete`
 `{"id": "994b2b49"}` → `{"ok": true}`. 없는 id면 `404 {"error": "없는 라벨입니다"}`.
+
+### POST `/api/labels/rename`
+`{"id": "1b4a6030", "name": "책상 앞"}` → 바뀐 라벨 객체를 돌려준다. 위치, 방향, id는 그대로다.
+웹 UI에서는 라벨을 선택하고 **이름 변경** 버튼을 누르거나, 목록에서 라벨을 더블클릭한다.
+
+| 상태 | 원인 |
+|---|---|
+| 400 | 빈 이름, 40자 초과, 이미 있는 이름 |
+| 404 | 없는 라벨 |
+| 500 | 라벨 파일 저장 실패 |
 
 ### POST `/api/nav/goto`
 `{"id": "994b2b49"}` 라벨의 위치·방향으로 Nav2 `navigate_to_pose` 목표를 보낸다(RViz "Nav2 Goal"과 같음).

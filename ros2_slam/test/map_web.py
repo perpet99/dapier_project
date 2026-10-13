@@ -11,6 +11,8 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
   GET  /api/state               JSON: pose in the map (or odom when there is no map
                                 yet), scan points, trail, Nav2 plan, AMCL spread
   GET  /api/map/meta            JSON: map size, resolution, origin, version
+  GET  /api/get_map_info        JSON summary for planners (LLM): my pose, labels with distance /
+                                bearing / reachability, map size + explored bounds, Nav2 state
   GET  /map.png                 the occupancy grid (row 0 = top = max y)
   POST /api/drive {"linear": 0.1, "angular": 0.0}   (see drive_control.py)
   POST /api/drive/stop
@@ -23,6 +25,7 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
   POST /api/labels {"name": "주방"}   label the robot's current map pose
                                 (or {"name", "x", "y", "yaw"} for an explicit pose)
   POST /api/labels/delete {"id": "..."}
+  POST /api/labels/rename {"id": "...", "name": "새 이름"}
   POST /api/nav/goto {"id": "..."}    Nav2 NavigateToPose to the label; when the label is
                                 behind the robot (bearing > 90 deg) back up goto_backup_m
                                 (0.30 m) first. A label inside an obstacle / the robot radius on
@@ -165,12 +168,17 @@ class Labels:
         with self.lock:
             return next((lb for lb in self.items if lb['id'] == label_id), None)
 
-    def add(self, name: str, x: float, y: float, yaw: float, frame: str) -> dict:
+    @staticmethod
+    def _check_name(name: str) -> str:
         name = name.strip()
         if not name:
             raise ValueError('라벨 이름을 입력하세요')
         if len(name) > 40:
             raise ValueError('라벨 이름은 40자까지')
+        return name
+
+    def add(self, name: str, x: float, y: float, yaw: float, frame: str) -> dict:
+        name = self._check_name(name)
         label = {'id': uuid.uuid4().hex[:8], 'name': name, 'x': round(x, 3), 'y': round(y, 3),
                  'yaw': round(math.atan2(math.sin(yaw), math.cos(yaw)), 4), 'frame': frame,
                  'created': time.strftime('%Y-%m-%d %H:%M:%S')}
@@ -180,6 +188,18 @@ class Labels:
             self.items.append(label)
             self._save()
         return label
+
+    def rename(self, label_id, name: str) -> dict:
+        name = self._check_name(name)
+        with self.lock:
+            lb = next((lb for lb in self.items if lb['id'] == label_id), None)
+            if lb is None:
+                raise KeyError(label_id)
+            if any(o['name'] == name and o['id'] != label_id for o in self.items):
+                raise ValueError(f'이미 있는 이름입니다: {name}')
+            lb['name'] = name
+            self._save()
+            return dict(lb)
 
     def delete(self, label_id):
         with self.lock:
@@ -1055,7 +1075,17 @@ class MapWeb(Node):
                 'origin': [o.position.x, o.position.y, yaw_of(o.orientation)],
                 'received': time.time(),
                 'known_m2': round(float(known.sum()) * msg.info.resolution ** 2, 1),
+                'bounds': self._known_bounds(known, msg.info.resolution, o.position.x, o.position.y),
             }
+
+    @staticmethod
+    def _known_bounds(known, res, ox, oy):
+        """[x_min, y_min, x_max, y_max] (m) of the explored cells, None for an empty map (origin yaw 0 assumed)."""
+        rows, cols = np.nonzero(known.any(axis=1))[0], np.nonzero(known.any(axis=0))[0]
+        if rows.size == 0:
+            return None
+        return [round(float(ox + cols[0] * res), 2), round(float(oy + rows[0] * res), 2),
+                round(float(ox + (cols[-1] + 1) * res), 2), round(float(oy + (rows[-1] + 1) * res), 2)]
 
     def _on_costmap(self, msg: OccupancyGrid):
         self.costmap = (np.asarray(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width),
@@ -1527,6 +1557,55 @@ class MapWeb(Node):
             }
             self.state_json = json.dumps(state).encode()
 
+    def map_info(self) -> dict:
+        """GET /api/get_map_info: what a planner needs -- where I am, the labels (distance, bearing,
+        reachable), the map extent and Nav2 state. Small: no scan, trail or image."""
+        now, cur = time.time(), self.cur_pose
+        pose = None
+        if cur is not None and now - cur[4] < 2.0:
+            pose = {'frame': cur[0], 'x': round(cur[1], 3), 'y': round(cur[2], 3), 'yaw': round(cur[3], 4),
+                    'yaw_deg': round(math.degrees(cur[3]), 1)}
+        in_map = pose is not None and cur[0] == self.map_frame
+        labels = []
+        for lb in self.labels.list():
+            cost = self.cost_at(lb['x'], lb['y'])
+            item = {'id': lb['id'], 'name': lb['name'], 'x': lb['x'], 'y': lb['y'], 'yaw': lb['yaw'],
+                    'yaw_deg': round(math.degrees(lb['yaw']), 1), 'cost': cost,
+                    'reachable': cost is None or cost < 99}
+            if in_map:
+                dx, dy = lb['x'] - cur[1], lb['y'] - cur[2]
+                b = math.atan2(dy, dx) - cur[3]
+                item['dist_m'] = round(math.hypot(dx, dy), 2)
+                item['bearing_deg'] = round(math.degrees(math.atan2(math.sin(b), math.cos(b))), 0)
+            labels.append(item)
+        if in_map:
+            labels.sort(key=lambda it: it['dist_m'])
+        with self.lock:
+            meta = self.map_meta
+        m = None
+        if meta is not None:
+            m = {'frame': meta['frame'], 'resolution': round(meta['resolution'], 3),
+                 'width_m': round(meta['width'] * meta['resolution'], 2),
+                 'height_m': round(meta['height'] * meta['resolution'], 2),
+                 'origin': [round(v, 3) for v in meta['origin']], 'bounds': meta.get('bounds'),
+                 'known_m2': meta['known_m2'], 'age_s': round(now - meta['received'], 1)}
+        nav = self.nav
+        return {
+            'frame': pose['frame'] if pose else None,
+            'pose': pose,
+            'robot_cost': self.cost_at(cur[1], cur[2]) if in_map else None,
+            'robot': {'radius': self.robot_radius, 'front': self.robot_front, 'back': self.robot_back},
+            'labels': labels,
+            'map': m,
+            'nav': {'server': self.nav_client.server_is_ready(), 'state': nav.get('state'),
+                    'target': (nav.get('target') or {}).get('name'), 'message': nav.get('message')},
+            'wall_ahead': None if self.wall.wall is None or now - self.wall.wall_t > 2.0 else
+                          {'dist_m': round(self.wall.wall['dist'], 3),
+                           'err_deg': round(math.degrees(self.wall.wall['err']), 1)},
+            'units': 'm, rad (_deg = degree). yaw 0 = +x, counter-clockwise +. '
+                     'bearing_deg = label direction seen from the robot (0 ahead, + left, +-180 behind)',
+        }
+
     def add_label(self, req: dict) -> dict:
         name = str(req.get('name', ''))
         if all(k in req for k in ('x', 'y')):
@@ -1703,6 +1782,7 @@ __DRIVE_CSS__
     <button id="lgo" class="go" disabled title="Nav2로 선택한 라벨 위치까지 자율 주행">Go to (Navi)</button>
     <button id="lgowall" class="go" disabled title="Nav2로 라벨 위치까지 간 뒤, 정면 벽과 수직으로 맞춰 최대한 가까이 전진 (라이다 근접 이동)">Go to + 벽 근접</button>
     <button id="lcancel" class="ghost" title="Nav2 목표 취소 (주행 패드를 눌러도 취소됨)">Navi 취소</button>
+    <button id="lren" class="ghost" disabled title="선택한 라벨의 이름 바꾸기 (목록에서 이름을 더블클릭해도 됨)">이름 변경</button>
     <button id="ldel" class="ghost danger" disabled>선택 라벨 삭제</button>
     <span id="navstate"></span>
   </div>
@@ -2163,7 +2243,7 @@ function renderLabels() {
   $('lgo').title = S && S.nav && S.nav.server ? 'Nav2로 선택한 라벨 위치까지 자율 주행'
                                               : 'Nav2가 실행 중이 아닙니다 (노트북: run_lidar_navigation.sh)';
   $('lgowall').disabled = $('lgo').disabled;
-  $('ldel').disabled = !selId;
+  $('ldel').disabled = $('lren').disabled = !selId;
   $('ladd').disabled = !(S && S.frame === 'map' && S.pose);
   $('ladd').title = $('ladd').disabled ? 'map 좌표계가 있어야 저장할 수 있습니다 (SLAM/내비게이션 실행)' : '로봇의 현재 위치·방향을 이 이름으로 저장';
   const n = S && S.nav, st = $('navstate');
@@ -2194,6 +2274,15 @@ async function addLabel() {
 }
 $('ladd').onclick = addLabel;
 $('lname').addEventListener('keydown', e => { if (e.key === 'Enter') addLabel(); });
+async function renameLabel() {
+  const lb = S.labels.find(l => l.id === selId); if (!lb) return;
+  const name = prompt(`'${lb.name}'의 새 이름 (40자까지)`, lb.name);
+  if (name === null || name.trim() === lb.name) return;
+  try { const r = await post('/api/labels/rename', { id: lb.id, name }); lastRows = ''; msg('lmsg', `'${lb.name}' → '${r.name}'`, 'ok'); }
+  catch (e) { msg('lmsg', e.message, 'err'); }
+}
+$('lren').onclick = renameLabel;
+$('lbody').addEventListener('dblclick', renameLabel);   // the first click already selected the row (rows get re-rendered)
 $('ldel').onclick = async () => {
   const lb = S.labels.find(l => l.id === selId); if (!lb) return;
   if (!confirm(`라벨 '${lb.name}'을(를) 삭제할까요?`)) return;
@@ -2304,6 +2393,8 @@ def make_handler(node: MapWeb):
                 with node.lock:
                     body = node.state_json
                 self._send(200, body, 'application/json')
+            elif path == '/api/get_map_info':
+                self._json(node.map_info())
             elif path == '/api/map/meta':
                 with node.lock:
                     self._json(node.map_meta)
@@ -2379,11 +2470,13 @@ def make_handler(node: MapWeb):
                     self._json({'error': str(exc)}, 409)
                 except OSError as exc:
                     self._json({'error': f'저장 실패: {exc}'}, 500)
-            elif path in ('/api/labels', '/api/labels/delete', '/api/nav/goto', '/api/nav/goto_wall'):
+            elif path in ('/api/labels', '/api/labels/delete', '/api/labels/rename', '/api/nav/goto', '/api/nav/goto_wall'):
                 try:
                     req = json.loads(body or b'{}')
                     if path == '/api/labels':
                         self._json(node.add_label(req))
+                    elif path == '/api/labels/rename':
+                        self._json(node.labels.rename(req.get('id'), str(req.get('name', ''))))
                     elif path == '/api/labels/delete':
                         node.labels.delete(req.get('id'))
                         self._json({'ok': True})

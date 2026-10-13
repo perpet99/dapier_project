@@ -31,6 +31,9 @@ llm_client.py - Gemini Robotics-ER 이 test4.py 의 REST API 를 스킬로 쓰�
   depth_approach         POST /api/approach/*         깊이 카메라 근접선까지 전진
   주소는 기본으로 --api 와 같은 호스트의 8081 포트 (--map-api 로 지정).
   map_web 이 없으면(연결 실패 또는 --no-base) 이 스킬들은 빠진다.
+  지도 정보: 지시를 처리하는 매 단계에 GET /api/get_map_info (내 위치, 라벨 위치·거리·방향·
+  도달 가능 여부, 지도 범위, Nav2 상태)를 프롬프트에 넣고, 첫 단계에서 모델이 그걸 보고
+  전체 실행 계획(plan)을 세운다. 계획은 다음 단계 프롬프트에도 들어간다.
 
 좌표 규약은 이 프로젝트의 다른 VLM 코드(test3.py)와 같다 - **[y, x] 순서로
 0~1000 정규화**. 클라이언트가 실제 픽셀로 바꿔서 REST 에 넘긴다. 모델이 픽셀
@@ -313,6 +316,22 @@ class MapApi:
     # --- 상태 -------------------------------------------------------------
     def state(self) -> dict:
         return self.call("/api/state")
+
+    def map_info(self) -> Optional[dict]:
+        """GET /api/get_map_info 를 모델에게 줄 모양으로 (못 읽으면 None)."""
+        r = self.call("/api/get_map_info", timeout=3.0)
+        if r.get("http") != 200:
+            return None
+        p, m = r.get("pose"), r.get("map") or {}
+        return {
+            "frame": r.get("frame"),       # map = 지도 위 위치, odom = 지도 없음
+            "pose": None if not p else {"x": p["x"], "y": p["y"], "yaw_deg": p["yaw_deg"]},
+            "labels": [{k: lb.get(k) for k in ("name", "x", "y", "yaw_deg", "reachable", "dist_m", "bearing_deg")
+                        if lb.get(k) is not None} for lb in r.get("labels", [])],
+            "map": None if not m else {k: m.get(k) for k in ("bounds", "known_m2", "resolution")},
+            "nav": r.get("nav"),
+            "wall_ahead": r.get("wall_ahead"),
+        }
 
     @staticmethod
     def _deg(rad) -> Optional[float]:
@@ -607,6 +626,10 @@ class SkillCall(BaseModel):
         default=None,
         description="사용자에게 소리로 들려줄 아주 짧은 한국어 한 문장 (30자 안팎). "
                     "첫 스킬에서는 무엇을 할지, done 에서는 결과를 말한다. 다른 단계에서는 비운다")
+    plan: Optional[List[str]] = Field(
+        default=None,
+        description="첫 스킬에서 지도 정보와 화면을 보고 세운 전체 실행 계획 (단계마다 짧은 한 문장, "
+                    "예: '책상으로 이동해 앞에 붙는다'). 계획을 바꿀 때만 다시 쓰고, 그 밖에는 비운다")
     reason: str = Field(description="왜 이 스킬을 지금 부르는지 한 문장")
 
 
@@ -665,6 +688,14 @@ BASE_DOC = """
   wall_approach(gap)   정면 벽(책상 앞면 등)과 수직으로 맞추고 차체 앞이 gap m 남을 때까지 다가간다.
                        gap 생략 시 저장된 값. 물건을 집기 전 작업대에 붙을 때 쓴다.
   depth_approach       깊이 카메라 기준선까지 천천히 다가간다.
+
+지도 정보:
+  프롬프트의 '지도 정보' 는 매 단계 새로 읽은 GET /api/get_map_info 요약이다.
+  pose(x, y m, yaw_deg), labels(이름, 위치, 방향, reachable, 로봇에서 거리 dist_m,
+  방향 bearing_deg: 0 = 정면, + 왼쪽, ±180 = 뒤), map(탐색된 범위 bounds [x_min, y_min,
+  x_max, y_max]), nav(Nav2 상태), wall_ahead(정면 벽). 좌표 단위 m, 각도 °, yaw 0 = +x, 반시계 +.
+  지시에 나온 장소는 labels 의 이름과 맞춰 보고, 어느 라벨로 갈지 계획을 세워라.
+  맞는 라벨이 없으면 지어내지 말고 say/done 으로 사용자에게 물어라.
 
 몸체 규칙:
   - 몸체가 움직이면 카메라 화면이 바뀐다. 움직인 뒤에는 클라이언트가 화면을 새로 받는다.
@@ -2611,15 +2642,25 @@ class Agent:
 
     def _follow(self, order: str, job: str, t0: float) -> None:
         history: list[str] = []
+        plan: list[str] = []
         for step in range(1, MAX_STEPS + 1):
             state = self.api.json("/get_state")
             self.ui.set_status(f"생각 중 ({step}/{MAX_STEPS})")
+            info = self.base.map_info() if self.base else None    # 매 단계 새로: 움직이면 바뀐다
+            if step == 1 and info:
+                TRACE.add(job, "지도 정보", f"라벨 {len(info['labels'])}개, 위치 {info['pose']}",
+                          detail=json.dumps(info, ensure_ascii=False))
             prompt = (
                 f"{self.skill_doc()}\n\n"
                 f"사용자 지시: {order}\n"
                 f"로봇 상태: {state.get('state')} ({state.get('label')})\n"
+                + (f"지도 정보 (지금): {json.dumps(info, ensure_ascii=False)}\n" if info
+                   else "지도 정보: 없음 (이동 로봇 연결 안 됨)\n" if self.base else "")
+                + ("세운 계획:\n" + "\n".join(f"  {i}. {p}" for i, p in enumerate(plan, 1)) + "\n" if plan else "")
                 + ("지금까지 한 일:\n" + "\n".join(history) + "\n" if history else "")
                 + ("이번이 이 지시의 첫 스킬이다 - speech 에 무엇을 할지 짧은 한 문장을 꼭 써라.\n"
+                   + ("지도 정보와 화면을 보고 지시를 끝낼 전체 실행 계획을 plan 에 단계별로 써라.\n"
+                      if self.base else "")
                    if step == 1 else "")
                 + "done 을 부른다면 speech 에 결과를 짧은 한 문장으로 꼭 써라.\n"
                 + "다음에 부를 스킬 하나를 JSON 으로 내라."
@@ -2645,6 +2686,10 @@ class Agent:
 
             arg = "".join(f" {v}" for v in (call.point, call.label, call.meters, call.degrees, call.gap)
                           if v is not None)
+            if call.plan:
+                plan = [p for p in call.plan if p][:12]
+                self.ui.log("  계획: " + " → ".join(plan))
+                TRACE.add(job, "실행 계획" if step == 1 else "계획 변경", " → ".join(plan))
             self.ui.log(f"  [{step}] {call.skill}{arg}  - {call.reason}")
             if call.message:
                 self.ui.log(f"      말: {call.message}")
