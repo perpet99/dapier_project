@@ -29,6 +29,8 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
                                 Nav2's global costmap is driven to the closest reachable point
                                 (within 1.5 m) instead; an abort mid-route retries up to twice when
                                 that point has moved (obstacle seen on the way)
+  POST /api/nav/goto_wall {"id": "..."}   Go to the label, then (on arrival) the lidar wall
+                                approach: square up to the wall in front and drive to `gap`
   POST /api/nav/cancel          cancel the Nav2 goal (manual driving cancels it too)
   GET  /api/nav/tolerance       JSON: arrival tolerance saved here / active in Nav2, limits
   POST /api/nav/tolerance {"xy": 0.05, "yaw_deg": 14}
@@ -969,6 +971,8 @@ class MapWeb(Node):
         self.robot_back = float(self.declare_parameter('robot_back', 0.16).value)       # center -> rear of body
         self.backup_clear_m = float(self.declare_parameter('goto_backup_clear_m', 0.12).value)
         self.backup = None            # {'label', 'start': (x, y) in odom, 't0'} while backing up
+        self.nav_then = None          # 'wall': start the lidar wall approach when the Go to arrives
+        self.after_nav = None         # {'seq', 'at', 'until'} pending wall start after arrival
 
         # relocalization
         self.reloc_min_match = float(self.declare_parameter('reloc_min_match', 0.5).value)
@@ -1295,6 +1299,7 @@ class MapWeb(Node):
             self._start_reloc(reloc)
         for req in reqs:
             if req[0] == 'cancel':
+                self.nav_then = self.after_nav = None
                 if self.backup is not None:
                     self.backup = None
                     self.drive.stop()
@@ -1309,6 +1314,8 @@ class MapWeb(Node):
                     self._send_goal(label, note, retries)
                 continue
             label = req[1]
+            self.nav_then = req[2] if len(req) > 2 else None
+            self.after_nav = None
             self.nav_seq += 1
             if not self.nav_client.server_is_ready():
                 self.backup = None
@@ -1332,6 +1339,32 @@ class MapWeb(Node):
                                    f"backing up {self.backup_m:.2f} m first")
         if self.backup is not None:
             self._backup_tick()
+        if self.after_nav is not None:
+            self._after_nav_tick()
+
+    def _after_nav_tick(self):
+        """Go to + wall: once arrived (and settled for a fresh scan), start the lidar wall approach.
+        Called from _nav_tick (ROS thread); retries a missing wall fit for a few seconds."""
+        a, now = self.after_nav, time.time()
+        if a['seq'] != self.nav_seq or self.nav.get('state') != 'succeeded':
+            self.after_nav = None
+            return
+        if now < a['at']:
+            return
+        try:
+            self.wall.start()
+        except ValueError as exc:
+            if '이미 목표 거리 안' not in str(exc) and now < a['until']:
+                return                                    # wall not fitted yet: try again next tick
+            self.after_nav = None
+            done = '이미 목표 거리 안' in str(exc)
+            self.nav = {**self.nav, 'then_state': 'done' if done else 'failed',
+                        'message': f"{self.nav.get('message', '도착')} · 라이다 근접 이동 "
+                                   + ('불필요' if done else '실패') + f': {exc}'}
+            return
+        self.after_nav = None
+        self.nav = {**self.nav, 'then_state': 'started',
+                    'message': f"{self.nav.get('message', '도착')} → 라이다 근접 이동 시작"}
 
     def _goal_bearing(self, label):
         """Direction of the label seen from the robot (rad, 0 = straight ahead, +-pi = behind), None if unknown."""
@@ -1362,7 +1395,7 @@ class MapWeb(Node):
         goal.pose.pose.orientation.z = math.sin(target['yaw'] / 2)
         goal.pose.pose.orientation.w = math.cos(target['yaw'] / 2)
         seq = self.nav_seq
-        self.nav = {'state': 'sending', 'target': target, 'label': label, 'retries': retries,
+        self.nav = {'state': 'sending', 'target': target, 'label': label, 'retries': retries, 'then': self.nav_then,
                     'started': self.nav.get('started', time.time()),
                     'backed': self.nav.get('backed'), 'note': note, 'message': '목표 전송 중'}
         fut = self.nav_client.send_goal_async(goal, feedback_callback=lambda fb, s=seq: self._nav_feedback(s, fb))
@@ -1415,6 +1448,12 @@ class MapWeb(Node):
             msg = f"라벨 위치가 막혀 있어 {target['shift'] * 100:.0f} cm 떨어진 가장 가까운 지점에 도착"
         self._set_nav(seq, state=state, message=msg + (f': {err}' if err else ''), finished=time.time())
         self.get_logger().info(f'nav result: {state} {err}')
+        if seq == self.nav_seq and self.nav_then == 'wall':
+            self.nav_then = None
+            if state == 'succeeded':      # settle 0.5 s for a scan taken standing still, give the fit 3 s
+                t = time.time()
+                self.after_nav = {'seq': seq, 'at': t + 0.5, 'until': t + 3.5}
+                self._set_nav(seq, then_state='pending', message=msg + ' — 라이다 근접 이동 준비')
 
     # ---- state (ROS thread, 5 Hz) ---------------------------------------------
     def _lookup(self, target, source):
@@ -1662,6 +1701,7 @@ __DRIVE_CSS__
   </table></div>
   <div class="labelbar">
     <button id="lgo" class="go" disabled title="Nav2로 선택한 라벨 위치까지 자율 주행">Go to (Navi)</button>
+    <button id="lgowall" class="go" disabled title="Nav2로 라벨 위치까지 간 뒤, 정면 벽과 수직으로 맞춰 최대한 가까이 전진 (라이다 근접 이동)">Go to + 벽 근접</button>
     <button id="lcancel" class="ghost" title="Nav2 목표 취소 (주행 패드를 눌러도 취소됨)">Navi 취소</button>
     <button id="ldel" class="ghost danger" disabled>선택 라벨 삭제</button>
     <span id="navstate"></span>
@@ -2122,6 +2162,7 @@ function renderLabels() {
   $('lgo').disabled = !selId || !(S && S.nav && S.nav.server);
   $('lgo').title = S && S.nav && S.nav.server ? 'Nav2로 선택한 라벨 위치까지 자율 주행'
                                               : 'Nav2가 실행 중이 아닙니다 (노트북: run_lidar_navigation.sh)';
+  $('lgowall').disabled = $('lgo').disabled;
   $('ldel').disabled = !selId;
   $('ladd').disabled = !(S && S.frame === 'map' && S.pose);
   $('ladd').title = $('ladd').disabled ? 'map 좌표계가 있어야 저장할 수 있습니다 (SLAM/내비게이션 실행)' : '로봇의 현재 위치·방향을 이 이름으로 저장';
@@ -2159,15 +2200,20 @@ $('ldel').onclick = async () => {
   try { await post('/api/labels/delete', { id: lb.id }); selId = null; msg('lmsg', `'${lb.name}' 삭제됨`, 'ok'); }
   catch (e) { msg('lmsg', e.message, 'err'); }
 };
-$('lgo').onclick = async () => {
+async function goLabel(wall) {
   const lb = S.labels.find(l => l.id === selId); if (!lb) return;
   const p = S.frame === 'map' ? S.pose : null;
   const behind = p && Math.abs(Math.atan2(Math.sin(Math.atan2(lb.y - p.y, lb.x - p.x) - p.yaw),
                                           Math.cos(Math.atan2(lb.y - p.y, lb.x - p.x) - p.yaw))) > Math.PI / 2;
-  if (!confirm(`로봇이 ${behind ? '(목표가 뒤쪽이라) 먼저 30 cm 후진한 뒤 ' : ''}'${lb.name}' (x ${lb.x.toFixed(2)}, y ${lb.y.toFixed(2)})까지 자율 주행합니다.\n주변이 안전한가요? (중지: 'Navi 취소' 또는 주행 패드)`)) return;
-  try { await post('/api/nav/goto', { id: lb.id }); msg('navstate', `'${lb.name}'(으)로 목표 전송`, 'busy'); }
+  const gap = S.wall ? ` 목표 ${S.wall.target.toFixed(3)} m(중심 기준)` : '';
+  if (!confirm(`로봇이 ${behind ? '(목표가 뒤쪽이라) 먼저 30 cm 후진한 뒤 ' : ''}'${lb.name}' (x ${lb.x.toFixed(2)}, y ${lb.y.toFixed(2)})까지 자율 주행합니다.`
+               + (wall ? `\n도착하면 정면 벽과 수직으로 회전한 뒤${gap}까지 전진합니다.` : '')
+               + `\n주변이 안전한가요? (중지: 'Navi 취소' / 정지 버튼 / 주행 패드)`)) return;
+  try { await post(wall ? '/api/nav/goto_wall' : '/api/nav/goto', { id: lb.id }); msg('navstate', `'${lb.name}'(으)로 목표 전송`, 'busy'); }
   catch (e) { msg('navstate', e.message, 'err'); }
-};
+}
+$('lgo').onclick = () => goLabel(false);
+$('lgowall').onclick = () => goLabel(true);
 $('lcancel').onclick = () => post('/api/nav/cancel').catch(e => msg('navstate', e.message, 'err'));
 
 // ---- polling ------------------------------------------------------------------
@@ -2285,6 +2331,8 @@ def make_handler(node: MapWeb):
             path = urlparse(self.path).path
             length = int(self.headers.get('Content-Length') or 0)
             body = self.rfile.read(length) if length else b''
+            if path in ('/api/drive', '/api/drive/stop'):
+                node.after_nav = None              # no wall approach after a Go to that was overridden
             if path == '/api/drive' and node.nav_active():
                 node.request_nav(('cancel',))      # manual driving overrides Nav2
             if path == '/api/drive/stop' and node.nav.get('state') == 'backing':
@@ -2331,7 +2379,7 @@ def make_handler(node: MapWeb):
                     self._json({'error': str(exc)}, 409)
                 except OSError as exc:
                     self._json({'error': f'저장 실패: {exc}'}, 500)
-            elif path in ('/api/labels', '/api/labels/delete', '/api/nav/goto'):
+            elif path in ('/api/labels', '/api/labels/delete', '/api/nav/goto', '/api/nav/goto_wall'):
                 try:
                     req = json.loads(body or b'{}')
                     if path == '/api/labels':
@@ -2350,7 +2398,7 @@ def make_handler(node: MapWeb):
                             node.approach.stop('stopped', 'Go to로 중지')
                         if node.wall.running():
                             node.wall.stop('stopped', 'Go to로 중지')
-                        node.request_nav(('goto', label))
+                        node.request_nav(('goto', label, 'wall' if path == '/api/nav/goto_wall' else None))
                         self._json({'ok': True, 'target': label})
                 except KeyError:
                     self._json({'error': '없는 라벨입니다'}, 404)

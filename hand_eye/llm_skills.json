@@ -1,7 +1,11 @@
 {
   "disabled": [
+    "base_move",
+    "base_turn",
     "depth_approach",
+    "goto_label",
     "relocalize",
-    "save_label"
+    "save_label",
+    "wall_approach"
   ]
 }

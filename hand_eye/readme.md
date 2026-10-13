@@ -527,6 +527,7 @@ python hand_eye/llm_client.py --auto "..."             # 실패해도 안 묻는
 |---|---|---|
 | `base_state` | `GET /api/state`, `/api/drive` | 위치·방향, 라벨 목록(reachable, 거리), Nav2 상태, 정면 장애물 거리, 정면 벽 |
 | `goto_label(label)` | `POST /api/nav/goto` | 라벨 이름 → id 로 Nav2 이동, 도착/실패까지 기다림 (최대 240초) |
+| `goto_label_wall(label, gap)` | `POST /api/wall/config`, `/api/nav/goto_wall` | goto_label 로 도착한 뒤 정면 벽과 수직으로 맞추고 차체 앞 gap m 까지 (근접 이동 끝까지 기다림) |
 | `save_label(label)` | `POST /api/labels` | 지금 위치를 라벨로 저장 |
 | `base_move(meters)` | `POST /api/drive` 반복 | 직진/후진 ±1 m, 0.08 m/s. 차체 앞/뒤 0.10 m 안에 라이다 점이 보이면 정지 |
 | `base_turn(degrees)` | `POST /api/drive` 반복 | 제자리 회전 ±180° (+ 왼쪽) |

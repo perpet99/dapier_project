@@ -21,6 +21,7 @@ llm_client.py - Gemini Robotics-ER 이 test4.py 의 REST API 를 스킬로 쓰�
 이동 로봇(car2) 스킬 (= ros2_slam/test/map_web.py 의 REST API, 문서 map_web_api.md)
   base_state             GET /api/state, /api/drive   위치·방향, 라벨 목록, Nav2/근접 상태
   goto_label(label)      POST /api/nav/goto           라벨 위치로 Nav2 자율 주행 (끝날 때까지 기다림)
+  goto_label_wall(label, gap)  POST /api/nav/goto_wall  라벨로 이동한 뒤 정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진
   save_label(label)      POST /api/labels             지금 위치를 라벨로 저장
   base_move(meters)      POST /api/drive (반복)       직진/후진 (±1 m, 앞뒤 라이다 장애물이면 정지)
   base_turn(degrees)     POST /api/drive (반복)       제자리 회전 (±180°, + = 왼쪽)
@@ -341,7 +342,8 @@ class MapApi:
         }
 
     # --- Go to ------------------------------------------------------------
-    def goto_label(self, name: str) -> dict:
+    def goto_label(self, name: str, wall: bool = False, gap: Optional[float] = None) -> dict:
+        """라벨로 Nav2 이동. wall 이면 /api/nav/goto_wall: 도착 뒤 라이다 근접 이동까지 기다린다."""
         labels = self.call("/api/labels").get("labels", [])
         exact = [lb for lb in labels if lb["name"] == name]
         part = exact or [lb for lb in labels if name and name.lower() in lb["name"].lower()]
@@ -349,10 +351,14 @@ class MapApi:
             return {"ok": False, "message": ("그런 라벨이 없다" if not part else "여러 라벨이 맞는다")
                     + f" - 있는 라벨: {[lb['name'] for lb in labels]}"}
         lb = part[0]
-        r = self.call("/api/nav/goto", {"id": lb["id"]})
+        if wall and gap is not None:
+            c = self.call("/api/wall/config", {"gap": float(gap)})
+            if c.get("http") != 200:
+                return {"ok": False, "message": c.get("error", f"HTTP {c.get('http')}")}
+        r = self.call("/api/nav/goto_wall" if wall else "/api/nav/goto", {"id": lb["id"]})
         if r.get("http") != 200:
             return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
-        self.log(f"    >> goto '{lb['name']}' (x {lb['x']:.2f}, y {lb['y']:.2f})")
+        self.log(f"    >> goto{'+wall' if wall else ''} '{lb['name']}' (x {lb['x']:.2f}, y {lb['y']:.2f})")
         t0, nav = time.time(), {}
         while time.time() - t0 < NAV_TIMEOUT:
             time.sleep(1.0)
@@ -368,6 +374,22 @@ class MapApi:
                "message": nav.get("message"), "note": nav.get("note")}
         if (nav.get("target") or {}).get("shift") is not None:   # label blocked -> closest reachable point
             out["stopped_short_m"] = nav["target"]["shift"]
+        if wall and out["ok"]:
+            # 도착 뒤 map_web 이 0.5초 쉬고(벽 못 찾으면 3초까지 재시도) 라이다 근접 이동을 시작한다
+            t1 = time.time()
+            while nav.get("then_state") in (None, "pending") and time.time() - t1 < 6.0:
+                time.sleep(0.5)
+                nav = self.state().get("nav") or {}
+            ts = nav.get("then_state")
+            out["message"] = nav.get("message")
+            if ts == "started":
+                a = self._wait_approach("wall", self.call("/api/wall"), 120.0)
+                out["ok"] = a["ok"]
+                out["wall"] = {k: a.get(k) for k in ("state", "message", "moved_m")}
+            elif ts != "done":            # done = 이미 목표 거리 안 (성공으로 본다)
+                out["ok"] = False
+                if ts is None:
+                    out["message"] = (nav.get("message") or "") + " · 라이다 근접 이동이 시작되지 않았다"
         p = self.state().get("pose")
         if p:
             out["error_m"] = round(math.hypot(p["x"] - lb["x"], p["y"] - lb["y"]), 3)
@@ -506,7 +528,10 @@ class MapApi:
         r = self.call(f"/api/{kind}/start", {})
         if r.get("http") != 200:
             return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
-        t0, a = time.time(), r
+        return self._wait_approach(kind, r, timeout)
+
+    def _wait_approach(self, kind: str, a: dict, timeout: float) -> dict:
+        t0 = time.time()
         while a.get("state") == "running" and time.time() - t0 < timeout:
             time.sleep(0.5)
             a = self.call(f"/api/{kind}")
@@ -528,9 +553,9 @@ class MapApi:
         return self._approach("approach", 90.0)
 
 
-BASE_SKILLS = ("base_state", "goto_label", "save_label", "base_move", "base_turn", "base_stop",
+BASE_SKILLS = ("base_state", "goto_label", "goto_label_wall", "save_label", "base_move", "base_turn", "base_stop",
                "relocalize", "wall_approach", "depth_approach")
-BASE_MOVING = ("goto_label", "base_move", "base_turn", "wall_approach", "depth_approach")
+BASE_MOVING = ("goto_label", "goto_label_wall", "base_move", "base_turn", "wall_approach", "depth_approach")
 
 # 웹 UI 의 '등록된 스킬' 표 (이름, 인자, REST, 설명)
 ARM_SKILL_LIST = [
@@ -547,6 +572,7 @@ ARM_SKILL_LIST = [
 BASE_SKILL_LIST = [
     ("base_state", "", "GET /api/state", "위치·방향, 라벨 목록, Nav2/근접 상태"),
     ("goto_label", "label", "POST /api/nav/goto", "라벨 위치로 Nav2 자율 주행"),
+    ("goto_label_wall", "label, gap", "POST /api/nav/goto_wall", "라벨로 이동한 뒤 정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진"),
     ("save_label", "label", "POST /api/labels", "지금 위치를 라벨로 저장"),
     ("base_move", "meters", "POST /api/drive", "직진/후진 (±1 m, 장애물이면 정지)"),
     ("base_turn", "degrees", "POST /api/drive", "제자리 회전 (±180°, + = 왼쪽)"),
@@ -564,7 +590,7 @@ LOCKED_SKILLS = ("done",)     # 끌 수 없다 - 이게 없으면 지시를 끝�
 
 class SkillCall(BaseModel):
     skill: str = Field(description="get_state | get_rgb | get_depth_at | pick | place "
-                                   "| reset | wait | say | done | base_state | goto_label | save_label "
+                                   "| reset | wait | say | done | base_state | goto_label | goto_label_wall | save_label "
                                    "| base_move | base_turn | base_stop | relocalize "
                                    "| wall_approach | depth_approach 중 하나")
     point: Optional[List[int]] = Field(
@@ -572,10 +598,10 @@ class SkillCall(BaseModel):
         description="[y, x] 순서, 0~1000 정규화. get_depth_at/pick/place 에만 쓴다")
     seconds: Optional[float] = Field(default=None, description="wait 의 대기 시간(초)")
     message: Optional[str] = Field(default=None, description="say/done 에서 사용자에게 할 말")
-    label: Optional[str] = Field(default=None, description="goto_label/save_label 의 라벨 이름")
+    label: Optional[str] = Field(default=None, description="goto_label/goto_label_wall/save_label 의 라벨 이름")
     meters: Optional[float] = Field(default=None, description="base_move 거리 (m, + 전진, - 후진, ±1 이내)")
     degrees: Optional[float] = Field(default=None, description="base_turn 각도 (°, + 왼쪽, ±180 이내)")
-    gap: Optional[float] = Field(default=None, description="wall_approach 에서 차체 앞과 벽 사이 남길 거리 (m)")
+    gap: Optional[float] = Field(default=None, description="wall_approach/goto_label_wall 에서 차체 앞과 벽 사이 남길 거리 (m)")
     global_search: Optional[bool] = Field(default=None, description="relocalize: 지도 전체 검색이면 true")
     speech: Optional[str] = Field(
         default=None,
@@ -626,6 +652,10 @@ BASE_DOC = """
   goto_label(label)    저장된 라벨 위치로 자율 주행 (Nav2). label 은 base_state 의 이름 그대로.
                        reachable 이 false 인 라벨은 그 자리가 막혀 있어서, 가장 가까운 갈 수 있는
                        지점까지 가서 멈춘다 (결과 메시지에 떨어진 거리가 나온다).
+  goto_label_wall(label, gap)
+                       goto_label 로 간 뒤 이어서 wall_approach(gap) 까지 한 번에 한다.
+                       "책상으로 가서 책상 앞에 붙어" 처럼 라벨 앞 작업대/벽에 붙어야 할 때 쓴다
+                       (라벨 방향이 그 벽을 보고 있어야 한다). gap 생략 시 저장된 값.
   save_label(label)    지금 위치를 새 라벨 이름으로 저장 (지도가 있을 때만).
   base_move(meters)    똑바로 직진(+)/후진(-), 한 번에 ±1 m 이내. 앞/뒤에 장애물이 보이면 멈춘다.
   base_turn(degrees)   제자리 회전, + 왼쪽(반시계) / - 오른쪽, ±180° 이내.
@@ -2495,10 +2525,12 @@ class Agent:
             return b.summary()
         if s == "base_stop":
             return b.stop()
-        if s in ("goto_label", "save_label"):
+        if s in ("goto_label", "goto_label_wall", "save_label"):
             if not call.label:
                 return {"ok": False, "message": "label 이 필요하다"}
-            return b.goto_label(call.label) if s == "goto_label" else b.save_label(call.label)
+            if s == "save_label":
+                return b.save_label(call.label)
+            return b.goto_label(call.label, wall=s == "goto_label_wall", gap=call.gap)
         if s == "base_move":
             if call.meters is None:
                 return {"ok": False, "message": "meters 가 필요하다"}

@@ -98,6 +98,7 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | POST | `/api/labels` | 라벨 추가 (현재 위치 또는 지정 좌표) | |
 | POST | `/api/labels/delete` | 라벨 삭제 | |
 | POST | `/api/nav/goto` | 라벨 위치로 Nav2 자율 주행 (목표가 뒤쪽이면 먼저 30 cm 후진) | **예** |
+| POST | `/api/nav/goto_wall` | Go to 후 도착하면 라이다 근접 이동 | **예** |
 | POST | `/api/nav/cancel` | Nav2 목표 취소 | |
 | GET | `/api/nav/tolerance` | 도착 오차 | |
 | POST | `/api/nav/tolerance` | 도착 오차 설정 | |
@@ -328,6 +329,26 @@ curl -X POST http://192.168.0.31:8081/api/nav/goto -d '{"id":"994b2b49"}'
 | `canceled` | 취소됨 (후진 중 취소 포함) |
 | `rejected` | Nav2가 목표를 거부함 |
 | `unavailable` | Nav2가 실행 중이 아님 |
+
+### POST `/api/nav/goto_wall`
+`/api/nav/goto`와 같다. 다만 Nav2가 도착(`succeeded`)하면 이어서 라이다 근접 이동(`/api/wall/start`)을 시작한다.
+라이다 근접 이동은 정면 벽과 수직으로 맞춘 뒤 `gap`까지 전진하는 동작이다.
+라벨 방향을 벽(책상) 쪽으로 저장해 두면 "책상 앞까지 가서 붙기"를 한 번에 할 수 있다.
+
+```bash
+curl -X POST http://192.168.0.31:8081/api/nav/goto_wall -d '{"id":"1b4a6030"}'
+```
+- 요청 본문, 응답, 오류는 `/api/nav/goto`와 같다.
+- 웹 UI: 라벨을 선택한 뒤 **Go to + 벽 근접** 버튼을 누른다.
+- 도착하고 0.5초 기다린 뒤 근접 이동을 시작한다. 멈춘 상태에서 찍힌 스캔을 쓰기 위해서다.
+  - 정면에 벽이 안 잡히면 3초 동안 다시 시도한 뒤 포기한다.
+  - Go to가 `succeeded`가 아니면(실패, 취소, 도착 오판) 근접 이동은 하지 않는다.
+- 진행 상황은 `/api/state`의 `nav`와 `wall`에서 확인한다.
+  - `nav.then` = `"wall"`
+  - `nav.then_state`: `pending`(도착, 시작 대기) → `started`(근접 이동 시작), `failed`(벽 못 찾음 등), `done`(이미 목표 거리 안)
+  - 이후 진행과 결과는 `wall.state`에 나온다.
+- 대기 중(0.5~3.5초)에 `/api/nav/cancel`, `/api/drive`, `/api/drive/stop`을 보내면 근접 이동을 시작하지 않는다.
+  근접 이동이 시작된 뒤에는 `/api/wall/stop`이나 `/api/drive/stop`으로 멈춘다.
 
 ### POST `/api/nav/cancel`
 진행 중인 Go to를 취소한다. → `{"ok": true}` (진행 중인 목표가 없어도 같은 응답).
