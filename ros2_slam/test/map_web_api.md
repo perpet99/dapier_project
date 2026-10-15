@@ -99,6 +99,7 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | POST | `/api/labels` | 라벨 추가 (현재 위치 또는 지정 좌표) | |
 | POST | `/api/labels/delete` | 라벨 삭제 | |
 | POST | `/api/labels/rename` | 라벨 이름 변경 | |
+| POST | `/api/labels/tolerance` | 라벨별 도착 오차 설정/해제 | |
 | POST | `/api/nav/goto` | 라벨 위치로 Nav2 자율 주행 (목표가 뒤쪽이면 먼저 30 cm 후진) | **예** |
 | POST | `/api/nav/goto_wall` | Go to 후 도착하면 라이다 근접 이동 | **예** |
 | POST | `/api/nav/cancel` | Nav2 목표 취소 | |
@@ -305,6 +306,25 @@ curl -X POST http://192.168.0.31:8081/api/labels -d '{"name":"문 앞","x":1.2,"
 | 400 | 빈 이름, 40자 초과, 이미 있는 이름 |
 | 404 | 없는 라벨 |
 | 500 | 라벨 파일 저장 실패 |
+
+### POST `/api/labels/tolerance`
+라벨마다 도착 오차를 따로 정한다. 그 라벨로 Go to(`/api/nav/goto`, `/api/nav/goto_wall`)를 하는 동안에만 Nav2 goal checker에 이 값을 쓴다.
+정하지 않은 라벨은 `/api/nav/tolerance`의 기본값을 쓴다.
+```bash
+curl -X POST http://192.168.0.31:8081/api/labels/tolerance -d '{"id":"1b4a6030","xy":0.05,"yaw_deg":10}'   # 설정
+curl -X POST http://192.168.0.31:8081/api/labels/tolerance -d '{"id":"1b4a6030"}'                         # 해제 (기본값 사용)
+```
+- 응답은 바뀐 라벨이다. 설정한 라벨에는 `"tol": {"xy": 0.05, "yaw_deg": 10.0}`가 붙는다. 이 값은 `/api/labels`, `/api/state`, `/api/get_map_info`의 라벨에도 나온다.
+- 범위는 기본값과 같다 (`limits`).
+- 범위 밖이거나 `xy`, `yaw_deg` 중 하나만 주면 400, 없는 라벨이면 404.
+- **적용 시점:**
+  - Go to가 목표를 보낼 때 적용한다. 후진 단계가 있으면 후진이 끝난 뒤다. 약 0.2초 안에 Nav2에 들어간다.
+  - 목표가 끝나면(도착, 실패, 취소, 거부) 기본값으로 돌아간다.
+  - 적용 중에는 `/api/state`의 `tolerance.override`에 `{"xy", "yaw_deg", "label"}`이 나온다.
+- 웹 UI 사용법:
+  - 라벨을 선택하고 **도착 오차** 줄에서 값을 맞춘 뒤 **'라벨'에 저장**을 누른다. **라벨 값 지우기**를 누르면 기본값으로 돌아간다.
+  - 라벨 목록의 "도착 오차" 열에 값이나 "기본"이 보인다.
+  - 값이 있는 라벨을 선택하면 그 값이 입력칸에 채워진다.
 
 ### POST `/api/nav/goto`
 `{"id": "994b2b49"}` 라벨의 위치·방향으로 Nav2 `navigate_to_pose` 목표를 보낸다(RViz "Nav2 Goal"과 같음).
