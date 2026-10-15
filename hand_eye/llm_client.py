@@ -52,7 +52,7 @@ gemini-3.5-transcribe-live)로 실시간 받아 적어 중간 결과를 입력�
 녹음이 끝나면 확정 문장이 곧바로 나온다 (말 끝나고 3초 무음 뒤 멈추므로 그 사이 확정된다).
 Live 를 못 쓰면 쌓아 둔 음성을 --stt-model(기본 gemini-3.5-flash-lite)로 한 번에 받아 적는다.
 
-음성 답변: 지시를 받으면 무엇을 할지, 끝나면 결과를 짧은 한 문장으로 소리 내 알려 준다.
+음성 답변: 지시를 받으면 무엇을 할지, 스킬마다 지금 할 행동을, 끝나면 결과를 짧은 한 문장으로 소리 내 알려 준다.
 모델이 스킬 JSON 의 speech 에 쓴 문장을 서버가 --tts-model(기본 gemini-3.8-flash-lite-tts)
 로 음성으로 만들고, 웹 UI 가 차례로 재생한다 ('🔊 음성 답변 듣기' 로 끄고 켠다). TTS 가 안
 되면 브라우저 내장 음성(ko-KR)으로 읽는다. --cli 에서는 글로 찍는다. 마이크는 브라우저 규칙상 https 또는 localhost(127.0.0.1) 에서만 열린다.
@@ -64,8 +64,8 @@ Live 를 못 쓰면 쌓아 둔 음성을 --stt-model(기본 gemini-3.5-flash-lit
 단계마다 시각 / 걸린 시간 / 프롬프트·응답 원문을 남긴다. 웹 UI 의 '처리 단계 로그'
 에서 진행 중인 단계를 보고, 전부는 hand_eye/llm_trace.jsonl 에 쌓인다 (5 MB 넘으면 .1 로).
 
-pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고, **실패했을 때만**
-다시 할지 묻는다(--auto 를 주면 그것도 묻지 않고 그냥 넘어간다).
+pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고, 실패하면 묻지 않고
+최대 MAX_RETRY 번까지 바로 다시 해 본다.
 
 사용:
   hand_eye/.env 에 GEMINI_API_KEY=... 한 줄 (hand_eye/.env.example 참고)
@@ -73,7 +73,6 @@ pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고,
   python hand_eye/llm_client.py                      # 웹 UI 로 지시
   python hand_eye/llm_client.py "주황색 통을 상자에 넣어"   # 첫 지시만 미리 주기
   python hand_eye/llm_client.py --cli                # 터미널로 지시
-  python hand_eye/llm_client.py --auto "책상 위 물건 하나만 집어봐"   # 재시도도 안 묻기
   python hand_eye/llm_client.py --api http://192.168.0.10:8765 "..."
   python hand_eye/llm_client.py --map-api http://192.168.0.31:8081 "책상으로 가서 컵을 집어"
   python hand_eye/llm_client.py --no-base            # 이동 로봇 스킬 없이 팔만
@@ -84,6 +83,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import math
@@ -171,7 +171,6 @@ SEND_WIDTH = 800          # 모델에 보낼 이미지 폭. 토큰을 아끼되 
 MAX_STEPS = 12            # 한 지시당 스킬 호출 상한 (무한루프 방지)
 MAX_RETRY = 3             # pick/place 가 실패했을 때 다시 해볼 최대 횟수
 WEB_PORT = 8770           # 웹 입력 UI 포트 (test4 의 REST 8765 와 다른 포트다)
-ASK_TIMEOUT = 300.0       # 재시도 질문에 답이 없으면 이 시간 뒤 '아니오' 로 본다
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +652,7 @@ class SkillCall(BaseModel):
     speech: Optional[str] = Field(
         default=None,
         description="사용자에게 소리로 들려줄 아주 짧은 한국어 한 문장 (30자 안팎). "
-                    "첫 스킬에서는 무엇을 할지, done 에서는 결과를 말한다. 다른 단계에서는 비운다")
+                    "매 스킬마다 지금 할 행동을 말한다 (첫 스킬은 전체적으로 무엇을 할지, done 은 결과)")
     plan: Optional[List[str]] = Field(
         default=None,
         description="첫 스킬에서 지도 정보와 화면을 보고 세운 전체 실행 계획 (단계마다 짧은 한 문장, "
@@ -689,7 +688,7 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
   - 집을 물체의 '가운데 윗면' 을 가리켜라. 가장자리는 깊이가 튄다.
   - pick 은 손이 비었을 때만, place 는 물체를 물고 있을 때만 된다.
     확실하지 않으면 get_state 를 먼저 불러라.
-  - pick/place 는 확인 없이 바로 실행된다. 실패하면 클라이언트가 사용자에게 물어
+  - pick/place 는 확인 없이 바로 실행된다. 실패하면 클라이언트가 묻지 않고
     최대 3번까지 스스로 다시 해 본다. 그래도 ok 가 false 로 오면 그 지점은 이미
     포기한 것이다 - 같은 지점을 다시 부르지 말고, 다른 지점을 고르거나 done 을
     불러 message 에 이유를 적어라.
@@ -702,9 +701,31 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
     이렇게 3번 다시 해도 못 잡으면 done 을 불러 못 잡았다고 알린다.
   - 한 번에 스킬 하나만 낸다. 결과를 보고 다음을 정한다.
   - 할 일이 없거나 사용자의 지시가 끝나면 done 을 불러라.
-  - speech 는 사용자에게 소리로 들려준다. 지시를 받은 첫 스킬에서 무엇을 할지,
-    done 에서 결과를 각각 짧은 한 문장(30자 안팎, 존댓말)으로 쓴다. 좌표나 스킬 이름은
-    말하지 말고, 그 밖의 단계에서는 비워라."""
+  - speech 는 사용자에게 소리로 들려준다. 스킬을 낼 때마다 지금 할 행동을 짧은 한
+    문장(20자 안팎, 존댓말)으로 꼭 쓴다 (예: "컵을 집을게요", "왼쪽 위로 옮겨 다시 잡아볼게요",
+    "책상으로 이동할게요"). 첫 스킬은 지시 전체로 무엇을 할지, done 은 결과를 말한다.
+    좌표나 스킬 이름은 말하지 말고, 바로 앞에서 한 말을 그대로 되풀이하지 마라."""
+
+# 모델이 speech 를 비웠을 때 대신 들려줄 말
+SKILL_SPEECH = {
+    "get_state": "상태를 확인할게요.",
+    "get_rgb": "화면을 다시 볼게요.",
+    "get_depth_at": "위치를 확인할게요.",
+    "pick": "물건을 집을게요.",
+    "place": "내려놓을게요.",
+    "reset": "상태를 초기화할게요.",
+    "wait": "잠시 기다릴게요.",
+    "base_state": "위치를 확인할게요.",
+    "goto_label_wall": "이동할게요.",
+    "goto_label": "이동할게요.",
+    "save_label": "이 위치를 저장할게요.",
+    "base_move": "조금 움직일게요.",
+    "base_turn": "방향을 돌릴게요.",
+    "base_stop": "멈출게요.",
+    "relocalize": "위치를 다시 잡을게요.",
+    "wall_approach": "작업대에 붙을게요.",
+    "depth_approach": "앞으로 다가갈게요.",
+}
 
 BASE_DOC = """
 팔은 이동 로봇(car2) 위에 있다. 로봇 몸체를 움직이는 스킬 (끝날 때까지 기다렸다가 결과를 준다):
@@ -815,75 +836,129 @@ def usage_tokens(res) -> Optional[int]:
     return None
 
 
+def key_id(api_key: str) -> str:
+    """키를 파일에 남기지 않고 구분하는 짧은 지문."""
+    return hashlib.sha256(api_key.encode()).hexdigest()[:12]
+
+
+def key_label(api_key: str) -> str:
+    """사람이 알아볼 키 이름: .env 에서 같은 값을 가진 변수 이름 + 끝 4자리."""
+    names = []
+    try:
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                name, sep, value = line.strip().partition("=")
+                if sep and value.strip().strip("'\"") == api_key:
+                    names.append(name.strip())
+    except OSError:
+        pass
+    if not names and os.environ.get("GEMINI_API_KEY", "").strip() == api_key:
+        names.append("$GEMINI_API_KEY")
+    # GEMINI_API_KEY 에 다른 이름의 키를 복사해 쓰는 경우가 많아 원래 이름을 앞에 둔다
+    names.sort(key=lambda n: n == "GEMINI_API_KEY")
+    return (names[0] if names else "키") + " …" + api_key[-4:]
+
+
 class Usage:
-    """모델별 오늘(태평양 시간 기준) 요청 횟수와 토큰. USAGE_PATH 에 남겨 재시작해도 이어 센다."""
+    """API 키별·모델별 오늘(태평양 시간 기준) 요청 횟수와 토큰.
+
+    할당량은 키(프로젝트)마다 따로라서 키를 바꾸면 그 키의 횟수로 센다. USAGE_PATH 에
+    남겨 재시작해도 이어 센다 - 키 값은 남기지 않고 지문(key_id)과 끝 4자리만 남긴다.
+    """
 
     def __init__(self, path: str = USAGE_PATH):
         self.path = path
         self.lock = threading.Lock()
-        self.day = ""
-        self.models: dict = {}       # model -> {"count", "tokens", "exhausted"}
-        self.limits: dict = {}       # 429 에서 알아낸 하루 한도 (날이 바뀌어도 유지)
+        self.keys: dict = {}         # key_id -> {"label", "day", "models", "limits"}
+        self.cur = ""                # 지금 쓰는 키의 key_id
         try:
             with open(path, encoding="utf-8") as f:
                 d = json.load(f)
-            self.day = d.get("day", "")
-            self.models = d.get("models", {})
-            self.limits = d.get("limits", {})
+            self.keys = d.get("keys", {})
+            if "models" in d:            # 키별로 나누기 전 형식 - 처음 쓰는 키의 것으로 본다
+                self._legacy = {"label": "", "day": d.get("day", ""), "models": d["models"],
+                                "limits": d.get("limits", {})}
         except (OSError, ValueError):
             pass
-        self._roll()
+
+    _legacy: Optional[dict] = None
+
+    def set_key(self, api_key: str) -> None:
+        with self.lock:
+            self.cur = key_id(api_key)
+            if self._legacy is not None and self.cur not in self.keys:
+                self.keys[self.cur] = self._legacy
+            self._legacy = None
+            k = self.keys.setdefault(self.cur, {"label": "", "day": "", "models": {}, "limits": {}})
+            k["label"] = key_label(api_key)       # .env 이름이 바뀌었을 수 있어 매번 새로
+            self._save()
 
     @staticmethod
     def _today() -> str:
         import datetime
         return datetime.datetime.now(QUOTA_TZ).strftime("%Y-%m-%d")
 
-    def _roll(self) -> None:
-        """날이 바뀌었으면 횟수를 0 으로."""
+    def _key(self, kid: Optional[str] = None) -> dict:
+        """그 키의 기록. 날이 바뀌었으면 횟수를 0 으로 (한도는 유지)."""
+        k = self.keys.setdefault(kid or self.cur, {"label": "?", "day": "", "models": {}, "limits": {}})
         today = self._today()
-        if today != self.day:
-            self.day, self.models = today, {}
+        if k["day"] != today:
+            k["day"], k["models"] = today, {}
+        return k
 
     def _save(self) -> None:
         try:
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump({"day": self.day, "models": self.models, "limits": self.limits}, f, indent=1)
+                json.dump({"keys": self.keys}, f, indent=1, ensure_ascii=False)
         except OSError:
             pass
 
     def add(self, model: str, tokens: Optional[int] = None) -> None:
         with self.lock:
-            self._roll()
-            m = self.models.setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})
+            m = self._key()["models"].setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})
             m["count"] += 1
             m["tokens"] += tokens or 0
             m["exhausted"] = False
             self._save()
 
     def exhausted(self, model: str, limit: Optional[int]) -> None:
-        """일일 할당량 429 - 오늘은 남은 게 없다."""
+        """일일 할당량 429 - 이 키로는 오늘 남은 게 없다."""
         with self.lock:
-            self._roll()
+            k = self._key()
             if limit:
-                self.limits[model] = limit
-            self.models.setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})["exhausted"] = True
+                k["limits"][model] = limit
+            k["models"].setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})["exhausted"] = True
             self._save()
 
+    def _rows(self, k: dict, all_limits: bool) -> list:
+        rows = []
+        names = set(k["models"]) | (set(DAILY_LIMITS) if all_limits else set())
+        for model in sorted(names):
+            m = k["models"].get(model, {"count": 0, "tokens": 0, "exhausted": False})
+            limit = k["limits"].get(model) or DAILY_LIMITS.get(model)
+            left = 0 if m["exhausted"] else (max(0, limit - m["count"]) if limit else None)
+            rows.append({"model": model, "used": m["count"], "tokens": m["tokens"],
+                         "limit": limit, "left": left, "exhausted": m["exhausted"]})
+        return rows
+
     def summary(self) -> dict:
+        """지금 키는 모델별 자세히, 다른 키는 오늘 쓴 것이 있으면 요약."""
         import datetime
         with self.lock:
-            self._roll()
-            rows = []
-            for model in sorted(set(self.models) | set(DAILY_LIMITS)):
-                m = self.models.get(model, {"count": 0, "tokens": 0, "exhausted": False})
-                limit = self.limits.get(model) or DAILY_LIMITS.get(model)
-                left = 0 if m["exhausted"] else (max(0, limit - m["count"]) if limit else None)
-                rows.append({"model": model, "used": m["count"], "tokens": m["tokens"],
-                             "limit": limit, "left": left, "exhausted": m["exhausted"]})
+            cur = self._key() if self.cur else None
+            others = []
+            for kid in list(self.keys):
+                if kid == self.cur:
+                    continue
+                k = self._key(kid)
+                if k["models"]:
+                    others.append({"key": k["label"], "models": self._rows(k, False)})
+            out = {"key": cur["label"] if cur else None, "day": self._today(),
+                   "models": self._rows(cur, True) if cur else [], "others": others}
         now = datetime.datetime.now(QUOTA_TZ)
         reset = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return {"day": self.day, "reset_at": reset.timestamp(), "models": rows}
+        out["reset_at"] = reset.timestamp()
+        return out
 
 
 def quota_retry_s(e: BaseException) -> Optional[float]:
@@ -928,7 +1003,8 @@ class Vlm:
         # 다시 쓸 수 있는 시각(until)이 지나면 빠진다. 웹 UI 가 경고로 보여 준다.
         self.quota: dict = {}
         self.quota_lock = threading.Lock()
-        self.usage = Usage()                  # 모델별 오늘 사용 횟수 (웹 UI 의 '남은 사용량')
+        self.usage = Usage()                  # 키별·모델별 오늘 사용 횟수 (웹 UI 의 '남은 사용량')
+        self.usage.set_key(api_key)
 
     def quota_list(self) -> List[dict]:
         now = time.time()
@@ -950,6 +1026,9 @@ class Vlm:
     def reload_key(self, api_key: str) -> None:
         """.env 를 고친 뒤 Gemini 재연결 - 프로세스를 다시 띄우지 않고 새 키로 바꾼다."""
         self._make_client(api_key)
+        self.usage.set_key(api_key)           # 사용량은 키마다 따로 센다
+        with self.quota_lock:
+            self.quota.clear()                # 소진 경고도 이전 키의 것이다
 
     def check(self) -> None:
         """키와 모델 접근 권한만 확인한다 (모델 정보 조회 - 토큰을 쓰지 않는다). 실패하면 예외."""
@@ -1327,14 +1406,6 @@ class ConsoleUi:
             print()
             return None
 
-    def ask(self, question: str) -> bool:
-        try:
-            ans = input(f"    >> {question} (Y/n) ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-        return ans in ("", "y", "yes", "예")
-
     def close(self) -> None:
         pass
 
@@ -1358,9 +1429,6 @@ PAGE = """<!doctype html>
   pre { background: #0e1013; border: 1px solid #262a30; border-radius: 8px;
         padding: 10px; height: 420px; overflow: auto; white-space: pre-wrap;
         word-break: break-all; margin: 0; font-size: 12.5px; }
-  .ask { background: #3a2d18; border: 1px solid #7a5c22; border-radius: 8px;
-         padding: 12px; margin-bottom: 10px; }
-  .ask div { margin-bottom: 8px; }
   form { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
   input { flex: 1 1 320px; padding: 10px 12px; border-radius: 8px;
           border: 1px solid #333a44; background: #0e1013; color: #e6e6e6; font-size: 15px; }
@@ -1376,6 +1444,7 @@ PAGE = """<!doctype html>
            color: #8b939c; margin: 0 0 12px; }
   .usage .u { white-space: nowrap; }
   .usage .u b { color: #e6e6e6; font-weight: 600; }
+  .usage .uo { flex-basis: 100%; font-size: 12px; }
   .usage .ok { color: #7bd88f; } .usage .low { color: #ffb74d; } .usage .out { color: #ff8a80; }
   button.estop:active { background: #8e0000; }
   .hint { color: #8b939c; font-size: 12.5px; margin-top: 8px; }
@@ -1464,11 +1533,6 @@ PAGE = """<!doctype html>
   <div class="row">
     <img id="view" src="/view.jpg?v=0" alt="현재 화면">
     <div class="side">
-      <div id="ask" class="ask" hidden>
-        <div id="askText"></div>
-        <button onclick="answer('y')">예, 다시 해봐</button>
-        <button class="no" onclick="answer('n')">아니오</button>
-      </div>
       <pre id="log"></pre>
     </div>
   </div>
@@ -1520,7 +1584,7 @@ PAGE = """<!doctype html>
   </details>
 </div>
 <script>
-let since = 0, viewSeq = -1, asking = 0, tsince = 0, ssince = -1;
+let since = 0, viewSeq = -1, tsince = 0, ssince = -1;
 const $ = function (id) { return document.getElementById(id); };
 
 async function poll() {
@@ -1545,14 +1609,6 @@ async function poll() {
     renderUsage(d.usage, d.now);
     $('status').textContent = d.status || '';
     $('status').hidden = !d.status;
-    if (d.ask) {
-      asking = d.ask.id;
-      $('askText').textContent = d.ask.text;
-      $('ask').hidden = false;
-    } else {
-      asking = 0;
-      $('ask').hidden = true;
-    }
   } catch (e) {
     $('state').textContent = '연결 끊김';
   }
@@ -1666,12 +1722,12 @@ function renderQuota(list, now) {
 // 모델 사용량: 오늘 이 프로그램이 부른 횟수와 하루 한도에서 남은 양 (태평양 시간 자정 초기화)
 function renderUsage(u, now) {
   const el = $('usage');
-  el.hidden = !u || !u.models.length;
+  el.hidden = !u || (!u.models.length && !(u.others || []).length);
   if (el.hidden) return;
   const left = Math.max(0, u.reset_at - now);
   const reset = Math.floor(left / 3600) + '시간 ' + Math.ceil(left % 3600 / 60) + '분 뒤 초기화';
   el.innerHTML = '<span title="Gemini API 는 남은 양을 알려주지 않는다 - 이 프로그램이 센 횟수를 하루 한도에서 뺀 값">'
-    + '모델 사용량 (오늘)</span>'
+    + '모델 사용량 (오늘, <b>' + esc(u.key || '-') + '</b>)</span>'
     + u.models.map(function (m) {
         let cls = 'ok', txt;
         if (m.limit) {
@@ -1686,7 +1742,12 @@ function renderUsage(u, now) {
              + (m.limit ? ' <small>(' + m.used + '회 사용' + tok + ')</small>' : (tok ? ' <small>' + tok + '</small>' : ''))
              + '</span>';
       }).join('')
-    + '<span><small>' + reset + '</small></span>';
+    + '<span><small>' + reset + '</small></span>'
+    + (u.others && u.others.length ? '<div class="uo">다른 키: ' + u.others.map(function (k) {
+        return esc(k.key) + ' ' + k.models.map(function (m) {
+          return esc(m.model) + ' ' + m.used + (m.limit ? '/' + m.limit : '') + '회' + (m.exhausted ? ' 소진' : '');
+        }).join(', ');
+      }).join(' · ') + '</div>' : '');
 }
 
 function renderConns(list) {
@@ -1709,11 +1770,6 @@ function renderConns(list) {
       box.appendChild(why);
     }
   });
-}
-
-function answer(v) {
-  fetch('/answer?id=' + asking + '&v=' + v);
-  $('ask').hidden = true;
 }
 
 function esc(s) {
@@ -2202,9 +2258,6 @@ def _make_handler(ui: "WebUi"):
                 ui.mark_waiting(target)
                 ui.put_order(f"{RECONNECT}:{target}")
                 self._json({"ok": True, "target": target})
-            elif u.path == "/answer":
-                ok = ui.answer(self._int(q, "id"), q.get("v", ["n"])[0] == "y")
-                self._json({"ok": ok})
             else:
                 self._send(404, "text/plain; charset=utf-8",
                            "없는 주소".encode("utf-8"))
@@ -2327,10 +2380,6 @@ class WebUi:
         self.view_bytes: bytes = b""
         self.view_seq = 0
         self.status_text = ""
-        self.pending: Optional[dict] = None
-        self._ask_id = 0
-        self._answer = False
-        self._answered = threading.Event()
         self.state_fn = state_fn
         self._state: dict = {}
         self._state_at = 0.0
@@ -2417,7 +2466,6 @@ class WebUi:
                 "text": "".join(line + "\n" for line in self.lines[since:]),
                 "view": self.view_seq,
                 "status": self.status_text,
-                "ask": dict(self.pending) if self.pending else None,
                 "trace": trace,
                 "treset": reset,
                 "tseq": trace[-1]["seq"] if trace else (0 if reset else tsince),
@@ -2605,11 +2653,6 @@ class WebUi:
             self.orders.put(item)
         for text, job in dropped:
             TRACE.add(job, "긴급 정지로 취소", text, level="warn", end=True)
-        with self.lock:
-            asking = self.pending is not None
-            if asking:                       # 재시도 질문에 '아니오'
-                self._answer = False
-                self._answered.set()
         err = ""
         if self.estop_fn is not None:
             try:
@@ -2638,28 +2681,6 @@ class WebUi:
         except KeyboardInterrupt:
             return None
 
-    def ask(self, question: str) -> bool:
-        self._answered.clear()
-        with self.lock:
-            self._ask_id += 1
-            self.pending = {"id": self._ask_id, "text": question}
-        self.log(f"    ?? {question}  -> 웹에서 [예/아니오]")
-        got = self._answered.wait(ASK_TIMEOUT)
-        with self.lock:
-            self.pending = None
-            ans = self._answer if got else False
-        self.log("    -> " + ("예" if ans else
-                              ("아니오" if got else "답이 없어 아니오로 본다")))
-        return ans
-
-    def answer(self, ask_id: int, yes: bool) -> bool:
-        with self.lock:
-            if not self.pending or self.pending["id"] != ask_id:
-                return False
-            self._answer = yes
-        self._answered.set()
-        return True
-
     def close(self) -> None:
         try:
             for srv in self.servers:
@@ -2674,8 +2695,8 @@ class WebUi:
 # ---------------------------------------------------------------------------
 
 class Agent:
-    def __init__(self, api: Api, vlm: Vlm, ui, auto: bool = False, base: Optional[MapApi] = None):
-        self.api, self.vlm, self.ui, self.auto, self.base = api, vlm, ui, auto, base
+    def __init__(self, api: Api, vlm: Vlm, ui, base: Optional[MapApi] = None):
+        self.api, self.vlm, self.ui, self.base = api, vlm, ui, base
         self.frame: Optional[np.ndarray] = None
         self.job: Optional[str] = None       # 지금 처리 중인 일의 처리 단계 로그 id (O3, B1 ...)
         self.disabled: set[str] = self._load_disabled()   # 웹 UI 에서 끈 스킬 (재시작해도 유지)
@@ -2864,7 +2885,7 @@ class Agent:
         return {"ok": False, "message": f"모르는 스킬: {s}"}
 
     def act(self, action: str, x: int, y: int) -> dict:
-        """팔을 움직인다. 확인 없이 바로 하고, 실패했을 때만 다시 할지 묻는다."""
+        """팔을 움직인다. 확인 없이 바로 하고, 실패하면 묻지 않고 MAX_RETRY 번까지 다시 한다."""
         out: dict = {}
         for attempt in range(1, MAX_RETRY + 1):
             self.ui.set_status(f"{action} 실행 중")
@@ -2889,24 +2910,13 @@ class Agent:
                 why = out.get("message") or out.get("error") or f"HTTP {out.get('http')}"
             self.ui.log(f"    !! {action} 실패: {why}")
             TRACE.add(self.job, f"{action} 실패", f"({x},{y}) {attempt}번째 시도: {why}", level="warn")
-            if attempt >= MAX_RETRY or not self.ask_retry(action, x, y, why):
+            if attempt >= MAX_RETRY or ESTOP.is_set():
                 break
+            time.sleep(1.0)
         out["ok"] = False
         out["message"] = why
         out["tries"] = attempt
         return out
-
-    def ask_retry(self, action: str, x: int, y: int, why: str) -> bool:
-        """실패했을 때만 묻는다. --auto 면 묻지 않고 모델에게 실패를 알린다."""
-        if self.auto:
-            return False
-        self.ui.set_status(f"{action} 실패 - 다시 할지 기다리는 중")
-        TRACE.add(self.job, "재시도 질문", "사용자의 예/아니오를 기다린다")
-        t0 = time.perf_counter()
-        yes = self.ui.ask(f"{action}({x},{y}) 실패: {why} / 다시 할까요?")
-        TRACE.add(self.job, "재시도 답", "예 - 다시 한다" if yes else "아니오",
-                  ms=(time.perf_counter() - t0) * 1000)
-        return yes
 
     def wait_idle(self, timeout: float) -> dict:
         """동작이 끝날 때까지 상태를 지켜본다."""
@@ -2953,6 +2963,7 @@ class Agent:
     def _follow(self, order: str, job: str, t0: float) -> None:
         history: list[str] = []
         plan: list[str] = []
+        last_said = ""                       # 바로 앞에서 들려준 말 (같은 말 반복 방지)
         for step in range(1, MAX_STEPS + 1):
             if ESTOP.is_set():
                 self._estopped(job, t0)
@@ -2975,7 +2986,7 @@ class Agent:
                    + ("지도 정보와 화면을 보고 지시를 끝낼 전체 실행 계획을 plan 에 단계별로 써라.\n"
                       if self.base else "")
                    if step == 1 else "")
-                + "done 을 부른다면 speech 에 결과를 짧은 한 문장으로 꼭 써라.\n"
+                + "speech 에 지금 할 행동을 짧은 한 문장으로 꼭 써라 (done 이면 결과).\n"
                 + "다음에 부를 스킬 하나를 JSON 으로 내라."
             )
             TRACE.add(job, f"{step}단계 판단", f"로봇 상태 {state.get('state')} ({state.get('label')})"
@@ -3008,14 +3019,17 @@ class Agent:
                 self.ui.log(f"      말: {call.message}")
             TRACE.add(job, f"{step}단계 스킬 선택", f"{call.skill}{arg} - {call.reason}"
                       + (f" / 말: {call.message}" if call.message else ""))
-            # 음성 답변: 첫 스킬에서 할 일, say 의 말, done 에서 결과 - 한 문장씩만
+            # 음성 답변: 스킬마다 지금 할 행동을 한 문장씩. say 는 그 말, done 은 결과.
             # (모델이 speech 를 비우기도 해서 비었을 때 할 말을 정해 둔다)
             if call.skill == "done":
                 self.speak(call.speech or call.message or call.reason, job)
             elif call.skill == "say":
                 self.speak(call.message or call.speech, job)
-            elif step == 1:
-                self.speak(call.speech or "네, 시작할게요.", job)
+            else:
+                said = call.speech or ("네, 시작할게요." if step == 1 else SKILL_SPEECH.get(call.skill))
+                if said and said != last_said:     # 같은 말을 연달아 하지 않는다
+                    self.speak(said, job)
+                    last_said = said
 
             if ESTOP.is_set():                # 모델이 답하는 동안 눌렸으면 스킬을 실행하지 않는다
                 self._estopped(job, t0)
@@ -3266,7 +3280,7 @@ def main() -> None:
     ap.add_argument("order", nargs="*", help="첫 지시 (없으면 웹/터미널에서 받는다)")
     ap.add_argument("--api", default=DEFAULT_API, help=f"REST 주소 (기본 {DEFAULT_API})")
     ap.add_argument("--auto", action="store_true",
-                    help="실패해도 다시 할지 묻지 않는다 (기본은 실패 때만 묻는다)")
+                    help="(예전 옵션 - 이제 재시도는 언제나 묻지 않고 한다. 받기만 하고 무시)")
     ap.add_argument("--cli", action="store_true", help="웹 대신 터미널로 지시를 받는다")
     ap.add_argument("--port", type=int, default=WEB_PORT,
                     help=f"웹 입력 UI 포트 (기본 {WEB_PORT})")
@@ -3324,7 +3338,7 @@ def main() -> None:
     vlm = Vlm(key, ui.log, stt_model=args.stt_model,
               live_model=None if args.live_model.lower() in ("", "none", "off") else args.live_model,
               tts_model=None if args.tts_model.lower() in ("", "none", "off") else args.tts_model)
-    agent = Agent(api, vlm, ui, auto=args.auto)       # 이동 로봇은 Links 가 연결되면 붙인다
+    agent = Agent(api, vlm, ui)       # 이동 로봇은 Links 가 연결되면 붙인다
     links = Links(agent, api, ui, args.map_api, use_base=not args.no_base)
     if isinstance(ui, WebUi):
         ui.toggle_fn = agent.set_skills
