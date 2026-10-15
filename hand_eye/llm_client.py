@@ -657,10 +657,13 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
                        waiting_pick(잡기 기다림) picking(잡는중)
                        waiting_place(놓기 기다림) placing(놓는중)
                        homing busy calibrating not_calibrated
+                       pick_failed(잡기 실패 - 그리퍼 부하로 보니 빈손. 다시 pick 하면 된다)
   get_rgb              카메라 영상을 새로 본다 (물체가 움직였거나 결과를 확인할 때)
   get_depth_at(point)  그 점의 깊이와 로봇좌표, 집기 가능 여부를 미리 확인한다.
                        팔은 움직이지 않는다. pick 전에 확인하는 습관이 좋다.
-  pick(point)          그 점의 물체를 집는다. waiting_pick 상태에서만 된다.
+  pick(point)          그 점의 물체를 집는다. waiting_pick / pick_failed / waiting_place 에서 된다
+                       (waiting_place 에서 하면 들고 있던 물체는 홈 자리에서 놓친다).
+                       끝나면 get_state 로 waiting_place(성공) 인지 pick_failed 인지 확인한다.
   place(point)         그 점에 내려놓는다. waiting_place 상태에서만 된다.
   reset                상태를 기본(waiting_pick, 손 빔)으로 강제로 되돌린다. 팔은 움직이지
                        않고 그리퍼도 열지 않는다. 상태가 실제와 어긋나 pick/place 가 계속

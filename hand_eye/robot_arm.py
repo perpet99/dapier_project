@@ -37,7 +37,7 @@ robot_arm.py - Depth 기반 클릭 Pick & Place (SO-101)
 웹 UI / 원격 제어 (같은 HTTP 서버, 기본 0.0.0.0:8765 - 같은 네트워크에서 접속 가능):
   GET /            브라우저용 조작 페이지 (스트림 + 클릭 + 키보드)
   GET /stream      MJPEG 영상 스트림 (?fps=15&q=80, 기본값은 PICK_STREAM_FPS/QUALITY)
-  GET|POST /click  x,y       화면 클릭과 동일 (pick/place/캘리브 점/버튼 히트테스트)
+  GET|POST /click  x,y[,ctrl=1] 화면 클릭과 동일 (ctrl=1 pick, 아니면 place / 캘리브 점 / 버튼)
   GET|POST /hover  x,y       마우스 이동(호버 좌표 표시)
   GET|POST /key    code      키보드 단축키 1개 전달 (q,h,o,c,r,d,w,k,t,s)
   GET|POST /pick   x,y       GET|POST /place  x,y      GET /status
@@ -148,6 +148,12 @@ GRASP_SINK = 0.012   # 표면에서 얼마나 더 내려가 잡을지
 LIFT_H = 0.08        # 파지 후 들어올리고 싶은 높이
 PLACE_CLEAR = 0.050  # 놓을 때 표면에서 띄울 높이 - 여기서 그리퍼를 연다
 
+# pick 성공 판정: 파지 후 그리퍼 서보 부하(0~1000)가 이 값 이상이면 물체를 문 것으로 본다.
+# 빈손으로 닫으면 손가락이 끝까지 가서 멈추므로 부하가 거의 0 이다.
+# 물체마다 다르므로 로그의 '[pick] 그리퍼 부하' 값을 보고 pick_settings.json 의
+# grip_load_min 으로 맞춘다.
+GRIP_LOAD_MIN = int(_read_pick_settings().get("grip_load_min", 150))
+
 # GRASP_SINK 는 웹 UI 에서 바꿀 수 있고, 바꾸면 pick_settings.json 에 바로 저장된다.
 GRASP_SINK_MIN, GRASP_SINK_MAX = -0.020, 0.100   # 허용 범위 [m] (음수 = 표면 위에서 멈춤)
 
@@ -181,6 +187,38 @@ def load_pick_settings() -> None:
         return
     set_grasp_sink(mm / 1000.0, save=False)
     print(f"[settings] pick 하강 offset {GRASP_SINK * 1000:.1f}mm (pick_settings.json)")
+
+
+def load_home_joints() -> None:
+    """pick_settings.json 의 home_joints_deg 가 있으면 홈을 그 관절각으로 쓴다."""
+    global HOME_Q
+    d = _read_pick_settings().get("home_joints_deg")
+    if not isinstance(d, dict):
+        return
+    try:
+        HOME_Q = {n: math.radians(float(d[n])) for n in JOINT_ORDER}
+    except (KeyError, TypeError, ValueError) as e:
+        print(f"[settings] home_joints_deg 읽기 실패 ({e}) - 기본 홈 {HOME_POSE} 사용")
+        return
+    print("[settings] 홈 자세(관절각): "
+          + "  ".join(f"{SHORT_NAME[n]}={d[n]:+.1f}" for n in JOINT_ORDER))
+
+
+def set_home_joints(q: Optional[dict[str, float]]) -> None:
+    """홈을 관절각[rad]으로 정하고 pick_settings.json 에 저장한다. None 이면 기본 홈으로."""
+    global HOME_Q
+    HOME_Q = None if q is None else {n: float(q[n]) for n in JOINT_ORDER}
+    d = _read_pick_settings()
+    if HOME_Q is None:
+        d.pop("home_joints_deg", None)
+    else:
+        d["home_joints_deg"] = {n: round(math.degrees(HOME_Q[n]), 2) for n in JOINT_ORDER}
+    d["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(PICK_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+    print("[settings] 홈 자세 " + ("기본값으로 되돌림" if HOME_Q is None else
+          "저장: " + "  ".join(f"{SHORT_NAME[n]}={d['home_joints_deg'][n]:+.1f}"
+                              for n in JOINT_ORDER)))
 
 # 그리퍼를 "연다"고 할 때 얼마나 벌릴지 (0=닫힘, 1=기계적 최대).
 # 최대로 벌리면 필요 이상으로 크게 벌어져 주변 물체를 건드리고 여닫는 시간도 길다.
@@ -1573,6 +1611,8 @@ JOINT_SIGN = {n: 1.0 for n in JOINT_ORDER}
 JOINT_OFFSET_DEG = {n: 0.0 for n in JOINT_ORDER}
 
 HOME_POSE = (0.16, 0.0, 0.12)  # 홈에서의 TCP 위치 [m] (도달 가능한 중립 자세)
+# 웹 UI 의 '현재 자세를 홈으로' 로 저장한 관절각[rad]. 있으면 HOME_POSE 대신 쓴다.
+HOME_Q: Optional[dict[str, float]] = None
 
 
 class RobotArm:
@@ -1604,6 +1644,10 @@ class RobotArm:
         """현재 서보 카운트. 캘리브레이션 점을 찍을 때의 '팔 자세'를 남기는 용도."""
         return None
 
+    def get_joints(self) -> Optional[dict[str, float]]:
+        """현재 관절각[rad] (IK 좌표계). 알 수 없으면 None."""
+        return None
+
     def set_torque(self, on: bool) -> None:
         """캘리브레이션 중 팔을 손으로 움직이려면 토크를 꺼야 한다."""
         raise NotImplementedError("이 백엔드는 토크 제어를 지원하지 않는다")
@@ -1616,15 +1660,28 @@ class RobotArm:
         self.send_joints(plan_pose(x, y, z, pitch, roll, z_min),
                          settle=settle, order=order)
 
+    def gripper_state(self) -> Optional[dict]:
+        """그리퍼 서보 상태 {"load": 0~1000, "opening": 0~1}. 알 수 없으면 None."""
+        return None
+
     def open_gripper(self) -> None:
         self.set_gripper(GRIPPER_OPEN)
 
     def close_gripper(self) -> None:
         self.set_gripper(0.0, settle=0.8)
 
-    def home(self) -> None:
-        """홈은 언제나 '돌아오는' 동작이므로 접는 순서로 간다."""
-        self.move_to(*HOME_POSE, settle=1.2, order=ORDER_BACK)
+    def home(self, roll: Optional[float] = None, settle: float = 1.2) -> None:
+        """홈은 언제나 '돌아오는' 동작이므로 접는 순서로 간다.
+
+        roll 을 주면 손목 회전만 그 값으로 둔다 (물체를 문 채로 돌리지 않으려고).
+        """
+        if HOME_Q is None:
+            self.move_to(*HOME_POSE, roll=roll or 0.0, settle=settle, order=ORDER_BACK)
+            return
+        q = dict(HOME_Q)
+        if roll is not None:
+            q["wrist_roll"] = roll
+        self.send_joints(q, settle=settle, order=ORDER_BACK)
 
 
 class MockArm(RobotArm):
@@ -1645,6 +1702,9 @@ class MockArm(RobotArm):
         print("[arm] joints deg: " + "  ".join(f"{k}={deg[k]:+7.2f}" for k in JOINT_ORDER) + seq)
         self.last_q = q
         time.sleep(settle / self.speed)
+
+    def get_joints(self) -> Optional[dict[str, float]]:
+        return dict(self.last_q) if self.last_q else None
 
     def set_gripper(self, opening: float, settle: float = 0.5) -> None:
         print(f"[arm] gripper -> {opening:.2f}")
@@ -2010,10 +2070,14 @@ class FeetechSO101Arm(RobotArm):
             self._ramp_to(dict(held), settle if n == last else 0.15)
 
     def worst_load(self) -> tuple[str, int]:
-        """가장 큰 서보 부하. STS3215 부하는 하위 10비트가 크기, 상위가 방향."""
+        """팔 관절 중 가장 큰 서보 부하. STS3215 부하는 하위 10비트가 크기, 상위가 방향.
+
+        그리퍼는 뺀다. 물체를 물면 손가락이 막힌 채 계속 조이므로 부하가 높은 게
+        정상이다. 그걸 충돌로 보면 파지 직후 들어올리는 순간 정지해 버린다.
+        """
         worst, who = 0, ""
-        for name, sid in SERVO_IDS.items():
-            raw = self.bus.read_u16(sid, STS_ADDR["present_load"])
+        for name in JOINT_ORDER:
+            raw = self.bus.read_u16(SERVO_IDS[name], STS_ADDR["present_load"])
             mag = (raw & 0x3FF) if raw is not None else 0
             if mag > worst:
                 worst, who = mag, name
@@ -2044,6 +2108,10 @@ class FeetechSO101Arm(RobotArm):
         except (RuntimeError, OSError):
             return None
 
+    def get_joints(self) -> Optional[dict[str, float]]:
+        counts = self.get_joint_counts()
+        return self.counts_to_ik(counts) if counts else None
+
     def set_torque(self, on: bool) -> None:
         if self.bus is None:
             raise RuntimeError("로봇이 연결되어 있지 않다")
@@ -2059,6 +2127,25 @@ class FeetechSO101Arm(RobotArm):
         count = int(r["range_min"] + (r["range_max"] - r["range_min"]) * opening)
         self.bus.sync_write_positions({SERVO_IDS["gripper"]: count})
         time.sleep(settle)
+
+    def gripper_state(self, samples: int = 5) -> Optional[dict]:
+        """부하는 순간값이 튀므로 몇 번 읽어 중앙값을 쓴다."""
+        if self.bus is None:
+            return None
+        sid = SERVO_IDS["gripper"]
+        loads = []
+        for _ in range(samples):
+            raw = self.bus.read_u16(sid, STS_ADDR["present_load"])
+            if raw is not None:
+                loads.append(raw & 0x3FF)
+            time.sleep(0.02)
+        pos = self.bus.read_u16(sid, STS_ADDR["present_position"])
+        if not loads:
+            return None
+        r = self.calib.ranges["gripper"]
+        span = (r["range_max"] - r["range_min"]) or 1
+        opening = None if pos is None else round(float((pos - r["range_min"]) / span), 3)
+        return {"load": int(np.median(loads)), "opening": opening}
 
 
 def find_so101_port() -> Optional[str]:
@@ -2189,7 +2276,7 @@ def pick_steps(target: Sequence[float], roll: float = 0.0) -> list[Step]:
         # 홈으로 물러난다. 집은 자리 위에 팔이 서 있으면 카메라가 그 지점을
         # 가려서 다음 클릭을 할 수 없고, 물체를 문 채로 팔이 뻗어 있으면
         # 서보에 계속 부하가 걸린다. 들어올린 다음에 옮겨야 물체를 끌지 않는다.
-        ("move", *HOME_POSE, roll, 1.2, ORDER_BACK),       # 6. 홈 복귀 (문 채로)
+        ("home", roll, 1.2),                               # 6. 홈 복귀 (문 채로)
     ]
 
 
@@ -2207,7 +2294,7 @@ def place_steps(target: Sequence[float], roll: float = 0.0) -> list[Step]:
         # 닫은 채로 이동한다. 벌린 손가락은 이동 중에 주변 물체를 걸기 쉽다.
         # 놓은 물체를 밀지 않도록 후퇴한 뒤에 닫는다.
         ("grip", 0.0, 0.5),                                # 5. 그리퍼 닫기
-        ("move", *HOME_POSE, 0.0, 1.2, ORDER_BACK),        # 6. 홈 복귀
+        ("home", None, 1.2),                               # 6. 홈 복귀
     ]
 
 
@@ -2222,6 +2309,25 @@ def check_steps(steps: Sequence[Step], z_min: float = WS_Z_MIN) -> tuple[bool, s
         except IKError as e:
             return False, f"{i+1}번 경유점 z={z*100:.1f}cm: {e}"
     return True, ""
+
+
+def nearest_place_target(target: Sequence[float], roll: float = 0.0,
+                         step: float = 0.002) -> Optional[np.ndarray]:
+    """place 가 도달 불가일 때 대신 놓을 지점. 없으면 None.
+
+    베이스에서 목표 쪽으로 같은 방향, 같은 높이를 유지한 채 반경만 바꿔 가며
+    place_steps 전체가 통과하는 지점 중 목표에 가장 가까운 곳을 고른다.
+    너무 멀면 닿는 가장 먼 곳, 너무 가까우면 닿는 가장 가까운 곳이 된다.
+    """
+    x, y, z = (float(v) for v in target)
+    r0 = math.hypot(x, y)
+    c, s = (x / r0, y / r0) if r0 > 1e-6 else (1.0, 0.0)
+    radii = np.arange(WS_R_MIN, WS_R_MAX + 1e-9, step)
+    for r in sorted(radii, key=lambda r: abs(r - r0)):
+        p = np.array([r * c, r * s, z])
+        if check_steps(place_steps(p, roll))[0]:
+            return p
+    return None
 
 
 def _reach_ok_vec(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -2431,16 +2537,32 @@ def run_steps(arm: RobotArm, steps: Sequence[Step], tag: str = "seq",
             _, x, y, z, roll, settle = s[:6]
             order = s[6] if len(s) > 6 else None      # 없으면 전 관절 동시
             arm.move_to(x, y, z, roll=roll, settle=settle, z_min=z_min, order=order)
+        elif s[0] == "home":
+            _, roll, settle = s
+            arm.home(roll=roll, settle=settle)
         else:
             _, opening, settle = s
             arm.set_gripper(opening, settle=settle)
     print(f"[{tag}] 완료")
 
 
-def do_pick(arm: RobotArm, target: np.ndarray, roll: float = 0.0) -> None:
-    """target: 물체 윗면의 로봇 베이스 좌표 [m]"""
+def do_pick(arm: RobotArm, target: np.ndarray, roll: float = 0.0) -> dict:
+    """target: 물체 윗면의 로봇 베이스 좌표 [m]
+
+    홈까지 돌아온 뒤 그리퍼 부하로 물체를 물었는지 본다. 들어올리거나 옮기는
+    도중에 빠졌어도 여기서 잡힌다. 반환: {"ok", "load", "opening", "load_min"}
+    """
     print(f"[pick] target=({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})")
     run_steps(arm, pick_steps(target, roll), "pick")
+    g = arm.gripper_state()
+    if g is None:
+        # 부하를 못 읽는 백엔드(mock 등)는 성공으로 본다 - 예전 동작과 같다.
+        print("[pick] 그리퍼 부하를 읽을 수 없음 - 성공으로 간주")
+        return {"ok": True, "load": None, "opening": None, "load_min": GRIP_LOAD_MIN}
+    ok = g["load"] >= GRIP_LOAD_MIN
+    print(f"[pick] 그리퍼 부하 {g['load']} (기준 {GRIP_LOAD_MIN}), 열림 {g['opening']} "
+          f"-> {'성공' if ok else '실패 (물체 없음)'}")
+    return {"ok": ok, **g, "load_min": GRIP_LOAD_MIN}
 
 
 def do_place(arm: RobotArm, target: np.ndarray, roll: float = 0.0) -> None:
@@ -2481,7 +2603,7 @@ class Job:
 @dataclass
 class AppState:
     mode: str = STATE_IDLE
-    status: str = "물체를 클릭하면 집습니다"
+    status: str = "물체를 Ctrl+클릭하면 집습니다"
     hover: tuple[int, int] = (0, 0)
     view: str = "sensor"      # sensor(IR/센서 영상) / depth(컬러맵) / color(순수 컬러)
     view_note: str = ""       # 컬러 카메라 준비 상태 (여는 중 / 실패 사유)
@@ -3583,6 +3705,7 @@ class App:
         self._src_paused = False                        # depth 스트림을 재웠는가
         self.current_job: Optional[str] = None          # 지금 워커가 도는 작업 종류
         self.last_error: Optional[str] = None           # 마지막 실패 사유
+        self.last_pick: Optional[dict] = None           # 마지막 pick 판정 (그리퍼 부하)
         self.last_color: Optional[np.ndarray] = None    # REST 로 넘길 원본 영상
         self.last_frame: Optional[np.ndarray] = None    # 오버레이까지 그린 영상
         self.running = True
@@ -3627,12 +3750,21 @@ class App:
             self.current_job = job.kind
             gen = self._reset_gen
             try:
-                job.fn(*job.args)
+                result = job.fn(*job.args)
                 if gen != self._reset_gen:      # 도는 사이 강제 리셋됨 - 결과로 상태를 덮지 않는다
                     print(f"[reset] 리셋 전에 시작한 {job.kind} 작업이 끝남 (상태는 그대로 IDLE)")
                     continue
                 self.st.mode = job.done_mode or prev_mode
                 self.st.status = job.done_msg or self.st.status
+                if job.kind == "pick" and isinstance(result, dict):
+                    self.last_pick = result
+                    if not result["ok"]:
+                        # 빈손이다. HOLDING 으로 두면 다음 클릭이 허공을 place 한다.
+                        self.st.mode = STATE_IDLE
+                        self.st.status = (f"pick 실패: 물체를 못 잡았습니다 (그리퍼 부하 "
+                                          f"{result['load']} < {result['load_min']}) - "
+                                          "다시 Ctrl+클릭하세요")
+                        self.last_error = self.st.status
                 if job.clear_markers:
                     self.st.markers = []
             except Exception as e:
@@ -3675,15 +3807,33 @@ class App:
             self.st.calib_base.clear()
             self._calib_pending = None
             self.last_error = None
-            self.st.status = "강제 리셋됨 - 물체를 클릭하면 집습니다"
+            self.last_pick = None
+            self.st.status = "강제 리셋됨 - 물체를 Ctrl+클릭하면 집습니다"
         print(f"[reset] 강제 리셋 (대기 작업 {dropped}개 버림"
               + (f", 진행 중인 {running} 은 끝까지 감)" if running else ")"))
         return {"dropped_jobs": dropped, "running_job": running}
 
+    def set_home_here(self) -> tuple[bool, str]:
+        """지금 팔의 관절각을 홈 자세로 저장한다. 팔은 움직이지 않는다."""
+        with self._cmd_lock:
+            if self.st.mode == STATE_BUSY:
+                return False, "동작 중에는 홈을 바꿀 수 없습니다"
+            q = self.arm.get_joints()
+            if q is None:
+                return False, "현재 관절각을 읽을 수 없습니다"
+            try:
+                set_home_joints(q)
+            except OSError as e:
+                return False, f"저장 실패: {e}"
+        msg = "홈 저장: " + " ".join(f"{SHORT_NAME[n]}={math.degrees(q[n]):+.0f}"
+                                    for n in JOINT_ORDER)
+        self.st.status = msg
+        return True, msg
+
     # --- 웹 UI 입력/출력 -----------------------------------------------------
-    def enqueue_mouse(self, event: int, x: int, y: int) -> None:
+    def enqueue_mouse(self, event: int, x: int, y: int, flags: int = 0) -> None:
         """HTTP 핸들러 스레드에서 호출. run() 루프가 다음 턴에 처리한다."""
-        self._input_events.put(("mouse", event, x, y))
+        self._input_events.put(("mouse", event, x, y, flags))
 
     def enqueue_key(self, code: int) -> None:
         self._input_events.put(("key", code))
@@ -3794,9 +3944,9 @@ class App:
                       "가능하면 실측 depth 가 있는 지점을 클릭할 것")
             self._calib_click(x, y, p_cam)
             return
-        # 손이 비었으면 집고, 물고 있으면 놓는다. 실제 판단과 실행은 command()
+        # Ctrl+클릭은 집기, 그냥 클릭은 놓기. 실제 판단과 실행은 command()
         # 한 곳에서만 한다 - REST 요청도 같은 함수를 부른다.
-        action = "pick" if self.st.mode == STATE_IDLE else "place"
+        action = "pick" if flags & cv2.EVENT_FLAG_CTRLKEY else "place"
         ok, msg, _ = self.command(action, x, y)
         if not ok:
             self.st.status = msg
@@ -3889,10 +4039,8 @@ class App:
             # 물체가 움직였어도 옛 자리로 간다.
             return False, "컬러 모드라 depth 가 멈춰 있습니다 (SENSOR 로 전환하세요)", info
 
-        # 상태 확인: 손이 비어야 집고, 물고 있어야 놓는다. 마우스 클릭이
-        # IDLE/HOLDING 으로 갈리는 것과 같은 규칙이다.
-        if action == "pick" and self.st.mode != STATE_IDLE:
-            return False, "이미 물체를 물고 있습니다 (place 먼저)", info
+        # 상태 확인: 놓기는 물고 있어야 한다. 집기는 물고 있어도 받는다 -
+        # pick 의 첫 단계가 그리퍼 열기라서 물고 있던 것은 홈 자리에서 놓인다.
         if action == "place" and self.st.mode != STATE_HOLDING:
             return False, "물고 있는 물체가 없습니다 (pick 먼저)", info
 
@@ -3906,10 +4054,23 @@ class App:
 
         steps = pick_steps(p_base) if action == "pick" else place_steps(p_base)
         ok, why = check_steps(steps)
+        adjusted = ""
+        if not ok and action == "place":
+            # 물체를 문 채로 거부하면 놓을 곳이 없다. 같은 방향으로 닿는 곳까지만 간다.
+            alt = nearest_place_target(p_base)
+            if alt is not None:
+                moved = float(np.linalg.norm(alt[:2] - p_base[:2]))
+                print(f"[place] 도달 불가({why}) -> 같은 방향 {moved*1000:.0f}mm 옮긴 "
+                      f"({alt[0]:.3f},{alt[1]:.3f},{alt[2]:.3f}) 에 놓는다")
+                adjusted = f" [도달 불가 -> {moved*1000:.0f}mm 옮김]"
+                info["requested_base_mm"] = info["target_base_mm"]
+                info["target_base_mm"] = [round(float(v) * 1000, 1) for v in alt]
+                info["adjusted"] = True
+                p_base, ok = alt, True
         if not ok:
             return False, f"도달 불가: {why}", info
 
-        pos = f"({p_base[0]:.3f},{p_base[1]:.3f},{p_base[2]:.3f})"
+        pos = f"({p_base[0]:.3f},{p_base[1]:.3f},{p_base[2]:.3f}){adjusted}"
         if est:
             pos += " [추정 depth]"
         if action == "pick":
@@ -3922,7 +4083,7 @@ class App:
             self.st.markers.append(Marker((x, y), "PLACE", (0, 165, 255)))
             self.st.status = f"내려놓는 중... {pos}"
             self._submit(Job(do_place, (self.arm, p_base), STATE_IDLE,
-                             "물체를 클릭하면 집습니다", clear_markers=True, kind="place"))
+                             "물체를 Ctrl+클릭하면 집습니다", clear_markers=True, kind="place"))
         return True, self.st.status, info
 
     # --- 지금 무엇을 하고 있는가 -------------------------------------------
@@ -3937,6 +4098,7 @@ class App:
         "busy":           "동작중",
         "calibrating":    "캘리브레이션중",
         "not_calibrated": "미보정",
+        "pick_failed":    "잡기 실패",
     }
 
     def state(self) -> str:
@@ -3951,6 +4113,8 @@ class App:
             # 물고 있지 않은데 보정도 안 됐으면 집기 명령이 거부된다.
             # '잡기 기다림' 이라고 하면 원격에서 계속 pick 을 던지게 된다.
             return "not_calibrated"
+        if self.last_pick is not None and not self.last_pick["ok"]:
+            return "pick_failed"          # 손은 비었다 - 다시 pick 하면 된다
         return "waiting_pick"
 
     def snapshot(self) -> dict:
@@ -3968,6 +4132,7 @@ class App:
                 "view": self.st.view,
                 "status": self.st.status,
                 "last_error": self.last_error,
+                "last_pick": self.last_pick,
                 "points": len(self.panel.records),
                 "image_size": [int(self.src.intr.width), int(self.src.intr.height)],
                 "tcp_mm": None if tcp is None else [round(float(v) * 1000, 1) for v in tcp],
@@ -4200,8 +4365,8 @@ class App:
                 return
             kind = item[0]
             if kind == "mouse":
-                _, event, x, y = item
-                self.on_mouse(event, x, y, 0, None)
+                _, event, x, y, flags = item
+                self.on_mouse(event, x, y, flags, None)
             elif kind == "key":
                 _, code = item
                 if not self.handle_key(code):
@@ -4234,7 +4399,7 @@ class App:
         elif key == ord('r'):
             self.st.mode = STATE_IDLE
             self.st.markers.clear()
-            self.st.status = "리셋됨 - 물체를 클릭하면 집습니다"
+            self.st.status = "리셋됨 - 물체를 Ctrl+클릭하면 집습니다"
         elif key == ord('k'):
             self._finish_calib() if self.st.calibrating else self._start_calib()
         elif key == ord('t'):
@@ -4279,7 +4444,7 @@ class App:
         # 클릭을 받으면 그 동작이 어떤 경로로 갈지 예측할 수 없다. send_joints 가
         # 8도씩 나눠 보내므로 여기서 갑자기 튀지 않는다.
         self._submit(Job(RobotArm.home, (self.arm,), STATE_IDLE,
-                         "홈 자세 - 물체를 클릭하면 집습니다", kind="home"))
+                         "홈 자세 - 물체를 Ctrl+클릭하면 집습니다", kind="home"))
 
         if self.calib_on_start:
             self._start_calib()
@@ -4607,6 +4772,7 @@ UI_HTML = f"""<!doctype html>
       min="{GRASP_SINK_MIN * 1000:g}" max="{GRASP_SINK_MAX * 1000:g}"> mm
     <span id="sinkMsg"></span>
     &nbsp;| <button id="reset">리셋</button> <span id="resetMsg"></span>
+    &nbsp;| <button id="homeSet">현재 자세를 홈으로</button> <span id="homeMsg"></span>
   </div>
   <div id="hint">클릭 = pick/place/캘리브 점 | 키(포커스가 이 탭에 있을 때):
     q 종료  h 홈  o/c 그리퍼  r 리셋  d 뷰전환  w 도달영역  k 캘리브  t 토크  s 저장</div>
@@ -4657,6 +4823,14 @@ document.getElementById('reset').addEventListener('click', () => {{
     .then(d => {{ resetMsg.textContent = d.ok ? d.message : (d.error || '실패'); }})
     .catch(() => {{ resetMsg.textContent = '리셋 실패'; }});
 }});
+const homeMsg = document.getElementById('homeMsg');
+document.getElementById('homeSet').addEventListener('click', () => {{
+  if (!confirm('지금 팔 자세를 홈(기본 자세)으로 저장할까요?')) return;
+  homeMsg.textContent = '…';
+  fetch('/home/set', {{method: 'POST'}}).then(r => r.json())
+    .then(d => {{ homeMsg.textContent = d.ok ? d.message : (d.error || d.message || '실패'); }})
+    .catch(() => {{ homeMsg.textContent = '저장 실패'; }});
+}});
 function toImageXY(e) {{
   const r = img.getBoundingClientRect();
   const sx = img.naturalWidth / r.width, sy = img.naturalHeight / r.height;
@@ -4664,7 +4838,7 @@ function toImageXY(e) {{
 }}
 img.addEventListener('click', e => {{
   const [x, y] = toImageXY(e);
-  fetch(`/click?x=${{x}}&y=${{y}}`);
+  fetch(`/click?x=${{x}}&y=${{y}}${{e.ctrlKey ? '&ctrl=1' : ''}}`);
 }});
 let lastHover = 0;
 img.addEventListener('mousemove', e => {{
@@ -4677,7 +4851,11 @@ img.addEventListener('mousemove', e => {{
 document.addEventListener('keydown', e => {{
   // 선택 칸/입력 칸/버튼 조작은 단축키가 아니다
   if (e.repeat || ['SELECT', 'INPUT', 'TEXTAREA', 'BUTTON'].includes(e.target.tagName)) return;
-  const code = e.key === 'Escape' ? 'Escape' : e.key;
+  // Ctrl/Shift 같은 조합키 자체나 Ctrl+글자는 단축키가 아니다. 'Control' 을 그대로
+  // 보내면 서버가 첫 글자 'c' 로 읽어 그리퍼를 닫는다 (Ctrl+클릭 = pick 과 충돌).
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  if (e.key !== 'Escape' && e.key.length !== 1) return;
+  const code = e.key;
   fetch(`/key?code=${{encodeURIComponent(code)}}`);
 }});
 </script>
@@ -4872,15 +5050,17 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "error": "x, y 를 숫자로 주세요"})
                 return
             event = cv2.EVENT_LBUTTONDOWN if path == "/click" else cv2.EVENT_MOUSEMOVE
-            app.enqueue_mouse(event, x, y)
+            ctrl = str(params.get("ctrl", "")).lower() in ("1", "true", "yes")
+            app.enqueue_mouse(event, x, y, cv2.EVENT_FLAG_CTRLKEY if ctrl else 0)
             self._send(200, {"ok": True})
             return
 
         if path == "/key":
             code = params.get("code", "")
-            key = 27 if code in ("Escape", "Esc") else (ord(code[0].lower()) if code else None)
+            # 한 글자만 받는다. 'Control' 같은 키 이름의 첫 글자를 단축키로 쓰면 안 된다.
+            key = 27 if code in ("Escape", "Esc") else (ord(code.lower()) if len(code) == 1 else None)
             if key is None:
-                self._send(400, {"ok": False, "error": "code 가 없습니다"})
+                self._send(400, {"ok": False, "error": "code 는 한 글자 또는 Escape 여야 합니다"})
                 return
             app.enqueue_key(key)
             self._send(200, {"ok": True})
@@ -4900,6 +5080,12 @@ class _ApiHandler(BaseHTTPRequestHandler):
             if info["running_job"]:
                 msg += f" (진행 중인 {info['running_job']} 동작은 끝까지 감)"
             self._send(200, {"ok": True, "message": msg, **info, **app.snapshot()})
+            return
+
+        if path == "/home/set":
+            ok, msg = app.set_home_here()
+            print(f"[api] home/set -> {msg}")
+            self._send(200 if ok else 409, {"ok": ok, "message": msg})
             return
 
         if path == "/settings":
@@ -4928,13 +5114,14 @@ class _ApiHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "endpoints": [
                 "GET /              브라우저 조작 페이지 (스트림 + 클릭 + 키보드)",
                 "GET /stream        MJPEG 영상 스트림 (?fps=15&q=80)",
-                "GET|POST /click   x,y (화면 픽셀) - 마우스 클릭과 동일",
+                "GET|POST /click   x,y (화면 픽셀)[,ctrl=1] - 마우스 클릭과 동일 (ctrl=1 이면 pick)",
                 "GET|POST /hover   x,y (화면 픽셀) - 마우스 이동(호버 좌표 표시)",
                 "GET|POST /key     code (q,h,o,c,r,d,w,k,t,s) - 키보드 단축키",
                 "GET /get_state  (= /status) 지금 무엇을 하는 중인지",
                 "GET|POST /pick   x,y (화면 픽셀)",
                 "GET|POST /place  x,y (화면 픽셀)",
                 "GET|POST /reset   기본 상태(IDLE, 손 빔)로 강제 리셋 - 대기 작업/캘리브 점 버림",
+                "POST /home/set     지금 팔 관절각을 홈 자세로 저장 (pick_settings.json)",
                 "GET|POST /settings [grasp_sink_mm] - pick 시 표면에서 더 내려갈 깊이(mm), 바꾸면 자동 저장",
                 "GET /get_rgb    [?format=png] [?overlay=1]",
                 "GET /get_depth  [?format=color] - 기본은 16bit PNG(mm)",
@@ -5020,6 +5207,7 @@ def main() -> None:
     arm = setup_arm()                  # 1/2: 팔 캘리브레이션 읽기
     calib_now = want_handeye_calib(arm)   # 2/2: 카메라-로봇 캘리브레이션 확인/실행
     load_pick_settings()
+    load_home_joints()
     handeye = HandEye.load()
     app = App(source, arm, handeye)
     app.calib_on_start = calib_now
