@@ -2763,6 +2763,14 @@ class Agent:
         job = self.job = job or TRACE.new_job("O")
         TRACE.add(job, "지시 시작", order)
         t0 = time.perf_counter()
+        # 지시를 받은 지금의 화면으로 판단한다 - 지난 지시 뒤에 사람이 물건을 옮겼을 수 있다
+        self.ui.set_status("최신 화면 받는 중")
+        if not self.look():
+            self.speak("카메라 화면을 받지 못해 시작하지 못했어요.", job)
+            TRACE.add(job, "중단", "최신 화면을 받지 못했다 - 예전 화면으로는 판단하지 않는다",
+                      level="error", end=True, ms=(time.perf_counter() - t0) * 1000)
+            self.job = None
+            return
         try:
             self._follow(order, job, t0)
         except BaseException as e:           # Ctrl-C 도 '끝났다' 는 줄을 남긴다
@@ -3023,8 +3031,6 @@ def run(agent: Agent, api: Api, ui, links: Links, first_order: str = "") -> None
             if not api.connected():
                 links.connect_arm()
                 ui.log("[error] 팔 REST 에 연결되어 있지 않다 - robot_arm.py 를 켠 뒤 '재연결'")
-                continue
-            if agent.frame is None and not agent.look():
                 continue
             try:
                 agent.follow(order, getattr(ui, "last_job", None))
