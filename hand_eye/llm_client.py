@@ -101,6 +101,7 @@ import urllib.parse
 import urllib.request
 import wave
 import webbrowser
+import zoneinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
@@ -151,6 +152,17 @@ TLS_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_tls_cer
 TLS_KEY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_tls_key.pem")
 VIEW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_view.jpg")
 SKILLS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_skills.json")  # 웹에서 끈 스킬
+USAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_usage.json")    # 모델별 오늘 사용 횟수
+# 모델별 하루 요청 한도. Gemini API 는 남은 사용량을 알려주지 않아서, 이 한도에서 이 프로그램이
+# 센 횟수를 빼서 '남은 양' 을 보여 준다 (같은 키를 다른 곳에서 쓰면 실제보다 많게 보인다).
+# 429 오류에 'limit: N' 이 오면 그 값을 llm_usage.json 에 기억해 이 표보다 우선한다.
+# 바꾸려면 환경변수 GEMINI_DAILY_LIMITS="모델=횟수,모델=횟수".
+DAILY_LIMITS = {"gemini-robotics-er-2-preview": 20}
+for _kv in os.environ.get("GEMINI_DAILY_LIMITS", "").split(","):
+    _m, _sep, _n = _kv.partition("=")
+    if _sep and _n.strip().isdigit():
+        DAILY_LIMITS[_m.strip()] = int(_n)
+QUOTA_TZ = zoneinfo.ZoneInfo("America/Los_Angeles")    # Gemini 일일 할당량은 태평양 시간 자정에 초기화
 TRACE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_trace.jsonl")   # 처리 단계 로그
 TRACE_MAX_BYTES = 5 * 1024 * 1024   # 넘으면 llm_trace.jsonl.1 로 돌린다
 TRACE_KEEP = 1000                   # 메모리(웹 UI)에 남길 줄 수
@@ -663,7 +675,7 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
                        팔은 움직이지 않는다. pick 전에 확인하는 습관이 좋다.
   pick(point)          그 점의 물체를 집는다. waiting_pick / pick_failed / waiting_place 에서 된다
                        (waiting_place 에서 하면 들고 있던 물체는 홈 자리에서 놓친다).
-                       끝나면 get_state 로 waiting_place(성공) 인지 pick_failed 인지 확인한다.
+                       물체를 못 잡으면(pick_failed) ok 가 false, pick_failed 가 true 로 온다.
   place(point)         그 점에 내려놓는다. waiting_place 상태에서만 된다.
   reset                상태를 기본(waiting_pick, 손 빔)으로 강제로 되돌린다. 팔은 움직이지
                        않고 그리퍼도 열지 않는다. 상태가 실제와 어긋나 pick/place 가 계속
@@ -681,6 +693,13 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
     최대 3번까지 스스로 다시 해 본다. 그래도 ok 가 false 로 오면 그 지점은 이미
     포기한 것이다 - 같은 지점을 다시 부르지 말고, 다른 지점을 고르거나 done 을
     불러 message 에 이유를 적어라.
+  - pick 결과가 pick_failed(팔은 움직였지만 빈손)이면 그 물체를 다시 잡는다. 이때는 같은
+    점이 아니라, 처음 고른 점에서 화면 기준 왼쪽 위로 조금씩 옮긴 점으로 다시 pick 한다.
+    정규화 좌표로 n번째 재시도는 처음 점 [y, x] 에서 [y - 15*n, x - 15*n] 이다
+    (1번째 -15, 2번째 -30, 3번째 -45). 단 물체의 윗면을 벗어나면 안 된다 - 벗어날 것 같으면
+    옮기는 양을 줄여라. 실패 뒤에는 클라이언트가 화면을 새로 받으니, 물체가 밀려서 자리가
+    바뀌었으면 새 화면에서 물체 가운데를 다시 고르고 거기서부터 같은 방식으로 옮긴다.
+    이렇게 3번 다시 해도 못 잡으면 done 을 불러 못 잡았다고 알린다.
   - 한 번에 스킬 하나만 낸다. 결과를 보고 다음을 정한다.
   - 할 일이 없거나 사용자의 지시가 끝나면 done 을 불러라.
   - speech 는 사용자에게 소리로 들려준다. 지시를 받은 첫 스킬에서 무엇을 할지,
@@ -776,6 +795,97 @@ def quota_message(e: BaseException) -> Optional[str]:
             + (f" - {re.sub(r'\.\d+s$', 's', wait.group(1).rstrip('.'))} 뒤에 다시 쓸 수 있다" if wait else ""))
 
 
+def quota_limit(e: BaseException) -> Optional[int]:
+    """일일 할당량 429 에 적힌 하루 한도 (없으면 None)."""
+    text = str(e)
+    m = re.search(r"limit: (\d+)[^.]*?per day", text) or re.search(r"limit: (\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def usage_tokens(res) -> Optional[int]:
+    """응답에 붙은 토큰 수 (SDK 응답 모양마다 이름이 달라서 아는 것만 본다)."""
+    for name in ("usage_metadata", "usage"):
+        u = getattr(res, name, None)
+        if u is None:
+            continue
+        for f in ("total_token_count", "total_tokens"):
+            v = getattr(u, f, None)
+            if isinstance(v, int):
+                return v
+    return None
+
+
+class Usage:
+    """모델별 오늘(태평양 시간 기준) 요청 횟수와 토큰. USAGE_PATH 에 남겨 재시작해도 이어 센다."""
+
+    def __init__(self, path: str = USAGE_PATH):
+        self.path = path
+        self.lock = threading.Lock()
+        self.day = ""
+        self.models: dict = {}       # model -> {"count", "tokens", "exhausted"}
+        self.limits: dict = {}       # 429 에서 알아낸 하루 한도 (날이 바뀌어도 유지)
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            self.day = d.get("day", "")
+            self.models = d.get("models", {})
+            self.limits = d.get("limits", {})
+        except (OSError, ValueError):
+            pass
+        self._roll()
+
+    @staticmethod
+    def _today() -> str:
+        import datetime
+        return datetime.datetime.now(QUOTA_TZ).strftime("%Y-%m-%d")
+
+    def _roll(self) -> None:
+        """날이 바뀌었으면 횟수를 0 으로."""
+        today = self._today()
+        if today != self.day:
+            self.day, self.models = today, {}
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"day": self.day, "models": self.models, "limits": self.limits}, f, indent=1)
+        except OSError:
+            pass
+
+    def add(self, model: str, tokens: Optional[int] = None) -> None:
+        with self.lock:
+            self._roll()
+            m = self.models.setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})
+            m["count"] += 1
+            m["tokens"] += tokens or 0
+            m["exhausted"] = False
+            self._save()
+
+    def exhausted(self, model: str, limit: Optional[int]) -> None:
+        """일일 할당량 429 - 오늘은 남은 게 없다."""
+        with self.lock:
+            self._roll()
+            if limit:
+                self.limits[model] = limit
+            self.models.setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})["exhausted"] = True
+            self._save()
+
+    def summary(self) -> dict:
+        import datetime
+        with self.lock:
+            self._roll()
+            rows = []
+            for model in sorted(set(self.models) | set(DAILY_LIMITS)):
+                m = self.models.get(model, {"count": 0, "tokens": 0, "exhausted": False})
+                limit = self.limits.get(model) or DAILY_LIMITS.get(model)
+                left = 0 if m["exhausted"] else (max(0, limit - m["count"]) if limit else None)
+                rows.append({"model": model, "used": m["count"], "tokens": m["tokens"],
+                             "limit": limit, "left": left, "exhausted": m["exhausted"]})
+        now = datetime.datetime.now(QUOTA_TZ)
+        reset = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return {"day": self.day, "reset_at": reset.timestamp(), "models": rows}
+
+
 def quota_retry_s(e: BaseException) -> Optional[float]:
     """할당량 오류의 'retry in 1h2m3.4s' / retryDelay '3600s' 를 초로 (없으면 None)."""
     text = str(e)
@@ -818,6 +928,7 @@ class Vlm:
         # 다시 쓸 수 있는 시각(until)이 지나면 빠진다. 웹 UI 가 경고로 보여 준다.
         self.quota: dict = {}
         self.quota_lock = threading.Lock()
+        self.usage = Usage()                  # 모델별 오늘 사용 횟수 (웹 UI 의 '남은 사용량')
 
     def quota_list(self) -> List[dict]:
         now = time.time()
@@ -855,6 +966,8 @@ class Vlm:
         for attempt in range(1, tries + 1):
             try:
                 out = with_deadline(lambda: fn(timeout), timeout + 5)
+                if model:
+                    self.usage.add(model, usage_tokens(out))
                 if model and model in self.quota:
                     with self.quota_lock:
                         self.quota.pop(model, None)     # 다시 쓸 수 있게 됐다
@@ -862,6 +975,7 @@ class Vlm:
             except Exception as e:
                 quota = quota_message(e)
                 if quota and model:
+                    self.usage.exhausted(model, quota_limit(e))
                     wait = quota_retry_s(e)
                     with self.quota_lock:
                         use = {self.model: "지시 처리·화면 설명이 안 됨",
@@ -1101,6 +1215,7 @@ class LiveStt:
         try:
             async with self.vlm.client.aio.live.connect(model=self.vlm.live_model, config=cfg) as s:
                 self.connected.set()
+                self.vlm.usage.add(self.vlm.live_model)       # Live 는 세션 하나를 한 번으로 센다
                 TRACE.add(self.job, "Live 연결", f"{self.vlm.live_model} (대기 중이던 조각 {self.q.qsize()}개)",
                           ms=(time.perf_counter() - t0) * 1000)
                 recv = asyncio.create_task(self._recv(s))
@@ -1257,6 +1372,11 @@ PAGE = """<!doctype html>
            padding: 10px 12px; margin: 0 0 12px; font-size: 14px; }
   .quota b { color: #ff8a80; }
   .quota small { color: #e0a8a8; }
+  .usage { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; font-size: 13px;
+           color: #8b939c; margin: 0 0 12px; }
+  .usage .u { white-space: nowrap; }
+  .usage .u b { color: #e6e6e6; font-weight: 600; }
+  .usage .ok { color: #7bd88f; } .usage .low { color: #ffb74d; } .usage .out { color: #ff8a80; }
   button.estop:active { background: #8e0000; }
   .hint { color: #8b939c; font-size: 12.5px; margin-top: 8px; }
   button.small { padding: 4px 12px; font-size: 13px; }
@@ -1339,6 +1459,7 @@ PAGE = """<!doctype html>
       <button type="button" class="small" onclick="reconnect('all')"
               title="모두 다시 접속하고 화면을 새로 받아 설명을 다시 듣는다">전체 재연결</button></h1>
   <div id="quota" class="quota" hidden></div>
+  <div id="usage" class="usage" hidden></div>
   <div id="conns" class="conns"></div>
   <div class="row">
     <img id="view" src="/view.jpg?v=0" alt="현재 화면">
@@ -1421,6 +1542,7 @@ async function poll() {
     $('state').textContent = d.state || '-';
     renderConns(d.conn || []);
     renderQuota(d.quota || [], d.now);
+    renderUsage(d.usage, d.now);
     $('status').textContent = d.status || '';
     $('status').hidden = !d.status;
     if (d.ask) {
@@ -1539,6 +1661,32 @@ function renderQuota(list, now) {
     return '<div>⚠ <b>모델 일일 할당량을 다 썼습니다</b> - ' + esc(q.model) + ': ' + esc(q.what)
          + '<br><small>' + esc(q.message) + ' · ' + at + ' 발생' + left + '</small></div>';
   }).join('');
+}
+
+// 모델 사용량: 오늘 이 프로그램이 부른 횟수와 하루 한도에서 남은 양 (태평양 시간 자정 초기화)
+function renderUsage(u, now) {
+  const el = $('usage');
+  el.hidden = !u || !u.models.length;
+  if (el.hidden) return;
+  const left = Math.max(0, u.reset_at - now);
+  const reset = Math.floor(left / 3600) + '시간 ' + Math.ceil(left % 3600 / 60) + '분 뒤 초기화';
+  el.innerHTML = '<span title="Gemini API 는 남은 양을 알려주지 않는다 - 이 프로그램이 센 횟수를 하루 한도에서 뺀 값">'
+    + '모델 사용량 (오늘)</span>'
+    + u.models.map(function (m) {
+        let cls = 'ok', txt;
+        if (m.limit) {
+          txt = '남은 ' + m.left + ' / ' + m.limit + '회';
+          if (m.left <= 0) cls = 'out'; else if (m.left <= Math.max(2, m.limit * 0.2)) cls = 'low';
+        } else {
+          txt = m.used + '회 사용 (한도 모름)';
+          if (m.exhausted) { cls = 'out'; txt += ' · 소진'; }
+        }
+        const tok = m.tokens ? ' · ' + m.tokens.toLocaleString() + ' 토큰' : '';
+        return '<span class="u"><b>' + esc(m.model) + '</b> <span class="' + cls + '">' + txt + '</span>'
+             + (m.limit ? ' <small>(' + m.used + '회 사용' + tok + ')</small>' : (tok ? ' <small>' + tok + '</small>' : ''))
+             + '</span>';
+      }).join('')
+    + '<span><small>' + reset + '</small></span>';
 }
 
 function renderConns(list) {
@@ -2191,6 +2339,7 @@ class WebUi:
         self.skills_fn = None
         self.toggle_fn = None
         self.estop_fn = None                 # 긴급 정지 때 몸체를 세우는 함수 (Agent 가 채운다)
+        self.usage_fn = None                 # Vlm.usage.summary - 모델별 오늘 사용량/남은 양
         self.quota_fn = None                 # Vlm.quota_list - 일일 할당량을 다 쓴 모델 (경고 띠)
         self.transcribe_fn = None            # Vlm.transcribe - (WAV bytes, job) -> 글
         self.live_fn = None                  # Vlm.live - job -> LiveStt (실시간 받아쓰기)
@@ -2281,6 +2430,7 @@ class WebUi:
             }
         out["state"] = self._robot_state()
         out["quota"] = self.quota_fn() if self.quota_fn else []
+        out["usage"] = self.usage_fn() if self.usage_fn else None
         # 팔 REST 행은 0.5초마다 하는 상태 조회 결과로 바로 갱신한다
         for r in out["conn"]:
             if r["key"] == "arm" and r["cls"] != "wait" and self._state:
@@ -2723,6 +2873,15 @@ class Agent:
             out = self.api.json(f"/{action}", {"x": x, "y": y})
             if out.get("ok"):                      # 접수됐으면 끝날 때까지 기다린다
                 out["after_wait"] = self.wait_idle(20.0)
+                if action == "pick" and out["after_wait"].get("state") == "pick_failed":
+                    # 팔은 끝까지 움직였는데 빈손이다. 같은 점을 그대로 다시 해도 같은 결과라
+                    # 여기서 재시도하지 않고, 점을 옮겨 다시 고르도록 모델에게 넘긴다.
+                    why = "물체를 못 잡았다 (그리퍼 부하로 보니 빈손)"
+                    self.ui.log(f"    !! pick 실패: {why}")
+                    TRACE.add(self.job, "pick 실패", f"({x},{y}) {why}", level="warn")
+                    self.look()                    # 팔이 물체를 밀었을 수 있다
+                    return {**out, "ok": False, "pick_failed": True,
+                            "message": why + " - 왼쪽 위로 조금 옮긴 점으로 다시 pick 하라"}
                 if out["after_wait"].get("ok"):
                     return out
                 why = out["after_wait"].get("message", "동작이 끝나지 않았다")
@@ -3172,6 +3331,7 @@ def main() -> None:
         ui.skills_fn = agent.skill_groups
         ui.estop_fn = lambda: agent.base.stop() if agent.base is not None else None
         ui.quota_fn = vlm.quota_list
+        ui.usage_fn = vlm.usage.summary
         ui.transcribe_fn = vlm.transcribe
         ui.live_fn = vlm.live
         ui.tts_fn = vlm.tts if vlm.tts_model else None

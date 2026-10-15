@@ -8,4 +8,5 @@ __pycache__/
 hand_eye/llm_skills.json
 hand_eye/llm_tls_*.pem
 hand_eye/llm_trace.jsonl*
+hand_eye/llm_usage.json
 
