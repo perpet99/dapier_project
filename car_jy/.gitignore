@@ -13,4 +13,12 @@ __pycache__/
 map_*.yaml
 .env
 *.jpg
+*.jpeg
+*.mp4
+*.avi
+*.mkv
+*.webm
 snapshots/
+sim_videos/
+reports/
+docs/*report*.md

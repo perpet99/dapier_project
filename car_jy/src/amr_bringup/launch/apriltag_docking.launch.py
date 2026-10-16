@@ -138,8 +138,8 @@ def generate_launch_description():
     )
     flip_180_arg = DeclareLaunchArgument(
         'flip_180',
-        default_value='true',
-        description='Rotate camera image 180 degrees if camera is mounted upside down (default: true)'
+        default_value='false',
+        description='Rotate camera image 180 degrees if camera is mounted upside down (default: false)'
     )
     auto_start_arg = DeclareLaunchArgument(
         'auto_start',

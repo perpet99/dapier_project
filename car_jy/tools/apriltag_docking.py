@@ -88,7 +88,7 @@ class ApriltagDockingNode(Node):
         self.declare_parameter('use_lidar', False)              # 라이다 센서 연동 여부 (기본: False, 순수 카메라 비전 모드)
         self.declare_parameter('lidar_topic', '/scan')
         self.declare_parameter('lidar_offset', 0.14)            # 라이다 중심과 로봇 전방 범퍼/카메라 간 거리 (미터)
-        self.declare_parameter('flip_180', True)                # 카메라 180도 상하 반전 (실제 AMR 장착 방향: 기본 True)
+        self.declare_parameter('flip_180', False)               # 카메라 180도 상하 반전 (기본: False)
         self.declare_parameter('show_gui', True)                # OpenCV 실시간 카메라 시점 GUI 창 표시 여부
         self.declare_parameter('straight_drive_duration', 7.5)  # 중앙 정렬 후 무조건 직진 밀착 시간 (완전 벽 밀착: 7.5초)
         self.declare_parameter('straight_drive_speed', 0.07)    # 무조건 직진 시 주행 속도 (m/s)
