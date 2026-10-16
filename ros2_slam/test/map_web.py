@@ -30,9 +30,9 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
                                 used while a Go to that label runs ({"id"} alone = back to the default)
   POST /api/nav/goto {"id": "..."}    Nav2 NavigateToPose to the label; when the label is
                                 behind the robot (bearing > 90 deg) back up goto_backup_m
-                                (0.30 m) first. A label inside an obstacle / the robot radius on
-                                Nav2's global costmap is driven to the closest reachable point
-                                (within 1.5 m) instead; an abort mid-route retries up to twice when
+                                (0.30 m) first. A label whose global-costmap cost is >= goal_max_cost
+                                (50: obstacle, robot radius or the inflation next to one) is driven
+                                to the closest reachable cell below that cost (within 1.5 m) instead; an abort mid-route retries up to twice when
                                 that point has moved (obstacle seen on the way)
   POST /api/nav/goto_wall {"id": "..."}   Go to the label, then (on arrival) the lidar wall
                                 approach: square up to the wall in front and drive to `gap`
@@ -1023,6 +1023,10 @@ class MapWeb(Node):
         self.goal_handle = None
         # every Go to first backs straight up this far (odom distance), then sends the goal
         self.backup_m = float(self.declare_parameter('goto_backup_m', 0.30).value)
+        # a Go to goal must sit below this global-costmap cost (0..100). Higher = deep in the inflation
+        # next to an obstacle: MPPI's CostCritic will not drive in there and the robot stalls ('Failed to
+        # make progress' x4 at a moved 99-cost label). Such labels go to the closest cell below it.
+        self.goal_max_cost = int(self.declare_parameter('goal_max_cost', 50).value)
         self.backup_speed = float(self.declare_parameter('goto_backup_speed', 0.08).value)
         self.robot_back = float(self.declare_parameter('robot_back', 0.16).value)       # center -> rear of body
         self.backup_clear_m = float(self.declare_parameter('goto_backup_clear_m', 0.12).value)
@@ -1139,9 +1143,10 @@ class MapWeb(Node):
             return -1
         return int(grid[j, i])
 
-    def nearest_reachable(self, x, y, max_m=1.5):
-        """Closest costmap cell to (x, y) the robot can stand on (cost < 99) and drive to from where it is
-        now (same free region), as (x, y, shift m); None without a fresh costmap or no such cell in max_m."""
+    def nearest_reachable(self, x, y, max_m=1.5, max_cost=99):
+        """Closest costmap cell to (x, y) with cost < max_cost that the robot can drive to from where it
+        is now (same cost < 99 region), as (x, y, shift m); None without a fresh costmap or no such
+        cell in max_m."""
         cm = self.costmap
         if cm is None or time.time() - cm[5] > 30.0:
             return None
@@ -1153,7 +1158,7 @@ class MapWeb(Node):
             ri, rj = int((cur[1] - ox) / res), int((cur[2] - oy) / res)
             if 0 <= ri < grid.shape[1] and 0 <= rj < grid.shape[0] and comp[rj, ri] > 0:
                 free = (comp == comp[rj, ri]).astype(np.uint8)   # only cells connected to the robot
-        js, is_ = np.nonzero(free)
+        js, is_ = np.nonzero(free.astype(bool) & (grid < max_cost))
         if js.size == 0:
             return None
         cx, cy = ox + (is_ + 0.5) * res, oy + (js + 0.5) * res
@@ -1164,18 +1169,21 @@ class MapWeb(Node):
         return round(float(cx[k]), 3), round(float(cy[k]), 3), round(float(d[k]), 3)
 
     def reachable_goal(self, label):
-        """The label itself, or -- when it sits in an obstacle / within the robot radius on Nav2's
-        costmap -- a copy moved to the closest reachable point (keeps the label's heading).
-        Returns (goal, note); goal None when nothing reachable is near."""
+        """The label itself, or -- when it sits in an obstacle / the robot radius / the high-cost band
+        next to one (cost >= goal_max_cost) on Nav2's costmap -- a copy moved to the closest reachable
+        low-cost point (keeps the label's heading). Returns (goal, note); goal None when nothing is near."""
         cost = self.cost_at(label['x'], label['y'])
-        if cost is None or cost < 99:
+        if cost is None or cost < self.goal_max_cost:
             return label, ''
-        near = self.nearest_reachable(label['x'], label['y'])
+        what = '막혀 있어' if cost >= 99 else '장애물에 너무 가까워'
+        near = self.nearest_reachable(label['x'], label['y'], max_cost=self.goal_max_cost)
         if near is None:
+            if cost < 99:                 # nothing low-cost nearby, but the label itself is drivable
+                return label, ''
             return None, f'라벨 위치가 비용지도에서 막혀 있고(cost {cost}) 1.5 m 안에 갈 수 있는 곳이 없습니다'
         x, y, shift = near
         return ({**label, 'x': x, 'y': y, 'orig': {'x': label['x'], 'y': label['y']}, 'shift': shift},
-                f'라벨 위치가 막혀 있어(cost {cost}) {shift * 100:.0f} cm 떨어진 가장 가까운 지점으로')
+                f'라벨 위치가 {what}(cost {cost}) {shift * 100:.0f} cm 떨어진 비용 {self.goal_max_cost} 미만 지점으로')
 
     def _on_scan(self, msg: LaserScan):
         now = time.time()
@@ -1515,7 +1523,7 @@ class MapWeb(Node):
         if seq == self.nav_seq:
             self.tolerance.use_label(None)     # back to the global tolerance
         if state == 'succeeded' and target and 'shift' in target:
-            msg = f"라벨 위치가 막혀 있어 {target['shift'] * 100:.0f} cm 떨어진 가장 가까운 지점에 도착"
+            msg = f"라벨 위치가 장애물에 가까워 {target['shift'] * 100:.0f} cm 떨어진 가장 가까운 지점에 도착"
         self._set_nav(seq, state=state, message=msg + (f': {err}' if err else ''), finished=time.time())
         self.get_logger().info(f'nav result: {state} {err}')
         if seq == self.nav_seq and self.nav_then == 'wall':
