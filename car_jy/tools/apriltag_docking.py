@@ -75,7 +75,7 @@ class ApriltagDockingNode(Node):
         self.declare_parameter('max_angular_speed', 0.45)       # 최대 회전 속도 (rad/s)
         self.declare_parameter('search_angular_speed', 0.35)    # 탐색/역회전 회전 속도 (rad/s)
         self.declare_parameter('enable_search', True)           # 태그 미감지 시 자동 탐색/역회전 여부
-        self.declare_parameter('auto_start', True)              # 노드 시작 시 즉시 도킹 제어 활성화
+        self.declare_parameter('auto_start', False)            # 노드 시작 시 즉시 도킹 제어 활성화 (기본: False, 시작 버튼 대기)
         self.declare_parameter('max_backup_count', 10)          # 최대 후진 리커버리 허용 횟수
 
         # 카메라 및 라이다 센서
@@ -655,16 +655,6 @@ class ApriltagDockingNode(Node):
     # 메인 도킹 제어 루프 (20Hz)
     # ---------------------------------------------------------------------
     def control_loop(self):
-        # 0. 비활성(STOP) 상태 시 즉시 속도 0 발행 후 완전 정지
-        if not self.is_active:
-            self.state = "IDLE"
-            self.publish_cmd_vel(0.0, 0.0)
-            self.smoothed_wz = 0.0
-            with self.frame_lock:
-                if self.latest_frame is not None:
-                    self.debug_frame = self.render_overlay(self.latest_frame.copy(), None, 0.0, 0.0, 999.0, 999.0)
-            return
-
         frame = None
         with self.frame_lock:
             if self.latest_frame is not None:
@@ -938,6 +928,54 @@ class ApriltagDockingNode(Node):
                     self.odom_yaw_offset = cur_hdg - self.odom_pose[2]
             elif self.odom_pose is not None and self.odom_yaw_offset is not None:
                 self.station_heading = self.odom_pose[2] + self.odom_yaw_offset
+
+        # -----------------------------------------------------------------
+        # 0. 비활성(STOP / IDLE) 상태 시 속도 0 발행 및 카메라 대기 화면 송출
+        # -----------------------------------------------------------------
+        if not self.is_active:
+            self.state = "IDLE"
+            self.publish_cmd_vel(0.0, 0.0)
+            self.smoothed_wz = 0.0
+            curr_dist = float(detected["station_z"]) if detected else 999.0
+            dist_err = (curr_dist - self.target_dist) if detected else 999.0
+            yaw_err = float(detected["yaw"]) if detected else 0.0
+            motion_code = "STOP"
+            motion_kr = "🛑 정지 대기 중입니다 (시작 버튼 대기)"
+            motion_en = "IDLE - READY TO DOCK"
+
+            status_info = {
+                "state": "IDLE",
+                "tag_detected": detected is not None,
+                "tag_id": detected["id"] if detected else None,
+                "tag_mode": detected.get("tag_mode", "NONE") if detected else "NONE",
+                "dist_m": round(curr_dist, 3) if curr_dist < 900.0 else None,
+                "dist_err_m": round(dist_err, 3) if curr_dist < 900.0 else None,
+                "lat_err_m": round(detected.get("lat_err", 0.0), 3) if detected else None,
+                "yaw_deg": round(math.degrees(yaw_err), 1),
+                "handover_active": self.handover_active,
+                "cmd_vx": 0.0,
+                "cmd_wz": 0.0,
+                "motion_code": motion_code,
+                "motion_kr": motion_kr,
+                "motion_en": motion_en,
+                "flip_180": self.flip_180,
+                "timestamp": time.time()
+            }
+            self.latest_status = status_info
+            status_msg = String()
+            status_msg.data = json.dumps(status_info, ensure_ascii=False)
+            self.pub_status.publish(status_msg)
+
+            dbg = self.render_overlay(frame, detected, 0.0, 0.0, curr_dist, dist_err)
+            with self.frame_lock:
+                self.debug_frame = dbg
+            if self.show_gui:
+                try:
+                    cv2.imshow("AMR AprilTag Precision Docking", dbg)
+                    cv2.waitKey(1)
+                except Exception:
+                    pass
+            return
 
         # -----------------------------------------------------------------
         # 5-1. 실시간 주행 궤적(선) 기록 및 ROS 2 Path 토픽 발행

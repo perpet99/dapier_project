@@ -128,8 +128,13 @@ def generate_launch_description():
     )
     flip_180_arg = DeclareLaunchArgument(
         'flip_180',
+        default_value='true',
+        description='Rotate camera image 180 degrees if camera is mounted upside down (default: true)'
+    )
+    auto_start_arg = DeclareLaunchArgument(
+        'auto_start',
         default_value='false',
-        description='Rotate camera image 180 degrees if camera is mounted upside down (default: false)'
+        description='Whether to start docking immediately upon launch (default: false, wait for Start button)'
     )
     show_gui_arg = DeclareLaunchArgument(
         'show_gui',
@@ -192,7 +197,7 @@ def generate_launch_description():
             'straight_drive_speed': LaunchConfiguration('straight_drive_speed'),
             'straight_dock_dist': LaunchConfiguration('straight_dock_dist'),
             'web_port': LaunchConfiguration('web_port'),
-            'auto_start': True,
+            'auto_start': LaunchConfiguration('auto_start'),
         }],
         output='screen'
     )
@@ -220,6 +225,7 @@ def generate_launch_description():
         lidar_topic_arg,
         lidar_offset_arg,
         flip_180_arg,
+        auto_start_arg,
         show_gui_arg,
         straight_drive_duration_arg,
         straight_drive_speed_arg,
