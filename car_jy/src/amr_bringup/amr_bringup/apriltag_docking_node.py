@@ -98,6 +98,7 @@ class ApriltagDockingNode(Node):
         self.declare_parameter('enable_obstacle_guard', True)   # 도킹 경로상 돌발 장애물 안전 가드 활성화
         self.declare_parameter('obstacle_safety_dist', 0.45)    # 돌발 장애물 감지 거리 임계치 (m)
         self.declare_parameter('obstacle_wait_timeout', 4.0)    # 장애물 대기 후 후진 대피 한계 시간 (초)
+        self.declare_parameter('show_axes', True)              # 도킹 스테이션 중심 3D 좌표축(Frame Axes) 렌더링 여부
 
         # -----------------------------------------------------------------
         # 2. 파라미터 값 추출
@@ -105,6 +106,9 @@ class ApriltagDockingNode(Node):
         self.enable_obstacle_guard = bool(self.get_parameter('enable_obstacle_guard').value)
         self.obstacle_safety_dist = float(self.get_parameter('obstacle_safety_dist').value)
         self.obstacle_wait_timeout = float(self.get_parameter('obstacle_wait_timeout').value)
+        self.show_axes = bool(self.get_parameter('show_axes').value)
+        self.filt_rvec = None
+        self.filt_tvec = None
         self.obstacle_detected = False
         self.obstacle_detect_start_time = None
         self.straight_drive_paused_elapsed = 0.0
@@ -722,8 +726,8 @@ class ApriltagDockingNode(Node):
 
     def estimate_single_pose(self, corner):
         s = self.tag_inner_size / 2.0
-        # OpenCV AprilTag 코너 검출 순서 [TR, BR, BL, TL]와 완벽 일치하는 3D 모델 좌표
-        tag_pts = np.array([[s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0], [-s, -s, 0.0]], dtype=np.float32)
+        # OpenCV AprilTag 코너 검출 순서 [TL, TR, BR, BL]와 완벽 일치하는 3D 모델 좌표
+        tag_pts = np.array([[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]], dtype=np.float32)
         img_pts = corner.reshape((4, 2)).astype(np.float32)
         flags = getattr(cv2, 'SOLVEPNP_IPPE_SQUARE', cv2.SOLVEPNP_ITERATIVE)
         ret, rvec, tvec = cv2.solvePnP(tag_pts, img_pts, self.camera_matrix, self.dist_coeffs, flags=flags)
@@ -863,8 +867,8 @@ class ApriltagDockingNode(Node):
                 tag_l_x = -self.tag_spacing / 2.0
                 tag_r_x = self.tag_spacing / 2.0
 
-                # 코너 순서 [TR, BR, BL, TL]와 완벽 일치하는 3D 모델
-                tag_pts = np.array([[s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0], [-s, -s, 0.0]], dtype=np.float32)
+                # 코너 순서 [TL, TR, BR, BL]와 완벽 일치하는 3D 모델
+                tag_pts = np.array([[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]], dtype=np.float32)
                 obj_8pts = np.vstack([tag_pts + [tag_l_x, 0.0, 0.0], tag_pts + [tag_r_x, 0.0, 0.0]]).astype(np.float32)
                 img_8pts = np.vstack([left_c["pts"], right_c["pts"]])
 
@@ -918,8 +922,8 @@ class ApriltagDockingNode(Node):
                     c = candidates[0]
                 now_t = time.time()
                 u_cur = float(c["u"])
-                s = self.tag_inner_size / 2.0
-                tag_pts = np.array([[s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0], [-s, -s, 0.0]], dtype=np.float32)
+                # 코너 순서 [TL, TR, BR, BL]와 완벽 일치하는 3D 모델
+                tag_pts = np.array([[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]], dtype=np.float32)
                 ret_s, rv, tv = cv2.solvePnP(
                     tag_pts, c["pts"], self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
                 )
@@ -1028,59 +1032,76 @@ class ApriltagDockingNode(Node):
                 baseline = 0.0
                 tag_mode = "SINGLE_LEFT" if is_left else "SINGLE_RIGHT"
 
-            raw_bearing = math.atan2(x_mid, max(0.08, z_mid))
+            if candidates:
+                raw_bearing = math.atan2(x_mid, max(0.08, z_mid))
 
-            # 지터 방지 EMA 필터
-            if not hasattr(self, 'filt_yaw'):
-                self.filt_yaw = raw_tag_yaw
-                self.filt_bearing = raw_bearing
-                self.filt_z = z_mid
-                self.filt_lat_err = station_lat_err
-                self.filt_station_z = station_dist_z
-            else:
-                alpha = 0.80 if len(candidates) >= 2 else 0.70
-                self.filt_yaw = (1.0 - alpha) * self.filt_yaw + alpha * raw_tag_yaw
-                self.filt_bearing = (1.0 - alpha) * self.filt_bearing + alpha * raw_bearing
-                self.filt_z = (1.0 - alpha) * self.filt_z + alpha * z_mid
-                self.filt_lat_err = (1.0 - alpha) * self.filt_lat_err + alpha * station_lat_err
-                self.filt_station_z = (1.0 - alpha) * self.filt_station_z + alpha * station_dist_z
+                # 지터 방지 EMA 필터
+                if not hasattr(self, 'filt_yaw') or self.filt_yaw is None:
+                    self.filt_yaw = raw_tag_yaw
+                    self.filt_bearing = raw_bearing
+                    self.filt_z = z_mid
+                    self.filt_lat_err = station_lat_err
+                    self.filt_station_z = station_dist_z
+                else:
+                    alpha = 0.80 if len(candidates) >= 2 else 0.70
+                    self.filt_yaw = (1.0 - alpha) * self.filt_yaw + alpha * raw_tag_yaw
+                    self.filt_bearing = (1.0 - alpha) * self.filt_bearing + alpha * raw_bearing
+                    self.filt_z = (1.0 - alpha) * self.filt_z + alpha * z_mid
+                    self.filt_lat_err = (1.0 - alpha) * self.filt_lat_err + alpha * station_lat_err
+                    self.filt_station_z = (1.0 - alpha) * self.filt_station_z + alpha * station_dist_z
 
-            detected = {
-                "id": candidates[0]["tid"],
-                "tag_mode": tag_mode,
-                "single_role": self.tracked_single_role if len(candidates) == 1 else "DUAL",
-                "is_dual": len(candidates) >= 2,
-                "baseline": baseline,
-                "candidates": candidates,
-                "left_c": left_c,
-                "right_c": right_c,
-                "rvec": rvec_use,
-                "rot_mat": rot_mat_use,
-                "tvec": np.array([x_mid, y_mid, self.filt_z]),
-                "x": x_mid,
-                "y": y_mid,
-                "z": self.filt_z,
-                "lat_err": self.filt_lat_err,
-                "station_x": -self.filt_lat_err,
-                "station_z": self.filt_station_z,
-                "bearing": self.filt_bearing,
-                "yaw": self.filt_yaw
-            }
-            self.last_detection_time = time.time()
-            self.last_seen_dist = float(self.filt_station_z)
-            self.last_seen_x = float(self.filt_lat_err)
-            self.has_seen_tag = True
+                # 3D 축 좌표계(rvec, tvec) EMA 안정화 필터 (화면 중앙 축 튐 완전 제거)
+                if rvec_use is not None:
+                    rvec_arr = np.array(rvec_use, dtype=np.float32).flatten()
+                    tvec_arr = np.array([x_mid, y_mid, self.filt_z], dtype=np.float32).flatten()
+                    if self.filt_rvec is None:
+                        self.filt_rvec = rvec_arr.copy()
+                        self.filt_tvec = tvec_arr.copy()
+                    else:
+                        self.filt_rvec = 0.80 * self.filt_rvec + 0.20 * rvec_arr
+                        self.filt_tvec = 0.80 * self.filt_tvec + 0.20 * tvec_arr
+                    draw_rvec = self.filt_rvec.copy()
+                    draw_tvec = self.filt_tvec.copy()
+                else:
+                    draw_rvec = None
+                    draw_tvec = None
 
-            # 🌟 [도킹 스테이션 기준 로봇 실제 물리 헤딩 각도 산출]
-            # 카메라 전방 벡터([0, 0, 1]^T)를 도킹 스테이션 좌표계로 역변환하여 진짜 진행 방향 계산
-            if rot_mat_use is not None:
-                cam_fwd = rot_mat_use.T @ np.array([[0.0], [0.0], [1.0]], dtype=np.float32)
-                cur_hdg = math.atan2(float(cam_fwd[0][0]), float(cam_fwd[2][0]))
-                self.station_heading = cur_hdg
-                if self.odom_pose is not None:
-                    self.odom_yaw_offset = cur_hdg - self.odom_pose[2]
-            elif self.odom_pose is not None and self.odom_yaw_offset is not None:
-                self.station_heading = self.odom_pose[2] + self.odom_yaw_offset
+                detected = {
+                    "id": candidates[0]["tid"],
+                    "tag_mode": tag_mode,
+                    "single_role": self.tracked_single_role if len(candidates) == 1 else "DUAL",
+                    "is_dual": len(candidates) >= 2,
+                    "baseline": baseline,
+                    "candidates": candidates,
+                    "left_c": left_c,
+                    "right_c": right_c,
+                    "rvec": draw_rvec,
+                    "rot_mat": rot_mat_use,
+                    "tvec": draw_tvec if draw_tvec is not None else np.array([x_mid, y_mid, self.filt_z]),
+                    "x": x_mid,
+                    "y": y_mid,
+                    "z": self.filt_z,
+                    "lat_err": self.filt_lat_err,
+                    "station_x": -self.filt_lat_err,
+                    "station_z": self.filt_station_z,
+                    "bearing": self.filt_bearing,
+                    "yaw": self.filt_yaw
+                }
+                self.last_detection_time = time.time()
+                self.last_seen_dist = float(self.filt_station_z)
+                self.last_seen_x = float(self.filt_lat_err)
+                self.has_seen_tag = True
+
+                # 🌟 [도킹 스테이션 기준 로봇 실제 물리 헤딩 각도 산출]
+                # 카메라 전방 벡터([0, 0, 1]^T)를 도킹 스테이션 좌표계로 역변환하여 진짜 진행 방향 계산
+                if rot_mat_use is not None:
+                    cam_fwd = rot_mat_use.T @ np.array([[0.0], [0.0], [1.0]], dtype=np.float32)
+                    cur_hdg = math.atan2(float(cam_fwd[0][0]), float(cam_fwd[2][0]))
+                    self.station_heading = cur_hdg
+                    if self.odom_pose is not None:
+                        self.odom_yaw_offset = cur_hdg - self.odom_pose[2]
+                elif self.odom_pose is not None and self.odom_yaw_offset is not None:
+                    self.station_heading = self.odom_pose[2] + self.odom_yaw_offset
 
         # -----------------------------------------------------------------
         # 0. 비활성(STOP / IDLE) 상태 시 속도 0 발행 및 카메라 대기 화면 송출
@@ -1746,7 +1767,7 @@ class ApriltagDockingNode(Node):
                 cv2.putText(dbg, "VIRTUAL CENTER", (u_virt - 48, v_tag + 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 100, 255), 1, cv2.LINE_AA)
 
-            if hasattr(cv2, 'drawFrameAxes') and detected.get("rvec") is not None:
+            if getattr(self, 'show_axes', True) and hasattr(cv2, 'drawFrameAxes') and detected.get("rvec") is not None:
                 try:
                     cv2.drawFrameAxes(dbg, self.camera_matrix, self.dist_coeffs,
                                       detected["rvec"], detected["tvec"], self.tag_size * 0.75, 2)
@@ -1954,6 +1975,8 @@ class ApriltagDockingNode(Node):
         .btn-stop:hover {{ background:#dc2626; }}
         .btn-flip {{ background:#475569; }}
         .btn-flip:hover {{ background:#334155; }}
+        .btn-axes {{ background:#6366f1; }}
+        .btn-axes:hover {{ background:#4f46e5; }}
         .telemetry-row {{ display:flex; justify-content:center; gap:12px; flex-wrap:wrap; margin-top:10px; font-size:14px; color:#cbd5e1; }}
         .telemetry-item {{ background:#0f172a; padding:6px 12px; border-radius:6px; border:1px solid #334155; }}
     </style>
@@ -1980,6 +2003,7 @@ class ApriltagDockingNode(Node):
             <button class="btn" onclick="startDocking()">▶️ 도킹 시작 (Start)</button>
             <button class="btn btn-stop" onclick="stopDocking()">⏹️ 정지 (Stop)</button>
             <button class="btn btn-flip" onclick="toggleFlip()">🔄 카메라 상하 반전 (Flip 180°)</button>
+            <button class="btn btn-axes" onclick="toggleAxes()">📐 3D 좌표축 On/Off</button>
         </div>
         <div class="telemetry-row">
             <div class="telemetry-item">상태: <b id="st-state" style="color:#38bdf8;">{node_ref.state}</b></div>
@@ -1999,6 +2023,9 @@ class ApriltagDockingNode(Node):
         }}
         function toggleFlip() {{
             fetch('/api/flip').then(r => r.json());
+        }}
+        function toggleAxes() {{
+            fetch('/api/toggle_axes').then(r => r.json());
         }}
         function clearPads() {{
             ['pad-fl','pad-fwd','pad-fr','pad-left','pad-stop','pad-right','pad-bwd'].forEach(id => {{
@@ -2082,6 +2109,13 @@ class ApriltagDockingNode(Node):
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
                     self.wfile.write(json.dumps({"flip_180": node_ref.flip_180}).encode('utf-8'))
+
+                elif self.path == '/api/toggle_axes':
+                    node_ref.show_axes = not getattr(node_ref, 'show_axes', True)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"show_axes": node_ref.show_axes}).encode('utf-8'))
 
                 elif self.path == '/api/start':
                     node_ref.is_active = True
