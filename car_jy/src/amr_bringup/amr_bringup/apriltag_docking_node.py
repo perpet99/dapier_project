@@ -829,6 +829,7 @@ class ApriltagDockingNode(Node):
             raw_tag_yaw = 0.0
             rot_mat_use = None
             station_lat_err = 0.0
+            s = self.tag_inner_size / 2.0
 
             has_explicit_lr = (
                 getattr(self, 'left_tag_id', -1) >= 0
@@ -922,6 +923,7 @@ class ApriltagDockingNode(Node):
                     c = candidates[0]
                 now_t = time.time()
                 u_cur = float(c["u"])
+                s = self.tag_inner_size / 2.0
                 # 코너 순서 [TL, TR, BR, BL]와 완벽 일치하는 3D 모델
                 tag_pts = np.array([[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]], dtype=np.float32)
                 ret_s, rv, tv = cv2.solvePnP(

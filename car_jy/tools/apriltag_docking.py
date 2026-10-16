@@ -750,6 +750,7 @@ class ApriltagDockingNode(Node):
             raw_tag_yaw = 0.0
             rot_mat_use = None
             station_lat_err = 0.0
+            s = self.tag_inner_size / 2.0
 
             has_explicit_lr = (
                 getattr(self, 'left_tag_id', -1) >= 0
