@@ -31,8 +31,8 @@ def generate_launch_description():
     )
     tag_size_arg = DeclareLaunchArgument(
         'tag_size',
-        default_value='0.08',
-        description='Physical marker outer size in meters (default: 0.08 = 8cm)'
+        default_value='0.14',
+        description='Physical marker outer size in meters (default: 0.14 = 14cm)'
     )
     tag_spacing_arg = DeclareLaunchArgument(
         'tag_spacing',
@@ -153,8 +153,8 @@ def generate_launch_description():
     )
     straight_drive_duration_arg = DeclareLaunchArgument(
         'straight_drive_duration',
-        default_value='6.0',
-        description='Duration in seconds for unconditional straight forward push when centered (default: 6.0s for complete contact)'
+        default_value='7.5',
+        description='Duration in seconds for unconditional straight forward push when centered (default: 7.5s for complete contact)'
     )
     straight_drive_speed_arg = DeclareLaunchArgument(
         'straight_drive_speed',
@@ -163,8 +163,8 @@ def generate_launch_description():
     )
     straight_dock_dist_arg = DeclareLaunchArgument(
         'straight_dock_dist',
-        default_value='0.25',
-        description='Distance threshold in meters to trigger final straight docking push (default: 0.25 = 25cm)'
+        default_value='0.38',
+        description='Distance threshold in meters to trigger final straight docking push (default: 0.38 = 38cm, handles tag clipping)'
     )
     web_port_arg = DeclareLaunchArgument(
         'web_port',

@@ -1369,7 +1369,7 @@
           <geometry>
             <plane>
               <normal>0 0 1</normal>
-              <size>0.08 0.08</size>
+              <size>0.14 0.14</size>
             </plane>
           </geometry>
           <material>
@@ -1392,7 +1392,7 @@
           <geometry>
             <plane>
               <normal>0 0 1</normal>
-              <size>0.08 0.08</size>
+              <size>0.14 0.14</size>
             </plane>
           </geometry>
           <material>

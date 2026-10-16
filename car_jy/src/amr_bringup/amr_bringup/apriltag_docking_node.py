@@ -60,7 +60,7 @@ class ApriltagDockingNode(Node):
         self.declare_parameter('target_tag_id', -1)            # -1: 임의의 감지된 첫 태그, >=0: 특정 ID
         self.declare_parameter('left_tag_id', -1)              # 왼쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
         self.declare_parameter('right_tag_id', -1)             # 오른쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
-        self.declare_parameter('tag_size', 0.08)                # 실제 마커 외곽 크기 (미터, 기본 0.08 = 8cm)
+        self.declare_parameter('tag_size', 0.14)                # 실제 마커 외곽 크기 (미터, 기본 0.14 = 14cm)
         self.declare_parameter('tag_spacing', 0.19)             # 두 마커 중심 간격 (미터, 기본 0.19 = 19cm)
         self.declare_parameter('is_gazebo_simulation', False)   # Gazebo 텍스처(2/3 마진) 적용 여부 (현실 로봇은 False)
 
@@ -91,9 +91,9 @@ class ApriltagDockingNode(Node):
         self.declare_parameter('lidar_offset', 0.14)            # 라이다 중심과 로봇 전방 범퍼/카메라 간 거리 (미터)
         self.declare_parameter('flip_180', True)                # 카메라 180도 상하 반전 (실제 AMR 기본: True)
         self.declare_parameter('show_gui', True)                # OpenCV 실시간 카메라 시점 GUI 창 표시 여부
-        self.declare_parameter('straight_drive_duration', 6.0)  # 중앙 정렬 후 무조건 직진 밀착 시간 (완전 벽 밀착: 6.0초)
+        self.declare_parameter('straight_drive_duration', 7.5)  # 중앙 정렬 후 무조건 직진 밀착 시간 (완전 벽 밀착: 7.5초)
         self.declare_parameter('straight_drive_speed', 0.07)    # 무조건 직진 시 주행 속도 (m/s)
-        self.declare_parameter('straight_dock_dist', 0.25)      # 최종 무조건 직진 밀착을 시작하는 도킹 진입 거리 (미터, 기본: 0.25m = 25cm)
+        self.declare_parameter('straight_dock_dist', 0.38)      # 최종 무조건 직진 밀착을 시작하는 도킹 진입 거리 (미터, 기본: 0.38m = 38cm, 태그 화각 이탈 대응)
         self.declare_parameter('web_port', 8088)                # 실시간 웹 모니터링 포트
         self.declare_parameter('enable_obstacle_guard', True)   # 도킹 경로상 돌발 장애물 안전 가드 활성화
         self.declare_parameter('obstacle_safety_dist', 0.45)    # 돌발 장애물 감지 거리 임계치 (m)
@@ -1370,7 +1370,7 @@ class ApriltagDockingNode(Node):
             # Case 2: [후진 리커버리 트리거: 벽 코앞인데 각도가 틀어져 있을 때]
             # 도킹대 코앞(0.28m 이하)에서 벽면과 각도/횡오차가 남아있으면 후진하여 공간 확보
             # -------------------------------------------------------------
-            elif curr_dist <= (self.straight_dock_dist + 0.07) and (abs(yaw_err) > 0.038 or abs(lat_err) > 0.025) and self.backup_count < self.max_backup_count:
+            elif curr_dist <= min(self.straight_dock_dist, 0.30) and (abs(yaw_err) > 0.038 or abs(lat_err) > 0.025) and self.backup_count < self.max_backup_count:
                 self.is_reversing = True
                 self.reverse_start_time = time.time()
                 self.backup_count += 1
@@ -1452,17 +1452,17 @@ class ApriltagDockingNode(Node):
                 self.tracked_single_role = None
 
             # 🚀 [초근접 화각 이탈 대응: 중앙 및 평행 정렬이 입증된 상태에서만 직진 밀착!]
-            is_was_centered = abs(self.last_seen_x) <= 0.040 or (hasattr(self, 'filt_lat_err') and abs(self.filt_lat_err) <= 0.040)
-            is_was_parallel = (hasattr(self, 'filt_yaw') and abs(self.filt_yaw) <= 0.040) or (abs(self.station_heading) <= 0.040)
+            is_was_centered = abs(self.last_seen_x) <= 0.045 or (hasattr(self, 'filt_lat_err') and abs(self.filt_lat_err) <= 0.045)
+            is_was_parallel = (hasattr(self, 'filt_yaw') and abs(self.filt_yaw) <= 0.045) or (abs(self.station_heading) <= 0.045)
 
-            if self.last_seen_dist <= (self.straight_dock_dist + 0.06) and is_was_centered and is_was_parallel and self.straight_drive_start_time is None and not self.is_reversing:
+            if self.last_seen_dist <= (self.straight_dock_dist + 0.10) and is_was_centered and is_was_parallel and self.straight_drive_start_time is None and not self.is_reversing:
                 self.straight_drive_start_time = time.time()
                 self.state = "STRAIGHT_IN"
                 wz = 0.0
                 self.smoothed_wz = 0.0
                 vx = float(self.straight_drive_speed)
                 self.get_logger().info(
-                    f"🚀 [초근접 화각 이탈 도킹] 도킹 직전 거리({self.last_seen_dist:.2f}m)에서 태그 통과 -> "
+                    f"🚀 [초근접 화각 이탈 도킹] 도킹 직전 거리({self.last_seen_dist:.2f}m)에서 태그 화각 이탈 -> "
                     f"{self.straight_drive_duration:.1f}초간 무조건 직진 밀착 푸시 개시!"
                 )
             elif self.last_seen_dist <= 0.35 and (not is_was_centered or not is_was_parallel) and self.backup_count < self.max_backup_count and not self.is_reversing:
