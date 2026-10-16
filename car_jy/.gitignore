@@ -1,0 +1,16 @@
+build/
+install/
+log/
+.vscode/
+*.pyc
+__pycache__/
+*:Zone.Identifier
+*.posegraph
+*.data
+.posegraph
+.data
+*.pgm
+map_*.yaml
+.env
+*.jpg
+snapshots/

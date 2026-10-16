@@ -1,0 +1,8 @@
+image: /home/juyeon/ros2_amr_ws/maps/keepout_mask.png
+mode: scale
+resolution: 0.050
+origin: [-10.997, -12.008, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+
