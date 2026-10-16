@@ -28,6 +28,7 @@ setup(
             'cmd_vel_odom = amr_bringup.cmd_vel_odom:main',
             'apriltag_docking_node = amr_bringup.apriltag_docking_node:main',
             'undock_node = amr_bringup.undock_node:main',
+            'button_stop_node = amr_bringup.button_stop_node:main',
         ],
     },
 )
