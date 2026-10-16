@@ -169,6 +169,18 @@ def setup_gpio(pin_num, controller, debounce_sec=0.05):
         btn = Button(pin_num, pull_up=True, bounce_time=debounce_sec)
         btn.when_pressed = controller.trigger_button_stop
         btn.when_released = lambda: print("\n⚪ [BUTTON] 버튼에서 손을 뗐습니다.")
+
+        # 🌟 초고속 폴링(100Hz) 백업 스레드 (인터럽트 누락 원천 차단)
+        def poll_gpiozero():
+            while controller.is_running and not controller.is_stopped:
+                try:
+                    if btn.is_pressed:
+                        controller.trigger_button_stop()
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.01)
+        threading.Thread(target=poll_gpiozero, daemon=True).start()
         return "gpiozero", btn
     except ImportError:
         pass
@@ -184,6 +196,18 @@ def setup_gpio(pin_num, controller, debounce_sec=0.05):
             controller.trigger_button_stop()
 
         GPIO.add_event_detect(pin_num, GPIO.FALLING, callback=bcm_callback, bouncetime=int(debounce_sec * 1000))
+
+        # 🌟 초고속 폴링(100Hz) 백업 스레드
+        def poll_rpi():
+            while controller.is_running and not controller.is_stopped:
+                try:
+                    if GPIO.input(pin_num) == 0:
+                        controller.trigger_button_stop()
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.01)
+        threading.Thread(target=poll_rpi, daemon=True).start()
         return "RPi.GPIO", GPIO
     except ImportError:
         pass
@@ -195,26 +219,18 @@ def setup_gpio(pin_num, controller, debounce_sec=0.05):
         chip = gpiod.Chip(chip_name)
         line = chip.get_line(pin_num)
         req_flags = getattr(gpiod, 'LINE_REQ_FLAG_BIAS_PULL_UP', 0)
-        line.request(consumer="amr_button", type=gpiod.LINE_REQ_EV_FALLING_EDGE, flags=req_flags)
+        line.request(consumer="amr_button", type=gpiod.LINE_REQ_DIR_IN, flags=req_flags)
 
-        class GpiodThread(threading.Thread):
-            def __init__(self, line, callback):
-                super().__init__(daemon=True)
-                self.line = line
-                self.callback = callback
-                self.running = True
-
-            def run(self):
-                while self.running:
-                    try:
-                        if self.line.event_wait(sec=1):
-                            _ = self.line.event_read()
-                            self.callback()
-                    except Exception:
-                        time.sleep(0.1)
-
-        t = GpiodThread(line, controller.trigger_button_stop)
-        t.start()
+        def poll_gpiod():
+            while controller.is_running and not controller.is_stopped:
+                try:
+                    if line.get_value() == 0:
+                        controller.trigger_button_stop()
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.01)
+        threading.Thread(target=poll_gpiod, daemon=True).start()
         print(f"🔌 [GPIO] gpiod 라이브러리 활성화 ({chip_name}, BCM 핀: {pin_num})")
         return "gpiod", line
     except Exception:
