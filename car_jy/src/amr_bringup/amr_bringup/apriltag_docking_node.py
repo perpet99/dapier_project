@@ -75,8 +75,8 @@ class ApriltagDockingNode(Node):
         # 속도 및 제어 게인
         self.declare_parameter('max_linear_speed', 0.15)        # 최대 전진 속도 (m/s)
         self.declare_parameter('min_linear_speed', 0.03)        # 최소 전진 속도 (m/s)
-        self.declare_parameter('max_angular_speed', 0.45)       # 최대 회전 속도 (rad/s)
-        self.declare_parameter('search_angular_speed', 0.35)    # 탐색/역회전 회전 속도 (rad/s)
+        self.declare_parameter('max_angular_speed', 0.70)       # 최대 회전 속도 (rad/s)
+        self.declare_parameter('search_angular_speed', 0.65)    # 탐색/역회전 회전 속도 (rad/s, 고속 탐색)
         self.declare_parameter('enable_search', True)           # 태그 미감지 시 자동 탐색/역회전 여부
         self.declare_parameter('auto_start', False)             # 노드 시작 시 즉시 도킹 제어 활성화 (기본: False, 시작 버튼 대기)
         self.declare_parameter('max_backup_count', 10)          # 최대 후진 리커버리 허용 횟수
@@ -1492,7 +1492,7 @@ class ApriltagDockingNode(Node):
                     self.state = "SEARCHING"
                     vx = 0.0
                     wait_time = (time.time() - self.first_frame_time) if self.first_frame_time else 0.0
-                    if wait_time < 3.0:
+                    if wait_time < 0.3:
                         wz = 0.0
                     elif self.last_turn_dir == "RIGHT":
                         wz = self.search_angular_speed

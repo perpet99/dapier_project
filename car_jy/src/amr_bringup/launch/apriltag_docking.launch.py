@@ -84,13 +84,13 @@ def generate_launch_description():
     )
     max_angular_speed_arg = DeclareLaunchArgument(
         'max_angular_speed',
-        default_value='0.45',
+        default_value='0.70',
         description='Maximum angular steering velocity in rad/s'
     )
     search_angular_speed_arg = DeclareLaunchArgument(
         'search_angular_speed',
-        default_value='0.35',
-        description='Angular velocity during tag search or recovery in rad/s'
+        default_value='0.65',
+        description='Angular velocity during tag search or recovery in rad/s (faster search)'
     )
     max_backup_count_arg = DeclareLaunchArgument(
         'max_backup_count',
