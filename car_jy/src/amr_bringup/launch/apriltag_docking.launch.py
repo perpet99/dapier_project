@@ -19,6 +19,16 @@ def generate_launch_description():
         default_value='-1',
         description='Target AprilTag ID (-1 for any tag)'
     )
+    left_tag_id_arg = DeclareLaunchArgument(
+        'left_tag_id',
+        default_value='-1',
+        description='Left AprilTag ID (-1 for auto, or specific ID like 0)'
+    )
+    right_tag_id_arg = DeclareLaunchArgument(
+        'right_tag_id',
+        default_value='-1',
+        description='Right AprilTag ID (-1 for auto, or specific ID like 1)'
+    )
     tag_size_arg = DeclareLaunchArgument(
         'tag_size',
         default_value='0.08',
@@ -172,6 +182,8 @@ def generate_launch_description():
         parameters=[{
             'tag_family': LaunchConfiguration('tag_family'),
             'target_tag_id': LaunchConfiguration('target_tag_id'),
+            'left_tag_id': LaunchConfiguration('left_tag_id'),
+            'right_tag_id': LaunchConfiguration('right_tag_id'),
             'tag_size': LaunchConfiguration('tag_size'),
             'tag_spacing': LaunchConfiguration('tag_spacing'),
             'is_gazebo_simulation': LaunchConfiguration('is_gazebo_simulation'),
@@ -205,6 +217,8 @@ def generate_launch_description():
     return LaunchDescription([
         tag_family_arg,
         target_tag_id_arg,
+        left_tag_id_arg,
+        right_tag_id_arg,
         tag_size_arg,
         tag_spacing_arg,
         is_gazebo_simulation_arg,

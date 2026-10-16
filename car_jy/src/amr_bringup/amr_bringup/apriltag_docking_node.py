@@ -58,6 +58,8 @@ class ApriltagDockingNode(Node):
         # 마커 및 배치 정보
         self.declare_parameter('tag_family', 'tag36h11')
         self.declare_parameter('target_tag_id', -1)            # -1: 임의의 감지된 첫 태그, >=0: 특정 ID
+        self.declare_parameter('left_tag_id', -1)              # 왼쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
+        self.declare_parameter('right_tag_id', -1)             # 오른쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
         self.declare_parameter('tag_size', 0.08)                # 실제 마커 외곽 크기 (미터, 기본 0.08 = 8cm)
         self.declare_parameter('tag_spacing', 0.19)             # 두 마커 중심 간격 (미터, 기본 0.19 = 19cm)
         self.declare_parameter('is_gazebo_simulation', False)   # Gazebo 텍스처(2/3 마진) 적용 여부 (현실 로봇은 False)
@@ -108,6 +110,8 @@ class ApriltagDockingNode(Node):
         self.straight_drive_paused_elapsed = 0.0
         self.tag_family_str = self.get_parameter('tag_family').value
         self.target_tag_id = int(self.get_parameter('target_tag_id').value)
+        self.left_tag_id = int(self.get_parameter('left_tag_id').value)
+        self.right_tag_id = int(self.get_parameter('right_tag_id').value)
         self.tag_size = float(self.get_parameter('tag_size').value)
         self.tag_spacing = float(self.get_parameter('tag_spacing').value)
         self.is_gazebo = bool(self.get_parameter('is_gazebo_simulation').value)
@@ -908,10 +912,16 @@ class ApriltagDockingNode(Node):
                 expected_du = fx * (self.tag_spacing / max(0.18, tz))
 
                 # ---------------------------------------------------------
-                # 🎯 [4단계 단일 마커 좌(LEFT)/우(RIGHT) 정밀 판별 로직]
+                # 🎯 [단일 마커 좌(LEFT)/우(RIGHT) 정밀 판별 로직]
                 # ---------------------------------------------------------
-                # 1단계: 좌/우 마커 ID가 서로 다른 경우 ID로 즉시 판별
-                if (
+                # 0단계: 파라미터로 지정된 좌/우 고유 태그 ID가 있는 경우 (절대 기준 확정)
+                if getattr(self, 'left_tag_id', -1) >= 0 and c["tid"] == self.left_tag_id:
+                    self.tracked_single_role = "LEFT"
+                elif getattr(self, 'right_tag_id', -1) >= 0 and c["tid"] == self.right_tag_id:
+                    self.tracked_single_role = "RIGHT"
+
+                # 1단계: 듀얼 마커에서 학습된 좌/우 ID가 서로 다른 경우 ID로 즉시 판별
+                elif (
                     self.has_seen_dual
                     and getattr(self, 'last_dual_left_id', -1) != getattr(self, 'last_dual_right_id', -1)
                 ):
@@ -944,24 +954,11 @@ class ApriltagDockingNode(Node):
                     if abs(du_jump) >= 0.55 * expected_du:
                         self.tracked_single_role = "RIGHT" if du_jump > 0 else "LEFT"
 
-                # 4단계: 처음부터 마커 1개만 보이는 경우 (화각 경계 클리핑 & 화면 위치 분석)
+                # 4단계: 처음부터 마커 1개만 보이는 경우 (화면 중심 cx 및 3D tx 기준 자연 판별)
                 else:
-                    # 만약 이 마커가 LEFT라면 파트너(RIGHT)는 u_cur + expected_du 에 있어야 함
-                    # 만약 이 마커가 RIGHT라면 파트너(LEFT)는 u_cur - expected_du 에 있어야 함
-                    u_partner_if_left = u_cur + expected_du
-                    u_partner_if_right = u_cur - expected_du
-                    border_margin = 20.0
-
-                    if u_partner_if_left > (w - border_margin) and u_partner_if_right >= border_margin:
-                        # 오른쪽 파트너 위치가 카메라 오른쪽 화면 밖으로 잘려 나간 상태 -> 현재 보이는 마커는 왼쪽(LEFT) 마커!
-                        self.tracked_single_role = "LEFT"
-                    elif u_partner_if_right < border_margin and u_partner_if_left <= (w - border_margin):
-                        # 왼쪽 파트너 위치가 카메라 왼쪽 화면 밖으로 잘려 나간 상태 -> 현재 보이는 마커는 오른쪽(RIGHT) 마커!
-                        self.tracked_single_role = "RIGHT"
-                    else:
-                        # 양쪽 파트너 예상 위치가 모두 화면 안에 있는데 1개만 보인다면(손 등으로 한쪽을 가린 경우):
-                        # 화면 중앙(cx) 기준 왼쪽에 있으면 LEFT 마커, 오른쪽에 있으면 RIGHT 마커
-                        self.tracked_single_role = "LEFT" if u_cur < cx else "RIGHT"
+                    # 마커가 화면 중심보다 왼쪽(u_cur < cx 또는 tx < 0.0)에 위치하면 LEFT 마커!
+                    # 마커가 화면 중심보다 오른쪽(u_cur >= cx 또는 tx >= 0.0)에 위치하면 RIGHT 마커!
+                    self.tracked_single_role = "LEFT" if (u_cur < cx or tx < 0.0) else "RIGHT"
 
                 self.last_single_u = u_cur
                 self.last_single_time = now_t

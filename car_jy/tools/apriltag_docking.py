@@ -57,6 +57,8 @@ class ApriltagDockingNode(Node):
         # 마커 및 배치 정보
         self.declare_parameter('tag_family', 'tag36h11')
         self.declare_parameter('target_tag_id', -1)            # -1: 임의의 감지된 첫 태그, >=0: 특정 ID
+        self.declare_parameter('left_tag_id', -1)              # 왼쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
+        self.declare_parameter('right_tag_id', -1)             # 오른쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
         self.declare_parameter('tag_size', 0.08)                # 실제 마커 외곽 크기 (미터, 기본 0.08 = 8cm)
         self.declare_parameter('tag_spacing', 0.19)             # 두 마커 중심 간격 (미터, 기본 0.19 = 19cm)
         self.declare_parameter('is_gazebo_simulation', False)   # Gazebo 텍스처(2/3 마진) 적용 여부 (현실 로봇은 False)
@@ -98,6 +100,8 @@ class ApriltagDockingNode(Node):
         # -----------------------------------------------------------------
         self.tag_family_str = self.get_parameter('tag_family').value
         self.target_tag_id = int(self.get_parameter('target_tag_id').value)
+        self.left_tag_id = int(self.get_parameter('left_tag_id').value)
+        self.right_tag_id = int(self.get_parameter('right_tag_id').value)
         self.tag_size = float(self.get_parameter('tag_size').value)
         self.tag_spacing = float(self.get_parameter('tag_spacing').value)
         self.is_gazebo = bool(self.get_parameter('is_gazebo_simulation').value)
@@ -821,8 +825,22 @@ class ApriltagDockingNode(Node):
                     lat_err_R = float(-p_cand_R[0])
                     dist_z_R = abs(float(p_cand_R[2]))  # 전방 거리는 항상 벽 앞 양수(+)
 
-                    # 🌟 [단일 태그 좌/우 판별: 횡오차 연속성(절대적 18cm 간격 차이) 최우선 판별]
-                    if hasattr(self, 'filt_lat_err') and abs(self.filt_lat_err) < 2.0:
+                    # 🌟 [단일 태그 좌/우 판별]
+                    # 0단계: 파라미터로 지정된 좌/우 고유 태그 ID가 있는 경우 (절대 기준 확정)
+                    if getattr(self, 'left_tag_id', -1) >= 0 and c["tid"] == self.left_tag_id:
+                        self.tracked_single_role = "LEFT"
+                    elif getattr(self, 'right_tag_id', -1) >= 0 and c["tid"] == self.right_tag_id:
+                        self.tracked_single_role = "RIGHT"
+                    # 1단계: 듀얼 마커에서 학습된 좌/우 ID가 서로 다른 경우 ID로 즉시 판별
+                    elif (
+                        self.has_seen_dual
+                        and getattr(self, 'last_dual_left_id', -1) != getattr(self, 'last_dual_right_id', -1)
+                    ):
+                        if c["tid"] == self.last_dual_left_id:
+                            self.tracked_single_role = "LEFT"
+                        elif c["tid"] == self.last_dual_right_id:
+                            self.tracked_single_role = "RIGHT"
+                    elif hasattr(self, 'filt_lat_err') and abs(self.filt_lat_err) < 2.0:
                         diff_L = abs(lat_err_L - self.filt_lat_err)
                         diff_R = abs(lat_err_R - self.filt_lat_err)
                         self.tracked_single_role = "LEFT" if diff_L <= diff_R else "RIGHT"
@@ -832,12 +850,7 @@ class ApriltagDockingNode(Node):
                         d_right_3d = float(np.linalg.norm(cur_tv - self.last_dual_right_tvec.flatten()))
                         self.tracked_single_role = "LEFT" if d_left_3d <= d_right_3d else "RIGHT"
                     elif self.tracked_single_role is None:
-                        if nx < -0.06 or raw_tag_yaw < -0.06:
-                            self.tracked_single_role = "LEFT"
-                        elif nx > 0.06 or raw_tag_yaw > 0.06:
-                            self.tracked_single_role = "RIGHT"
-                        else:
-                            self.tracked_single_role = "LEFT" if (float(tv[0][0]) < 0 or float(c["u"]) < cx) else "RIGHT"
+                        self.tracked_single_role = "LEFT" if (float(tv[0][0]) < 0 or float(c["u"]) < cx) else "RIGHT"
 
                     is_left = (self.tracked_single_role == "LEFT")
 
