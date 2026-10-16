@@ -128,6 +128,37 @@ def setup_gpio(pin_num, stop_controller, debounce_sec=0.05):
     except ImportError:
         pass
 
+    # 3. gpiod 시도 (라즈베리파이 OS 기본 내장 라이브러리)
+    try:
+        import gpiod
+        chip_name = 'gpiochip4' if os.path.exists('/dev/gpiochip4') else 'gpiochip0'
+        chip = gpiod.Chip(chip_name)
+        line = chip.get_line(pin_num)
+        req_flags = getattr(gpiod, 'LINE_REQ_FLAG_BIAS_PULL_UP', 0)
+        line.request(consumer="amr_button", type=gpiod.LINE_REQ_EV_FALLING_EDGE, flags=req_flags)
+
+        class GpiodThread(threading.Thread):
+            def __init__(self, line, callback):
+                super().__init__(daemon=True)
+                self.line = line
+                self.callback = callback
+                self.running = True
+            def run(self):
+                while self.running:
+                    try:
+                        if self.line.event_wait(sec=1):
+                            _ = self.line.event_read()
+                            self.callback()
+                    except Exception:
+                        time.sleep(0.1)
+
+        t = GpiodThread(line, stop_controller.stop_robot)
+        t.start()
+        print(f"🔌 [GPIO] gpiod 라이브러리 사용 ({chip_name}, BCM 핀: {pin_num})")
+        return "gpiod", line
+    except Exception:
+        pass
+
     return None, None
 
 

@@ -59,8 +59,41 @@ class ButtonStopNode(Node):
         except ImportError:
             pass
 
+        try:
+            import os
+            import threading
+            import gpiod
+            chip_name = 'gpiochip4' if os.path.exists('/dev/gpiochip4') else 'gpiochip0'
+            chip = gpiod.Chip(chip_name)
+            line = chip.get_line(self.pin)
+            req_flags = getattr(gpiod, 'LINE_REQ_FLAG_BIAS_PULL_UP', 0)
+            line.request(consumer="amr_button", type=gpiod.LINE_REQ_EV_FALLING_EDGE, flags=req_flags)
+
+            class GpiodThread(threading.Thread):
+                def __init__(self, line, callback):
+                    super().__init__(daemon=True)
+                    self.line = line
+                    self.callback = callback
+                    self.running = True
+                def run(self):
+                    while self.running:
+                        try:
+                            if self.line.event_wait(sec=1):
+                                _ = self.line.event_read()
+                                self.callback()
+                        except Exception:
+                            time.sleep(0.1)
+
+            self.gpiod_thread = GpiodThread(line, self.on_button_pressed)
+            self.gpiod_thread.start()
+            self.gpio_backend = "gpiod"
+            self.get_logger().info(f"🔌 [GPIO] gpiod 활성화 ({chip_name}, BCM {self.pin}번 핀 대기 중)")
+            return
+        except Exception:
+            pass
+
         self.get_logger().warn(
-            "⚠️ [GPIO] gpiozero 또는 RPi.GPIO 라이브러리를 찾을 수 없습니다. "
+            "⚠️ [GPIO] gpiozero, RPi.GPIO 또는 gpiod 라이브러리를 찾을 수 없습니다. "
             "(라즈베리파이에서 'sudo apt install python3-gpiozero' 실행 필요)"
         )
 
