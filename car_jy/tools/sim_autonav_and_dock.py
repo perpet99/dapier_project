@@ -392,7 +392,7 @@ class AutoNavDockSimNode(Node):
             rclpy.spin_once(self, timeout_sec=0.04)
 
 
-def run_simulation(trials_to_run: int = 3, out_dir: str = "/home/juyeon/ros2_amr_ws/sim_videos"):
+def run_simulation(trials_to_run: int = 4, start_trial: int = 1, out_dir: str = "/home/juyeon/ros2_amr_ws/sim_videos", video_prefix: str = ""):
     os.makedirs(out_dir, exist_ok=True)
     rclpy.init()
     node = AutoNavDockSimNode()
@@ -403,9 +403,9 @@ def run_simulation(trials_to_run: int = 3, out_dir: str = "/home/juyeon/ros2_amr
     # MP4 VideoWriters (20 FPS, H.264 avc1)
     fps = 20.0
     fourcc = cv2.VideoWriter_fourcc(*'avc1')
-    top_video_path = os.path.join(out_dir, "autonav_docking_topview.mp4")
-    cam_video_path = os.path.join(out_dir, "autonav_docking_cameraview.mp4")
-    comb_video_path = os.path.join(out_dir, "autonav_docking_combined.mp4")
+    top_video_path = os.path.join(out_dir, f"{video_prefix}autonav_docking_topview.mp4")
+    cam_video_path = os.path.join(out_dir, f"{video_prefix}autonav_docking_cameraview.mp4")
+    comb_video_path = os.path.join(out_dir, f"{video_prefix}autonav_docking_combined.mp4")
 
     vw_top = cv2.VideoWriter(top_video_path, fourcc, fps, (640, 480))
     vw_cam = cv2.VideoWriter(cam_video_path, fourcc, fps, (640, 480))
@@ -439,6 +439,12 @@ def run_simulation(trials_to_run: int = 3, out_dir: str = "/home/juyeon/ros2_amr
             "start_x": 5.15, "start_y": -5.35, "start_yaw_deg": 5.0,
             "err_x": +0.25, "err_y": +0.15, "err_yaw_deg": -12.0,
         },
+        {
+            "name": "시나리오 4 [극한 환경]: 횡방향 대규모 이탈(+38cm) 및 극단적 사선(-42°) 도착 (시야 이탈 한계 테스트)",
+            "title_en": "Extreme Offset (+38cm) & Severe Skew (-42 deg)",
+            "start_x": 4.95, "start_y": -5.60, "start_yaw_deg": 15.0,
+            "err_x": -0.10, "err_y": +0.38, "err_yaw_deg": -42.0,
+        },
     ]
 
     results = []
@@ -471,7 +477,8 @@ def run_simulation(trials_to_run: int = 3, out_dir: str = "/home/juyeon/ros2_amr
         total_frames += 1
         return comb_img
 
-    for idx, sc in enumerate(scenarios[:trials_to_run], start=1):
+    for idx in range(start_trial, min(trials_to_run + 1, len(scenarios) + 1)):
+        sc = scenarios[idx - 1]
         print("\n" + "=" * 78)
         print(f"🚀 [{idx}/{trials_to_run}] {sc['name']}")
         print("=" * 78)
@@ -638,7 +645,9 @@ def run_simulation(trials_to_run: int = 3, out_dir: str = "/home/juyeon/ros2_amr
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trials", type=int, default=3, help="실행할 오차 시나리오 개수 (기본 3)")
+    parser.add_argument("--trials", type=int, default=3, help="실행할 최대 오차 시나리오 번호 (기본 3)")
+    parser.add_argument("--start-trial", type=int, default=1, help="시작 시나리오 번호 (1-based)")
+    parser.add_argument("--prefix", default="", help="영상 파일명 접두사 (예: extreme_)")
     parser.add_argument("--out-dir", default="/home/juyeon/ros2_amr_ws/sim_videos", help="영상 저장 폴더")
     args = parser.parse_args()
-    run_simulation(trials_to_run=args.trials, out_dir=args.out_dir)
+    run_simulation(trials_to_run=args.trials, start_trial=args.start_trial, out_dir=args.out_dir, video_prefix=args.prefix)
