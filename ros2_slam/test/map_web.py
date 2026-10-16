@@ -26,11 +26,13 @@ lidar_navigation / rtabmap_* launches, same ROS_DOMAIN_ID); the lidar scan,
                                 (or {"name", "x", "y", "yaw"} for an explicit pose)
   POST /api/labels/delete {"id": "..."}
   POST /api/labels/rename {"id": "...", "name": "새 이름"}
+  POST /api/labels/tolerance {"id": "...", "xy": 0.05, "yaw_deg": 10}   per-label arrival tolerance
+                                used while a Go to that label runs ({"id"} alone = back to the default)
   POST /api/nav/goto {"id": "..."}    Nav2 NavigateToPose to the label; when the label is
                                 behind the robot (bearing > 90 deg) back up goto_backup_m
-                                (0.30 m) first. A label inside an obstacle / the robot radius on
-                                Nav2's global costmap is driven to the closest reachable point
-                                (within 1.5 m) instead; an abort mid-route retries up to twice when
+                                (0.30 m) first. A label whose global-costmap cost is >= goal_max_cost
+                                (50: obstacle, robot radius or the inflation next to one) is driven
+                                to the closest reachable cell below that cost (within 1.5 m) instead; an abort mid-route retries up to twice when
                                 that point has moved (obstacle seen on the way)
   POST /api/nav/goto_wall {"id": "..."}   Go to the label, then (on arrival) the lidar wall
                                 approach: square up to the wall in front and drive to `gap`
@@ -198,6 +200,19 @@ class Labels:
             if any(o['name'] == name and o['id'] != label_id for o in self.items):
                 raise ValueError(f'이미 있는 이름입니다: {name}')
             lb['name'] = name
+            self._save()
+            return dict(lb)
+
+    def set_tol(self, label_id, tol) -> dict:
+        """tol {'xy': m, 'yaw_deg': deg} (already validated) or None = use the global tolerance."""
+        with self.lock:
+            lb = next((lb for lb in self.items if lb['id'] == label_id), None)
+            if lb is None:
+                raise KeyError(label_id)
+            if tol is None:
+                lb.pop('tol', None)
+            else:
+                lb['tol'] = tol
             self._save()
             return dict(lb)
 
@@ -866,6 +881,8 @@ class GoalTolerance:
     def __init__(self, node: Node):
         self.node = node
         p = lambda name, default: node.declare_parameter(name, default).value
+        self.override = None      # {'xy', 'yaw', 'label'}: the running Go to's label tolerance
+        self.sending = None       # value of the set_parameters call in flight
         self.xy_min, self.xy_max = float(p('goal_xy_min', 0.03)), float(p('goal_xy_max', 0.5))
         self.yaw_min, self.yaw_max = float(p('goal_yaw_min_deg', 3.0)), float(p('goal_yaw_max_deg', 90.0))
         self.path = os.path.expanduser(p('tolerance_file', '~/.ros/car2_nav_tolerance.json'))
@@ -890,12 +907,27 @@ class GoalTolerance:
         node.create_timer(2.0, self.tick)
         node.create_timer(0.2, lambda: self.kick and self.tick())
 
-    def set(self, xy, yaw_deg) -> dict:
+    def check(self, xy, yaw_deg):
         xy, yaw_deg = float(xy), float(yaw_deg)
         if not (self.xy_min <= xy <= self.xy_max):
             raise ValueError(f'위치 오차는 {self.xy_min:g} ~ {self.xy_max:g} m 범위로 입력하세요')
         if not (self.yaw_min <= yaw_deg <= self.yaw_max):
             raise ValueError(f'방향 오차는 {self.yaw_min:g} ~ {self.yaw_max:g}° 범위로 입력하세요')
+        return round(xy, 3), round(yaw_deg, 1)
+
+    def use_label(self, label):
+        """Go to start: apply the label's own tolerance (if it has one); None/no 'tol' = the saved one.
+        Applied within ~0.2 s -- long before the robot gets near the goal."""
+        tol = (label or {}).get('tol')
+        self.override = None if not tol else {'xy': tol['xy'], 'yaw': round(math.radians(tol['yaw_deg']), 4),
+                                              'label': label['name']}
+        self.kick = True
+
+    def want(self):
+        return self.override or self.saved
+
+    def set(self, xy, yaw_deg) -> dict:
+        xy, yaw_deg = self.check(xy, yaw_deg)
         self.saved = {'xy': round(xy, 3), 'yaw': round(math.radians(yaw_deg), 4)}
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path + '.tmp', 'w') as f:
@@ -905,9 +937,9 @@ class GoalTolerance:
         return self.status()
 
     def tick(self):
-        self.kick = False
         if self.busy:
-            return
+            return                # kick stays set: retried 0.2 s later, not at the next 2 s tick
+        self.kick = False
         if not self.get_cli.service_is_ready():
             self.active = None
             self.message = 'Nav2 꺼짐 — 저장값은 내비게이션을 시작하면 자동 적용됩니다'
@@ -927,8 +959,9 @@ class GoalTolerance:
         except Exception as exc:
             self.active, self.message, self.busy = None, f'Nav2 파라미터 읽기 실패: {exc}', False
             return
-        want = self.saved
+        want = self.want()
         if want and (abs(want['xy'] - self.active['xy']) > 1e-4 or abs(want['yaw'] - self.active['yaw']) > 1e-4):
+            self.sending = {'xy': want['xy'], 'yaw': want['yaw']}
             req = SetParameters.Request(parameters=[
                 Parameter(name=n, value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=v))
                 for n, v in zip(self.names, (want['xy'], want['yaw']))])
@@ -943,22 +976,25 @@ class GoalTolerance:
             if bad:
                 self.message = 'Nav2가 거부: ' + '; '.join(bad)
             else:
-                self.active = dict(self.saved)
+                self.active = dict(self.sending)
                 self.message = 'Nav2에 적용됨'
-                self.node.get_logger().info(f"goal tolerance set: xy {self.saved['xy']} m, "
-                                            f"yaw {math.degrees(self.saved['yaw']):.1f} deg")
+                self.node.get_logger().info(f"goal tolerance set: xy {self.sending['xy']} m, "
+                                            f"yaw {math.degrees(self.sending['yaw']):.1f} deg"
+                                            + (f" (label '{self.override['label']}')" if self.override else ''))
         except Exception as exc:
             self.message = f'Nav2 파라미터 설정 실패: {exc}'
         self.busy = False
 
     def status(self) -> dict:
         deg = lambda d: None if d is None else {'xy': d['xy'], 'yaw_deg': round(math.degrees(d['yaw']), 1)}
+        ov = self.override
         return {'saved': deg(self.saved), 'active': deg(self.active), 'message': self.message,
+                'override': None if ov is None else {**deg(ov), 'label': ov['label']},
                 'limits': {'xy': [self.xy_min, self.xy_max], 'yaw_deg': [self.yaw_min, self.yaw_max]}}
 
     def arrive_check(self) -> float:
         """Distance beyond which a Nav2 'succeeded' is reported as not really arrived."""
-        xy = (self.active or self.saved or {'xy': 0.1})['xy']
+        xy = (self.active or self.want() or {'xy': 0.1})['xy']
         return max(0.35, xy + 0.15)
 
 
@@ -987,6 +1023,10 @@ class MapWeb(Node):
         self.goal_handle = None
         # every Go to first backs straight up this far (odom distance), then sends the goal
         self.backup_m = float(self.declare_parameter('goto_backup_m', 0.30).value)
+        # a Go to goal must sit below this global-costmap cost (0..100). Higher = deep in the inflation
+        # next to an obstacle: MPPI's CostCritic will not drive in there and the robot stalls ('Failed to
+        # make progress' x4 at a moved 99-cost label). Such labels go to the closest cell below it.
+        self.goal_max_cost = int(self.declare_parameter('goal_max_cost', 50).value)
         self.backup_speed = float(self.declare_parameter('goto_backup_speed', 0.08).value)
         self.robot_back = float(self.declare_parameter('robot_back', 0.16).value)       # center -> rear of body
         self.backup_clear_m = float(self.declare_parameter('goto_backup_clear_m', 0.12).value)
@@ -1103,9 +1143,10 @@ class MapWeb(Node):
             return -1
         return int(grid[j, i])
 
-    def nearest_reachable(self, x, y, max_m=1.5):
-        """Closest costmap cell to (x, y) the robot can stand on (cost < 99) and drive to from where it is
-        now (same free region), as (x, y, shift m); None without a fresh costmap or no such cell in max_m."""
+    def nearest_reachable(self, x, y, max_m=1.5, max_cost=99):
+        """Closest costmap cell to (x, y) with cost < max_cost that the robot can drive to from where it
+        is now (same cost < 99 region), as (x, y, shift m); None without a fresh costmap or no such
+        cell in max_m."""
         cm = self.costmap
         if cm is None or time.time() - cm[5] > 30.0:
             return None
@@ -1117,7 +1158,7 @@ class MapWeb(Node):
             ri, rj = int((cur[1] - ox) / res), int((cur[2] - oy) / res)
             if 0 <= ri < grid.shape[1] and 0 <= rj < grid.shape[0] and comp[rj, ri] > 0:
                 free = (comp == comp[rj, ri]).astype(np.uint8)   # only cells connected to the robot
-        js, is_ = np.nonzero(free)
+        js, is_ = np.nonzero(free.astype(bool) & (grid < max_cost))
         if js.size == 0:
             return None
         cx, cy = ox + (is_ + 0.5) * res, oy + (js + 0.5) * res
@@ -1128,18 +1169,21 @@ class MapWeb(Node):
         return round(float(cx[k]), 3), round(float(cy[k]), 3), round(float(d[k]), 3)
 
     def reachable_goal(self, label):
-        """The label itself, or -- when it sits in an obstacle / within the robot radius on Nav2's
-        costmap -- a copy moved to the closest reachable point (keeps the label's heading).
-        Returns (goal, note); goal None when nothing reachable is near."""
+        """The label itself, or -- when it sits in an obstacle / the robot radius / the high-cost band
+        next to one (cost >= goal_max_cost) on Nav2's costmap -- a copy moved to the closest reachable
+        low-cost point (keeps the label's heading). Returns (goal, note); goal None when nothing is near."""
         cost = self.cost_at(label['x'], label['y'])
-        if cost is None or cost < 99:
+        if cost is None or cost < self.goal_max_cost:
             return label, ''
-        near = self.nearest_reachable(label['x'], label['y'])
+        what = '막혀 있어' if cost >= 99 else '장애물에 너무 가까워'
+        near = self.nearest_reachable(label['x'], label['y'], max_cost=self.goal_max_cost)
         if near is None:
+            if cost < 99:                 # nothing low-cost nearby, but the label itself is drivable
+                return label, ''
             return None, f'라벨 위치가 비용지도에서 막혀 있고(cost {cost}) 1.5 m 안에 갈 수 있는 곳이 없습니다'
         x, y, shift = near
         return ({**label, 'x': x, 'y': y, 'orig': {'x': label['x'], 'y': label['y']}, 'shift': shift},
-                f'라벨 위치가 막혀 있어(cost {cost}) {shift * 100:.0f} cm 떨어진 가장 가까운 지점으로')
+                f'라벨 위치가 {what}(cost {cost}) {shift * 100:.0f} cm 떨어진 비용 {self.goal_max_cost} 미만 지점으로')
 
     def _on_scan(self, msg: LaserScan):
         now = time.time()
@@ -1418,6 +1462,7 @@ class MapWeb(Node):
                         'note': note, 'message': f'실패: {adj}', 'finished': time.time()}
             self.get_logger().info(f"nav goal '{label['name']}': {adj}")
             return
+        self.tolerance.use_label(label)
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = target.get('frame', self.map_frame)
         goal.pose.pose.position.x = float(target['x'])
@@ -1444,6 +1489,7 @@ class MapWeb(Node):
         if seq != self.nav_seq:
             return
         if not gh.accepted:
+            self.tolerance.use_label(None)
             self._set_nav(seq, state='rejected', message='Nav2가 목표를 거부했습니다')
             return
         self.goal_handle = gh
@@ -1474,8 +1520,10 @@ class MapWeb(Node):
                 self.request_nav(('retry', seq, label, '막혀서 다시 시도', self.nav.get('retries', 0) + 1))
                 self.get_logger().info('nav aborted, retrying to the closest reachable point')
                 return
+        if seq == self.nav_seq:
+            self.tolerance.use_label(None)     # back to the global tolerance
         if state == 'succeeded' and target and 'shift' in target:
-            msg = f"라벨 위치가 막혀 있어 {target['shift'] * 100:.0f} cm 떨어진 가장 가까운 지점에 도착"
+            msg = f"라벨 위치가 장애물에 가까워 {target['shift'] * 100:.0f} cm 떨어진 가장 가까운 지점에 도착"
         self._set_nav(seq, state=state, message=msg + (f': {err}' if err else ''), finished=time.time())
         self.get_logger().info(f'nav result: {state} {err}')
         if seq == self.nav_seq and self.nav_then == 'wall':
@@ -1686,6 +1734,7 @@ PAGE = """<!doctype html>
   #relocstate { font-size:13px; color:var(--muted); }
   #relocstate.ok { color:#7ddc8a; } #relocstate.err { color:#ff8a80; } #relocstate.busy { color:#ffb74c; }
   .labels .blocked { color:#ffb74c; font-size:12px; }
+  .labels .muted { color:var(--muted); }
   .tol { display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; padding-top:8px; border-top:1px solid #ffffff14; }
   .tol .f { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); }
   .tol input[type=range] { width:140px; }
@@ -1775,7 +1824,7 @@ __DRIVE_CSS__
     <span id="lmsg"></span>
   </div>
   <div class="ltable"><table>
-    <thead><tr><th>이름</th><th>X (m)</th><th>Y (m)</th><th>방향</th><th>로봇에서 거리</th></tr></thead>
+    <thead><tr><th>이름</th><th>X (m)</th><th>Y (m)</th><th>방향</th><th>로봇에서 거리</th><th title="이 라벨로 Go to 할 때 쓰는 도착 오차 (없으면 아래 기본값)">도착 오차</th></tr></thead>
     <tbody id="lbody"></tbody>
   </table></div>
   <div class="labelbar">
@@ -1794,7 +1843,9 @@ __DRIVE_CSS__
     <span class="f" title="목표 방향과 이만큼 안이면 도착">방향
       <input id="tolyaw" type="range" step="1"> <input id="tolyawn" type="number" step="1"> °
       <small id="tolyawr"></small></span>
-    <button id="tolapply">적용</button>
+    <button id="tolapply" title="라벨에 따로 정하지 않았을 때 쓰는 기본 도착 오차로 저장">기본값으로 적용</button>
+    <button id="tollabel" class="ghost" disabled title="이 위치/방향 오차를 선택한 라벨에만 저장 — 그 라벨로 Go to 할 때만 쓴다">선택 라벨에 저장</button>
+    <button id="tolclear" class="ghost" disabled title="선택한 라벨의 도착 오차를 지우고 기본값을 쓴다">라벨 값 지우기</button>
     <span id="tolstate"></span>
   </div>
 </div>
@@ -2186,11 +2237,26 @@ function renderTol() {
     $('tolxy').value = $('tolxyn').value = cur.xy;
     $('tolyaw').value = $('tolyawn').value = Math.round(cur.yaw_deg);
   }
-  const a = t.active, sv = t.saved;
+  const a = t.active, sv = t.override || t.saved;
   let txt = a ? `Nav2 적용값 ${a.xy.toFixed(2)} m / ${a.yaw_deg.toFixed(0)}°` : '';
+  if (t.override) txt += ` (라벨 '${t.override.label}' 값)`;
   if (sv && a && (Math.abs(sv.xy - a.xy) > 1e-4 || Math.abs(sv.yaw_deg - a.yaw_deg) > 0.1)) txt += ' · 적용 중…';
+  const lb = selId && S.labels.find(l => l.id === selId);
+  $('tollabel').disabled = !lb; $('tolclear').disabled = !(lb && lb.tol);
+  $('tollabel').textContent = lb ? `'${lb.name}'에 저장` : '선택 라벨에 저장';
   msg('tolstate', [txt, t.message].filter(Boolean).join(' · '), a ? (t.message === 'Nav2에 적용됨' ? 'ok' : 'busy') : 'err');
 }
+async function setLabelTol(clear) {
+  const lb = selId && S.labels.find(l => l.id === selId); if (!lb) return;
+  const body = clear ? { id: lb.id } : { id: lb.id, xy: parseFloat($('tolxyn').value), yaw_deg: parseFloat($('tolyawn').value) };
+  try {
+    const r = await post('/api/labels/tolerance', body); lastRows = '';
+    msg('lmsg', r.tol ? `'${r.name}' 도착 오차 ${r.tol.xy} m / ${r.tol.yaw_deg}° 저장 — 이 라벨로 Go to 할 때 적용`
+                          : `'${r.name}'은(는) 기본 도착 오차를 씁니다`, 'ok');
+  } catch (e) { msg('lmsg', e.message, 'err'); }
+}
+$('tollabel').onclick = () => setLabelTol(false);
+$('tolclear').onclick = () => setLabelTol(true);
 $('tolapply').onclick = async () => {
   const xy = parseFloat($('tolxyn').value), yaw = parseFloat($('tolyawn').value);
   try { await post('/api/nav/tolerance', { xy, yaw_deg: yaw }); tolEdited = false; msg('tolstate', '저장함 — Nav2에 적용 중…', 'busy'); }
@@ -2236,8 +2302,9 @@ function renderLabels() {
   const target = S && S.nav && ['backing', 'sending', 'active', 'canceling'].includes(S.nav.state) && S.nav.target ? S.nav.target.id : null;
   const rows = labels.length ? labels.map(lb => `<tr data-id="${lb.id}" class="${lb.id === selId ? 'sel' : ''} ${lb.id === target ? 'target' : ''}">
       <td>${esc(lb.name)}${lb.cost >= 99 ? ' <span class="blocked" title="Nav2 비용지도에서 장애물/로봇 반경 안 — Go to는 가장 가까운 갈 수 있는 지점까지 가서 멈춤">⚠ 도달 불가 (근처까지)</span>' : ''}</td><td>${lb.x.toFixed(2)}</td><td>${lb.y.toFixed(2)}</td><td>${deg(lb.yaw).toFixed(0)}°</td>
-      <td>${p ? Math.hypot(lb.x - p.x, lb.y - p.y).toFixed(2) + ' m' : '-'}</td></tr>`).join('')
-    : '<tr><td colspan="5" class="empty">등록된 라벨이 없습니다 — 로봇을 원하는 곳에 두고 이름을 입력해 추가하세요</td></tr>';
+      <td>${p ? Math.hypot(lb.x - p.x, lb.y - p.y).toFixed(2) + ' m' : '-'}</td>
+      <td>${lb.tol ? `${lb.tol.xy.toFixed(2)} m / ${lb.tol.yaw_deg.toFixed(0)}°` : '<span class="muted">기본</span>'}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="empty">등록된 라벨이 없습니다 — 로봇을 원하는 곳에 두고 이름을 입력해 추가하세요</td></tr>';
   if (rows !== lastRows) { $('lbody').innerHTML = rows; lastRows = rows; }
   $('lgo').disabled = !selId || !(S && S.nav && S.nav.server);
   $('lgo').title = S && S.nav && S.nav.server ? 'Nav2로 선택한 라벨 위치까지 자율 주행'
@@ -2262,6 +2329,11 @@ $('lbody').addEventListener('click', e => {
   selId = tr.dataset.id; lastRows = ''; renderLabels(); draw();
   const lb = S.labels.find(l => l.id === selId);
   if (lb && !$('follow').checked) { view.x = lb.x; view.y = lb.y; draw(); }
+  if (lb && lb.tol) {   // show the label's own tolerance in the inputs (edit, then '선택 라벨에 저장')
+    $('tolxy').value = $('tolxyn').value = lb.tol.xy;
+    $('tolyaw').value = $('tolyawn').value = Math.round(lb.tol.yaw_deg);
+    tolEdited = true;
+  }
 });
 async function addLabel() {
   const name = $('lname').value.trim();
@@ -2470,11 +2542,20 @@ def make_handler(node: MapWeb):
                     self._json({'error': str(exc)}, 409)
                 except OSError as exc:
                     self._json({'error': f'저장 실패: {exc}'}, 500)
-            elif path in ('/api/labels', '/api/labels/delete', '/api/labels/rename', '/api/nav/goto', '/api/nav/goto_wall'):
+            elif path in ('/api/labels', '/api/labels/delete', '/api/labels/rename', '/api/labels/tolerance',
+                          '/api/nav/goto', '/api/nav/goto_wall'):
                 try:
                     req = json.loads(body or b'{}')
                     if path == '/api/labels':
                         self._json(node.add_label(req))
+                    elif path == '/api/labels/tolerance':
+                        tol = None
+                        if req.get('xy') is not None or req.get('yaw_deg') is not None:
+                            if req.get('xy') is None or req.get('yaw_deg') is None:
+                                raise ValueError('xy와 yaw_deg를 함께 주세요 (둘 다 빼면 기본값 사용)')
+                            xy, yaw = node.tolerance.check(req['xy'], req['yaw_deg'])
+                            tol = {'xy': xy, 'yaw_deg': yaw}
+                        self._json(node.labels.set_tol(req.get('id'), tol))
                     elif path == '/api/labels/rename':
                         self._json(node.labels.rename(req.get('id'), str(req.get('name', ''))))
                     elif path == '/api/labels/delete':

@@ -1,0 +1,290 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="amr">
+  <!-- 로봇 치수: 가로 45cm, 세로 35cm, 전체 높이 75cm, 지름 8cm 4바퀴(외벽 네 꼭짓점) -->
+  <xacro:property name="wheel_radius" value="0.04"/>
+  <xacro:property name="wheel_width" value="0.025"/>
+  <xacro:property name="wheel_sep" value="0.48"/>
+  <xacro:property name="wheel_base" value="0.26"/>
+  <xacro:property name="chassis_length" value="0.35"/>
+  <xacro:property name="chassis_width" value="0.45"/>
+  <xacro:property name="total_height" value="0.75"/>
+  <xacro:property name="chassis_ground_clearance" value="0.015"/>
+  <xacro:property name="chassis_height" value="0.735"/>
+  <xacro:property name="chassis_mass" value="20.0"/>
+
+  <!-- Macro for Inertia -->
+  <xacro:macro name="box_inertia" params="m w h d">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${(m/12) * (h*h + d*d)}" ixy="0.0" ixz="0.0"
+               iyy="${(m/12) * (w*w + d*d)}" iyz="0.0"
+               izz="${(m/12) * (w*w + h*h)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cylinder_inertia" params="m r h">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${(m/12) * (3*r*r + h*h)}" ixy="0.0" ixz="0.0"
+               iyy="${(m/12) * (3*r*r + h*h)}" iyz="0.0"
+               izz="${(m/2) * (r*r)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- base_footprint -->
+  <link name="base_footprint"/>
+
+  <joint name="base_footprint_to_base" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- base_link (Chassis: 가로 45cm, 세로 35cm, 높이 73.5cm, 바닥 기준 1.5cm~75cm) -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0.3425" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+      <material name="amr_blue">
+        <color rgba="0.1 0.4 0.8 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.3425" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="${chassis_mass}"/>
+      <origin xyz="0 0 0.25" rpy="0 0 0"/>
+      <inertia ixx="${(chassis_mass/12) * (chassis_height*chassis_height + chassis_length*chassis_length)}" ixy="0.0" ixz="0.0"
+               iyy="${(chassis_mass/12) * (chassis_width*chassis_width + chassis_length*chassis_length)}" iyz="0.0"
+               izz="${(chassis_mass/12) * (chassis_width*chassis_width + chassis_height*chassis_height)}"/>
+    </inertial>
+  </link>
+
+  <!-- 4바퀴 매크로: 차체 바깥벽, 네 꼭짓점 부근 (지름 8cm, 반경 4cm) -->
+  <xacro:macro name="corner_wheel" params="prefix x_pos y_pos">
+    <link name="wheel_${prefix}_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <material name="black">
+          <color rgba="0.1 0.1 0.1 1.0"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </collision>
+      <xacro:cylinder_inertia m="0.4" r="${wheel_radius}" h="${wheel_width}"/>
+    </link>
+
+    <joint name="base_to_wheel_${prefix}" type="continuous">
+      <parent link="base_link"/>
+      <child link="wheel_${prefix}_link"/>
+      <origin xyz="${x_pos} ${y_pos} 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+
+    <gazebo reference="wheel_${prefix}_link">
+      <mu1>1.0</mu1>
+      <mu2>0.2</mu2>
+      <kp>1000000.0</kp>
+      <kd>100.0</kd>
+      <material>Gazebo/Black</material>
+    </gazebo>
+  </xacro:macro>
+
+  <!-- 1. 전방 좌측 바퀴 (Front Left) -->
+  <xacro:corner_wheel prefix="front_left" x_pos="${wheel_base/2}" y_pos="${wheel_sep/2}"/>
+  <!-- 2. 후방 좌측 바퀴 (Rear Left) -->
+  <xacro:corner_wheel prefix="rear_left" x_pos="-${wheel_base/2}" y_pos="${wheel_sep/2}"/>
+  <!-- 3. 전방 우측 바퀴 (Front Right) -->
+  <xacro:corner_wheel prefix="front_right" x_pos="${wheel_base/2}" y_pos="-${wheel_sep/2}"/>
+  <!-- 4. 후방 우측 바퀴 (Rear Right) -->
+  <xacro:corner_wheel prefix="rear_right" x_pos="-${wheel_base/2}" y_pos="-${wheel_sep/2}"/>
+
+  <!-- LiDAR Sensor (상단 상판 장착) -->
+  <link name="laser_frame">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.040" length="0.05"/>
+      </geometry>
+      <material name="lidar_black">
+        <color rgba="0.05 0.05 0.05 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder radius="0.040" length="0.05"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.25"/>
+      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
+    </inertial>
+  </link>
+
+  <joint name="base_to_laser" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser_frame"/>
+    <origin xyz="${chassis_length/2 - 0.08} 0 0.735" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Front Camera Sensor (HBVCAM GC0308 0.3M Pixel CMOS, 크기: 30x25x11.3mm) -->
+  <!-- 앞면 중앙, 맨 위에서 9cm 아래: 지면 기준 66cm -> base_link 기준 Z = 0.66 - 0.04 = 0.620m -->
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0.006 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.0113 0.030 0.025"/>
+      </geometry>
+      <material name="cam_grey">
+        <color rgba="0.2 0.2 0.2 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.0113 0.030 0.025"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.05"/>
+      <inertia ixx="0.00004" ixy="0" ixz="0" iyy="0.00004" iyz="0" izz="0.00004"/>
+    </inertial>
+  </link>
+
+  <joint name="base_to_camera" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="${chassis_length/2} 0 0.620" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Front Physical Bumper Link (전면 물리적 접촉 감지 범퍼) -->
+  <link name="bumper_link">
+    <visual>
+      <origin xyz="0.005 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.010 ${chassis_width - 0.02} 0.08"/>
+      </geometry>
+      <material name="bumper_red">
+        <color rgba="0.9 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision name="bumper_collision">
+      <origin xyz="0.005 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.010 ${chassis_width - 0.02} 0.08"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.2"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <joint name="base_to_bumper" type="fixed">
+    <parent link="base_link"/>
+    <child link="bumper_link"/>
+    <origin xyz="${chassis_length/2} 0 0.10" rpy="0 0 0"/>
+  </joint>
+
+  <gazebo reference="base_to_bumper">
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+
+  <gazebo reference="bumper_link">
+    <sensor name="bumper_sensor" type="contact">
+      <always_on>true</always_on>
+      <update_rate>50</update_rate>
+      <topic>/bumper/contact</topic>
+      <contact>
+        <collision>bumper_link_fixed_joint_lump__bumper_collision_collision</collision>
+      </contact>
+    </sensor>
+    <material>Gazebo/Red</material>
+  </gazebo>
+
+  <!-- Gazebo Sensors & Plugins -->
+  <gazebo reference="laser_frame">
+    <sensor name="lidar" type="gpu_lidar">
+      <always_on>true</always_on>
+      <update_rate>10</update_rate>
+      <topic>/scan</topic>
+      <gz_frame_id>laser_frame</gz_frame_id>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>360</samples>
+            <resolution>1</resolution>
+            <min_angle>-3.141592</min_angle>
+            <max_angle>3.141592</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.03</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+      </ray>
+    </sensor>
+  </gazebo>
+
+  <!-- HBVCAM GC0308 Camera Sensor: 640x480, 30fps, FOV: 50 deg (0.8727 rad) -->
+  <gazebo reference="camera_link">
+    <sensor name="camera" type="camera">
+      <always_on>true</always_on>
+      <update_rate>30</update_rate>
+      <topic>/camera/image_raw</topic>
+      <gz_frame_id>camera_link</gz_frame_id>
+      <camera>
+        <horizontal_fov>0.8727</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.02</near>
+          <far>20.0</far>
+        </clip>
+      </camera>
+    </sensor>
+  </gazebo>
+
+  <!-- Gazebo Harmonic System Plugins (4WD Skid-Steer DiffDrive) -->
+  <gazebo>
+    <plugin filename="gz-sim-diff-drive-system" name="gz::sim::systems::DiffDrive">
+      <left_joint>base_to_wheel_front_left</left_joint>
+      <left_joint>base_to_wheel_rear_left</left_joint>
+      <right_joint>base_to_wheel_front_right</right_joint>
+      <right_joint>base_to_wheel_rear_right</right_joint>
+      <wheel_separation>${wheel_sep}</wheel_separation>
+      <wheel_radius>${wheel_radius}</wheel_radius>
+      <odom_publish_frequency>50</odom_publish_frequency>
+      <topic>/cmd_vel</topic>
+      <odom_topic>/odom</odom_topic>
+      <tf_topic>/tf</tf_topic>
+      <frame_id>odom</frame_id>
+      <child_frame_id>base_footprint</child_frame_id>
+    </plugin>
+
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <plugin filename="gz-sim-joint-state-publisher-system" name="gz::sim::systems::JointStatePublisher">
+      <topic>/joint_states</topic>
+    </plugin>
+  </gazebo>
+
+</robot>
