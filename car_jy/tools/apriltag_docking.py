@@ -57,8 +57,8 @@ class ApriltagDockingNode(Node):
         # 마커 및 배치 정보
         self.declare_parameter('tag_family', 'tag36h11')
         self.declare_parameter('target_tag_id', -1)            # -1: 임의의 감지된 첫 태그, >=0: 특정 ID
-        self.declare_parameter('left_tag_id', -1)              # 왼쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
-        self.declare_parameter('right_tag_id', -1)             # 오른쪽 마커 특정 ID (-1: 자동 판별, >=0: 지정 ID)
+        self.declare_parameter('left_tag_id', 0)              # 왼쪽 마커 특정 ID (기본 0: Left Tag ID 0)
+        self.declare_parameter('right_tag_id', 1)             # 오른쪽 마커 특정 ID (기본 1: Right Tag ID 1)
         self.declare_parameter('tag_size', 0.14)                # 실제 마커 외곽 크기 (미터, 기본 0.14 = 14cm)
         self.declare_parameter('tag_spacing', 0.19)             # 두 마커 중심 간격 (미터, 기본 0.19 = 19cm)
         self.declare_parameter('is_gazebo_simulation', False)   # Gazebo 텍스처(2/3 마진) 적용 여부 (현실 로봇은 False)
@@ -691,8 +691,19 @@ class ApriltagDockingNode(Node):
                 self._last_detect_log = time.time()
                 self.get_logger().info(f"🏷️ [마커 감지 성공!] 카메라에 감지된 마커 IDs: {flat_ids.tolist()}")
             matching_indices = []
+            valid_docking_ids = []
+            if getattr(self, 'left_tag_id', -1) >= 0:
+                valid_docking_ids.append(self.left_tag_id)
+            if getattr(self, 'right_tag_id', -1) >= 0:
+                valid_docking_ids.append(self.right_tag_id)
+            if getattr(self, 'target_tag_id', -1) >= 0:
+                valid_docking_ids.append(self.target_tag_id)
+
             for idx, tid in enumerate(flat_ids):
-                if self.target_tag_id < 0 or tid == self.target_tag_id:
+                if valid_docking_ids:
+                    if tid in valid_docking_ids:
+                        matching_indices.append(idx)
+                else:
                     matching_indices.append(idx)
 
             candidates = []
@@ -736,13 +747,33 @@ class ApriltagDockingNode(Node):
             rot_mat_use = None
             station_lat_err = 0.0
 
-            if len(candidates) >= 2:
-                # 🌟 [듀얼 태그 8-포인트 광역 기저선 solvePnP]
+            has_explicit_lr = (
+                getattr(self, 'left_tag_id', -1) >= 0
+                and getattr(self, 'right_tag_id', -1) >= 0
+                and self.left_tag_id != self.right_tag_id
+            )
+            cand_by_id = {c["tid"]: c for c in candidates}
+
+            if has_explicit_lr and (self.left_tag_id in cand_by_id) and (self.right_tag_id in cand_by_id):
+                # 🌟 [고유 태그 ID 기반 절대 좌/우 듀얼 매칭 (Left=0, Right=1)]
+                left_c = cand_by_id[self.left_tag_id]
+                right_c = cand_by_id[self.right_tag_id]
+                is_dual = True
+            elif not has_explicit_lr and len(candidates) >= 2:
+                # 🌟 [자동 화면 좌표 u 기반 듀얼 매칭]
                 left_c = candidates[0]
                 right_c = candidates[-1]
+                is_dual = True
+            else:
+                is_dual = False
+
+            if is_dual:
+                # 🌟 [듀얼 태그 8-포인트 광역 기저선 solvePnP]
                 tag_mode = "DUAL_TAG"
                 self.last_dual_left_u = float(left_c["u"])
                 self.last_dual_right_u = float(right_c["u"])
+                self.last_dual_left_id = int(left_c["tid"])
+                self.last_dual_right_id = int(right_c["tid"])
                 self.last_dual_left_tvec = np.array(left_c["tvec"], dtype=np.float32)
                 self.last_dual_right_tvec = np.array(right_c["tvec"], dtype=np.float32)
                 self.has_seen_dual = True
@@ -797,9 +828,14 @@ class ApriltagDockingNode(Node):
 
                 baseline = abs(right_c["x"] - left_c["x"])
 
-            elif len(candidates) == 1:
+            elif len(candidates) >= 1:
                 # 🌟 [단일 태그 관측 시 가상 중심점 투영]
-                c = candidates[0]
+                if has_explicit_lr and self.left_tag_id in cand_by_id:
+                    c = cand_by_id[self.left_tag_id]
+                elif has_explicit_lr and self.right_tag_id in cand_by_id:
+                    c = cand_by_id[self.right_tag_id]
+                else:
+                    c = candidates[0]
                 s = self.tag_inner_size / 2.0
                 tag_pts = np.array([[s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0], [-s, -s, 0.0]], dtype=np.float32)
                 ret_s, rv, tv = cv2.solvePnP(
@@ -1448,12 +1484,14 @@ class ApriltagDockingNode(Node):
 
             if detected.get("left_c") is not None:
                 c = detected["left_c"]
-                cv2.putText(dbg, f"L({self.tag_size*100:.0f}cm)", (int(c["u"]) - 25, int(c["v"]) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 200, 0), 1)
+                tid_str = f"ID:{c['tid']}" if 'tid' in c else "L"
+                cv2.putText(dbg, f"L ({tid_str})", (int(c["u"]) - 35, int(c["v"]) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 200, 0), 1)
             if detected.get("right_c") is not None:
                 c = detected["right_c"]
-                cv2.putText(dbg, f"R({self.tag_size*100:.0f}cm)", (int(c["u"]) - 25, int(c["v"]) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 200, 0), 1)
+                tid_str = f"ID:{c['tid']}" if 'tid' in c else "R"
+                cv2.putText(dbg, f"R ({tid_str})", (int(c["u"]) - 35, int(c["v"]) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 200, 0), 1)
 
             if len(candidates) >= 2:
                 u_pts = [(int(c["u"]), int(c["v"])) for c in candidates]

@@ -21,13 +21,13 @@ def generate_launch_description():
     )
     left_tag_id_arg = DeclareLaunchArgument(
         'left_tag_id',
-        default_value='-1',
-        description='Left AprilTag ID (-1 for auto, or specific ID like 0)'
+        default_value='0',
+        description='Left AprilTag ID (default: 0)'
     )
     right_tag_id_arg = DeclareLaunchArgument(
         'right_tag_id',
-        default_value='-1',
-        description='Right AprilTag ID (-1 for auto, or specific ID like 1)'
+        default_value='1',
+        description='Right AprilTag ID (default: 1)'
     )
     tag_size_arg = DeclareLaunchArgument(
         'tag_size',

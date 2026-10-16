@@ -1378,7 +1378,7 @@
             <emissive>0.4 0.4 0.4 1</emissive>
             <pbr>
               <metal>
-                <albedo_map>/home/juyeon/ros2_amr_ws/src/amr_bringup/models/apriltag_marker/materials/textures/tag36h11_1.png</albedo_map>
+                <albedo_map>/home/juyeon/ros2_amr_ws/src/amr_bringup/models/apriltag_marker/materials/textures/tag36h11_0.png</albedo_map>
                 <roughness>0.1</roughness>
                 <metalness>0.0</metalness>
               </metal>
