@@ -1,5 +1,7 @@
 {
   "disabled": [
+    "base_move",
+    "base_stop",
     "base_turn",
     "depth_approach",
     "goto_label",
