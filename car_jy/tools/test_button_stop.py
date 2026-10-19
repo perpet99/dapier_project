@@ -56,7 +56,14 @@ class DriveAndStopController:
                 # 백그라운드 ROS 2 spin
                 self.executor = rclpy.executors.SingleThreadedExecutor()
                 self.executor.add_node(self.node)
-                self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
+
+                def _safe_spin():
+                    try:
+                        self.executor.spin()
+                    except (rclpy.executors.ExternalShutdownException, Exception):
+                        pass
+
+                self.spin_thread = threading.Thread(target=_safe_spin, daemon=True)
                 self.spin_thread.start()
                 print(f"🤖 [ROS 2] 노드 초기화 완료 (속도 명령 토픽: {self.topic_name})")
             except Exception as e:
@@ -151,10 +158,21 @@ class DriveAndStopController:
     def shutdown(self):
         self.is_running = False
         self.stop_robot_safety()
+        if self.executor is not None:
+            try:
+                self.executor.shutdown()
+            except Exception:
+                pass
         if self.node is not None:
-            self.node.destroy_node()
+            try:
+                self.node.destroy_node()
+            except Exception:
+                pass
         if HAS_ROS2 and rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 def setup_gpio(pin_num, controller, debounce_sec=0.05):
