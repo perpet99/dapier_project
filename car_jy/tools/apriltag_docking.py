@@ -92,7 +92,7 @@ class ApriltagDockingNode(Node):
         self.declare_parameter('show_gui', True)                # OpenCV 실시간 카메라 시점 GUI 창 표시 여부
         self.declare_parameter('straight_drive_duration', 7.5)  # 중앙 정렬 후 무조건 직진 밀착 시간 (완전 벽 밀착: 7.5초)
         self.declare_parameter('straight_drive_speed', 0.07)    # 무조건 직진 시 주행 속도 (m/s)
-        self.declare_parameter('straight_dock_dist', 0.38)      # 최종 무조건 직진 밀착을 시작하는 도킹 진입 거리 (미터, 기본: 0.38m = 38cm, 태그 화각 이탈 대응)
+        self.declare_parameter('straight_dock_dist', 0.42)      # 최종 무조건 직진 밀착을 시작하는 도킹 진입 거리 (미터, 기본: 0.42m = 42cm, 14cm 태그 화각 이탈 전 조기 직진 전환)
         self.declare_parameter('web_port', 8088)                # 실시간 웹 모니터링 포트
         self.declare_parameter('show_axes', True)              # 도킹 스테이션 중심 3D 좌표축(Frame Axes) 렌더링 여부
 
@@ -1203,17 +1203,19 @@ class ApriltagDockingNode(Node):
             self.state = "REALIGNING"
             vx = 0.0
             if detected is not None:
-                # 완벽하게 평행(약 1.1도 이내)해질 때까지 제자리 정밀 회전
-                if abs(yaw_err) <= 0.020:
+                # 완벽하게 평행(약 3.8도 이내)해질 때까지 제자리 정밀 회전
+                if abs(yaw_err) <= 0.065:
                     self.is_realigning = False
                     wz = 0.0
                     self.smoothed_wz = 0.0
                     self.get_logger().info(f"✨ [평행 정렬 완료] 벽면과 완전 평행 달성 (Yaw={math.degrees(yaw_err):+.1f}°) -> 직진 정밀 도킹 재개!")
                 else:
-                    raw_wz = -1.30 * yaw_err
-                    wz = float(np.clip(raw_wz, -0.20, 0.20))
-                    if abs(wz) < 0.04:
-                        wz = math.copysign(0.04, raw_wz)
+                    raw_wz = -1.00 * yaw_err
+                    # 4WD 스키드 제자리 회전 정지 마찰 극복 (최소 0.14 rad/s)
+                    min_turn = 0.14
+                    if abs(raw_wz) < min_turn:
+                        raw_wz = math.copysign(min_turn, raw_wz)
+                    wz = float(np.clip(raw_wz, -0.25, 0.25))
                     self.smoothed_wz = wz
             else:
                 self.is_realigning = False
@@ -1226,20 +1228,19 @@ class ApriltagDockingNode(Node):
             rot_mat_cur = detected.get("rot_mat", None)
             lat_err = float(detected.get("lat_err", 0.0))
 
-            # 🎯 완벽 평행 밀착 판별 (벽면 각도 오차 2.2도 이내, 횡오차 2.5cm 이내)
-            is_parallel = (abs(yaw_err) <= 0.038) and (abs(lat_err) <= 0.025) and (abs(bearing) <= 0.050)
-            # 허용 도킹 진입 (약 2.6도 이내, 1회 이상 후진 후 완벽 정렬 시 조기 도킹)
-            is_good_enough = (abs(yaw_err) <= 0.045) and (abs(lat_err) <= 0.030)
+            # 🎯 완벽 평행 밀착 판별 (실물 카메라 노이즈 고려: 각도 약 4.6도 이내, 횡오차 4.5cm 이내)
+            is_parallel = (abs(yaw_err) <= 0.080) and (abs(lat_err) <= 0.045) and (abs(bearing) <= 0.085)
+            # 허용 도킹 진입 (약 5.7도 이내, 횡오차 5.5cm 이내: 1회 이상 후진 후 신속 도킹)
+            is_good_enough = (abs(yaw_err) <= 0.100) and (abs(lat_err) <= 0.055)
 
             # -------------------------------------------------------------
             # Case 1: [최종 도킹 진입 조건 (완벽 평행 밀착)]
-            # 벽면과 각도가 2.2도 이내로 완전 평행하고 정중앙일 때만 직진 밀착 실행!
-            # 1회 이상 후진한 경우 2.5도 이내에서 즉시 직진 밀착 진입하여 불필요한 다회 후진 방지!
+            # 14cm 태그 화각 이탈 전(0.42m 내외)에 평행 정렬 확인 시 조기 직진 밀착 실행!
             # -------------------------------------------------------------
             can_straight_dock = (is_parallel and (
-                curr_dist <= (self.straight_dock_dist + 0.05) or dist_err <= 0.08
+                curr_dist <= (self.straight_dock_dist + 0.05) or dist_err <= 0.12
             )) or (
-                self.backup_count >= 1 and is_good_enough and curr_dist <= (self.straight_dock_dist + 0.04)
+                self.backup_count >= 1 and is_good_enough and curr_dist <= (self.straight_dock_dist + 0.06)
             )
 
             if can_straight_dock:
@@ -1256,10 +1257,10 @@ class ApriltagDockingNode(Node):
                 )
 
             # -------------------------------------------------------------
-            # Case 2: [후진 리커버리 트리거: 벽 코앞인데 각도가 틀어져 있을 때]
-            # 도킹대 코앞(0.28m 이하)에서 벽면과 각도/횡오차가 남아있으면 후진하여 공간 확보
+            # Case 2: [후진 리커버리 트리거: 벽 코앞인데 각도가 심하게 틀어져 있을 때]
+            # 도킹대 코앞(0.28m 이하)에서 벽면과 각도(>5.5°) 또는 횡오차(>5cm)가 심할 때만 후진
             # -------------------------------------------------------------
-            elif curr_dist <= min(self.straight_dock_dist, 0.30) and (abs(yaw_err) > 0.038 or abs(lat_err) > 0.025) and self.backup_count < self.max_backup_count:
+            elif curr_dist <= 0.28 and (abs(yaw_err) > 0.095 or abs(lat_err) > 0.050) and self.backup_count < self.max_backup_count:
                 self.is_reversing = True
                 self.reverse_start_time = time.time()
                 self.backup_count += 1
@@ -1270,8 +1271,8 @@ class ApriltagDockingNode(Node):
                 self.bezier_pts = []
                 self.lookahead_pt = None
                 self.get_logger().info(
-                    f"🔄 [후진 리커버리 발동] 벽 앞({curr_dist:.2f}m)에서 평행 오차(Yaw={math.degrees(yaw_err):+.1f}°, LatErr={lat_err*100:+.1f}cm) 감지 -> "
-                    f"완벽한 평행 밀착을 위해 후진 재정렬을 수행합니다! (시도 {self.backup_count}/{self.max_backup_count})"
+                    f"🔄 [후진 리커버리 발동] 벽 앞({curr_dist:.2f}m)에서 심한 오차(Yaw={math.degrees(yaw_err):+.1f}°, LatErr={lat_err*100:+.1f}cm) 감지 -> "
+                    f"후진 재정렬을 수행합니다! (시도 {self.backup_count}/{self.max_backup_count})"
                 )
 
             # -------------------------------------------------------------
@@ -1279,20 +1280,20 @@ class ApriltagDockingNode(Node):
             # -------------------------------------------------------------
             else:
                 self.docked_consecutive_count = 0
-                if abs(lat_err) <= 0.020 and abs(yaw_err) <= 0.025:
+                if abs(lat_err) <= 0.035 and abs(yaw_err) <= 0.045:
                     self.state = "APPROACHING"
                 else:
                     self.state = "ALIGNING"
 
                 # 🌟 [거리 적응형 Stanley + 거리 연동 평행화(Distance-based Heading Flattening) 제어]
-                # 벽에 가까워질수록(curr_dist < 0.48m) psi_des를 0으로 강제 수렴시켜 차체를 벽면과 완벽 평행(0도)으로 정렬!
-                lookahead_d = max(0.35, min(0.95, curr_dist * 0.85))
-                dist_flatten = float(np.clip((curr_dist - 0.22) / 0.26, 0.0, 1.0))
-                raw_psi = -math.atan2(2.80 * lat_err, lookahead_d)
-                psi_des = float(np.clip(raw_psi, -math.radians(50), math.radians(50))) * dist_flatten
+                lookahead_d = max(0.40, min(1.00, curr_dist * 0.90))
+                dist_flatten = float(np.clip((curr_dist - 0.22) / 0.28, 0.0, 1.0))
+                # 횡오차 게인 1.60 (오버슈트 억제), 최대 각도 35도 제한
+                raw_psi = -math.atan2(1.60 * lat_err, lookahead_d)
+                psi_des = float(np.clip(raw_psi, -math.radians(35), math.radians(35))) * dist_flatten
                 heading_err = float(yaw_err - psi_des)
 
-                # 🌟 [PD 댐핑 제어 (D-term): 위상 지연 및 좌우 헌팅 진동 완벽 흡수]
+                # 🌟 [PD 댐핑 제어: P게인 하향(0.85), D게인 상향(0.12)으로 좌우 요동(Hunting) 완벽 억제]
                 now_t = time.time()
                 dt = max(0.01, min(0.10, now_t - self.prev_control_time))
                 self.prev_control_time = now_t
@@ -1300,11 +1301,17 @@ class ApriltagDockingNode(Node):
                 d_heading = float(np.clip(d_heading, -0.8, 0.8))
                 self.prev_heading_err = heading_err
 
-                raw_wz = -1.20 * heading_err - 0.06 * d_heading
+                raw_wz = -0.85 * heading_err - 0.12 * d_heading
 
-                # 🌟 [미세 불감대(Deadband): 중심선과 평행 시 미세 조향 떨림 방지]
-                if abs(heading_err) < math.radians(0.8) and abs(lat_err) < 0.012:
+                # 🌟 [불감대(Deadband): 중심선 정렬 시 미세 조향 요동 방지]
+                if abs(heading_err) < math.radians(1.8) and abs(lat_err) < 0.020:
                     raw_wz = 0.0
+                else:
+                    # 4WD 스키드 조향 타이어 바닥 정지 마찰 극복 (Tire Scrub Booster)
+                    # 각속도가 너무 작으면 바퀴가 돌지 않고 직진하므로 최소 회전 속도(0.11 rad/s) 보장
+                    min_skid_wz = 0.11
+                    if abs(raw_wz) < min_skid_wz:
+                        raw_wz = math.copysign(min_skid_wz, raw_wz)
 
                 # 🛡️ [부드러운 카메라 화각 보호(Soft FOV Guard): 마커가 화면 밖으로 이탈 방지]
                 if bearing > 0.22 and raw_wz > 0:
@@ -1314,9 +1321,9 @@ class ApriltagDockingNode(Node):
                     scale = float(np.clip((0.32 - abs(bearing)) / 0.10, 0.0, 1.0))
                     raw_wz *= scale
 
-                # 🕊️ [거리 연동 각속도 제한 & 부드러운 Slew-Rate Limiter (위상 지연 제거)]
-                max_wz_cur = float(np.clip(0.40 * (curr_dist / 0.70), 0.14, 0.40))
-                max_dwz = 0.075
+                # 🕊️ [거리 연동 각속도 제한 & 부드러운 Slew-Rate Limiter (부드러운 조향 가속)]
+                max_wz_cur = float(np.clip(0.35 * (curr_dist / 0.70), 0.13, 0.35))
+                max_dwz = 0.045
                 delta_wz = float(np.clip(raw_wz - self.smoothed_wz, -max_dwz, max_dwz))
                 self.smoothed_wz += delta_wz
                 wz = float(np.clip(self.smoothed_wz, -max_wz_cur, max_wz_cur))
@@ -1340,9 +1347,9 @@ class ApriltagDockingNode(Node):
             if (time.time() - self.last_detection_time) > 1.0:
                 self.tracked_single_role = None
 
-            # 🚀 [초근접 화각 이탈 대응: 중앙 및 평행 정렬이 입증된 상태에서만 직진 밀착!]
-            is_was_centered = abs(self.last_seen_x) <= 0.045 or (hasattr(self, 'filt_lat_err') and abs(self.filt_lat_err) <= 0.045)
-            is_was_parallel = (hasattr(self, 'filt_yaw') and abs(self.filt_yaw) <= 0.045) or (abs(self.station_heading) <= 0.045)
+            # 🚀 [초근접 화각 이탈 대응: 14cm 태그 잘림 시 안정적 직진 밀착!]
+            is_was_centered = abs(self.last_seen_x) <= 0.060 or (hasattr(self, 'filt_lat_err') and abs(self.filt_lat_err) <= 0.060)
+            is_was_parallel = (hasattr(self, 'filt_yaw') and abs(self.filt_yaw) <= 0.090) or (abs(self.station_heading) <= 0.090)
 
             if self.last_seen_dist <= (self.straight_dock_dist + 0.10) and is_was_centered and is_was_parallel and self.straight_drive_start_time is None and not self.is_reversing:
                 self.straight_drive_start_time = time.time()
@@ -1354,8 +1361,8 @@ class ApriltagDockingNode(Node):
                     f"🚀 [초근접 화각 이탈 도킹] 도킹 직전 거리({self.last_seen_dist:.2f}m)에서 태그 화각 이탈 -> "
                     f"{self.straight_drive_duration:.1f}초간 무조건 직진 밀착 푸시 개시!"
                 )
-            elif self.last_seen_dist <= 0.35 and (not is_was_centered or not is_was_parallel) and self.backup_count < self.max_backup_count and not self.is_reversing:
-                # 벽 코앞에서 정렬되지 않은 채 태그가 화각을 벗어났다면, 제자리에서 돌지 말고 안전하게 후진 리커버리!
+            elif self.last_seen_dist <= 0.30 and (not is_was_centered or not is_was_parallel) and self.backup_count < self.max_backup_count and not self.is_reversing:
+                # 벽 코앞에서 크게 틀어진 채 태그가 화각을 벗어났다면, 안전하게 후진 리커버리!
                 self.is_reversing = True
                 self.reverse_start_time = time.time()
                 self.backup_count += 1
