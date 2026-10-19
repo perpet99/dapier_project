@@ -61,7 +61,7 @@ class ApriltagDockingNode(Node):
         self.declare_parameter('left_tag_id', 0)              # 왼쪽 마커 특정 ID (기본 0: Left Tag ID 0)
         self.declare_parameter('right_tag_id', 1)             # 오른쪽 마커 특정 ID (기본 1: Right Tag ID 1)
         self.declare_parameter('tag_size', 0.14)                # 실제 마커 외곽 크기 (미터, 기본 0.14 = 14cm)
-        self.declare_parameter('tag_spacing', 0.19)             # 두 마커 중심 간격 (미터, 기본 0.19 = 19cm)
+        self.declare_parameter('tag_spacing', 0.20)             # 두 마커 중심 간격 (미터, 기본 0.20 = 20cm)
         self.declare_parameter('is_gazebo_simulation', False)   # Gazebo 텍스처(2/3 마진) 적용 여부 (현실 로봇은 False)
 
         # 도킹 목표 및 허용오차

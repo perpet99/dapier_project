@@ -36,8 +36,8 @@ def generate_launch_description():
     )
     tag_spacing_arg = DeclareLaunchArgument(
         'tag_spacing',
-        default_value='0.19',
-        description='Center-to-center distance between dual tags in meters (default: 0.19 = 19cm)'
+        default_value='0.20',
+        description='Center-to-center distance between dual tags in meters (default: 0.20 = 20cm)'
     )
     is_gazebo_simulation_arg = DeclareLaunchArgument(
         'is_gazebo_simulation',
