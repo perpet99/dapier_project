@@ -10,6 +10,7 @@ import urllib.request
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool
 
 
 class ButtonStopNode(Node):
@@ -27,7 +28,8 @@ class ButtonStopNode(Node):
         self.bounce_time = float(self.get_parameter('bounce_time').value)
 
         self.cmd_pub = self.create_publisher(Twist, self.topic_name, 10)
-        self.get_logger().info(f"🔘 [ButtonStopNode] 초기화 완료 (GPIO BCM {self.pin}, 토픽: {self.topic_name})")
+        self.pub_bumper = self.create_publisher(Bool, '/bumper_state', 10)
+        self.get_logger().info(f"🔘 [ButtonStopNode] 초기화 완료 (GPIO BCM {self.pin}, 토픽: {self.topic_name}, 범퍼: /bumper_state)")
 
         self.gpio_backend = None
         self.btn_handle = None
@@ -98,15 +100,20 @@ class ButtonStopNode(Node):
         )
 
     def on_button_pressed(self):
-        self.get_logger().warn("🛑 [EMERGENCY STOP] 물리 버튼 감지! 로봇 즉시 정지 실행!")
+        self.get_logger().warn("🛑 [EMERGENCY STOP & BUMPER] 물리 버튼 감지! 로봇 즉시 정지 및 범퍼 접촉 신호 발행!")
 
-        # 1. ROS 2 속도 0 연속 10회 발행 (모터 즉각 차단)
+        # 1. 범퍼 접촉 신호(/bumper_state) 발행 -> 도킹 노드에서 DOCKED 상태 전환 트리거
+        bumper_msg = Bool()
+        bumper_msg.data = True
+        self.pub_bumper.publish(bumper_msg)
+
+        # 2. ROS 2 속도 0 연속 10회 발행 (모터 즉각 차단)
         stop_msg = Twist()
         for _ in range(10):
             self.cmd_pub.publish(stop_msg)
             time.sleep(0.02)
 
-        # 2. 실행 중인 정밀 도킹 노드 /api/stop 호출
+        # 3. 실행 중인 정밀 도킹 노드 /api/stop 호출
         try:
             url = f"http://127.0.0.1:{self.web_port}/api/stop"
             req = urllib.request.Request(url, headers={'User-Agent': 'AMR-Button-Node'})
@@ -117,6 +124,9 @@ class ButtonStopNode(Node):
             pass
 
     def on_button_released(self):
+        bumper_msg = Bool()
+        bumper_msg.data = False
+        self.pub_bumper.publish(bumper_msg)
         self.get_logger().info("⚪ [BUTTON] 버튼 해제됨 (정지 상태 유지)")
 
 
