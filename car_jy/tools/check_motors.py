@@ -95,6 +95,7 @@ def check_all():
     print("\n" + "=" * 60)
     if any_found:
         print(" 🎉 모터가 정상적으로 연결되어 통신하고 있습니다!")
+        print(" 💡 [바퀴 회전 테스트]: python3 check_motors.py --spin")
     else:
         print(" ❌ 어떤 포트에서도 모터 응답이 없습니다.")
         print(" 💡 필수 체크포인트:")
@@ -103,5 +104,65 @@ def check_all():
         print("    3. 다른 ROS 노드가 켜져 있다면 종료하세요: 'fuser -k /dev/ttyACM0'")
     print("=" * 60)
 
+
+def spin_test(port='/dev/ttyACM0', baud=1000000, duration=1.5):
+    """ROS 노드 없이 시리얼 포트로 STS3215 모터 1.5초간 직접 회전 테스트"""
+    ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
+    if not ports:
+        print("❌ 발견된 시리얼 장치가 없습니다.")
+        return
+    target_port = ports[0]
+    print("=" * 60)
+    print(f" 🚗 [모터 직접 회전 테스트] {target_port} ({duration}초간 천천히 전진)")
+    print("=" * 60)
+
+    try:
+        ser = serial.Serial(target_port, baud, timeout=0.04)
+    except Exception as e:
+        print(f" ❌ 포트 열기 실패: {e}")
+        print("    (혹시 다른 노드가 포트를 잡고 있다면 'fuser -k /dev/ttyACM0' 실행)")
+        return
+
+    # 1. 서보 1~4를 Wheel Mode (무한회전 모드)로 설정
+    for sid in [1, 2, 3, 4]:
+        for reg, val in [(0x37, [0x00]), (0x21, [0x01]), (0x37, [0x01])]:
+            body = [sid, 3 + len(val), 3, reg] + val
+            ser.write(bytearray([0xFF, 0xFF] + body + [calc_chk(body)]))
+            time.sleep(0.01)
+
+    # 2. 바퀴 회전 속도 전송 (좌/우 방향 반전 고려: ID 1,3 = 전진, ID 2,4 = 역방향 전진)
+    # 0x2E Goal Speed: 800 step/s
+    speed_mag = 800
+    sp_fwd = [speed_mag & 0xFF, (speed_mag >> 8) & 0xFF]
+    sp_rev = [speed_mag & 0xFF, ((speed_mag >> 8) | 0x80) & 0xFF]
+
+    sync_packet = [
+        0xFE, 16, 0x83, 0x2E, 2,
+        1, sp_fwd[0], sp_fwd[1],
+        2, sp_rev[0], sp_rev[1],
+        3, sp_fwd[0], sp_fwd[1],
+        4, sp_rev[0], sp_rev[1]
+    ]
+
+    print(" 🚀 바퀴가 회전합니다...")
+    t0 = time.time()
+    while time.time() - t0 < duration:
+        ser.write(bytearray([0xFF, 0xFF] + sync_packet + [calc_chk(sync_packet)]))
+        time.sleep(0.05)
+
+    # 3. 정지 (속도 0)
+    stop_packet = [
+        0xFE, 16, 0x83, 0x2E, 2,
+        1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0
+    ]
+    ser.write(bytearray([0xFF, 0xFF] + stop_packet + [calc_chk(stop_packet)]))
+    time.sleep(0.05)
+    ser.close()
+    print(" ✅ 회전 테스트 완료! 모터가 정상적으로 정지했습니다.\n")
+
+
 if __name__ == '__main__':
-    check_all()
+    if len(sys.argv) > 1 and sys.argv[1] in ['--spin', '-s']:
+        spin_test()
+    else:
+        check_all()
