@@ -58,6 +58,16 @@ def generate_launch_description():
         default_value='false',
         description='Enable legacy ESP32 bridge node (default: false)'
     )
+    enable_button_arg = DeclareLaunchArgument(
+        'enable_button',
+        default_value='true',
+        description='Enable physical emergency stop button node (default: true)'
+    )
+    button_pin_arg = DeclareLaunchArgument(
+        'button_pin',
+        default_value='18',
+        description='GPIO BCM pin for emergency stop button (default: 18)'
+    )
 
     invert_left_arg = DeclareLaunchArgument(
         'invert_left',
@@ -180,11 +190,27 @@ def generate_launch_description():
         output='screen'
     )
 
+    # 8. 물리 버튼 긴급 정지 노드 (BCM 18)
+    button_node = Node(
+        package='amr_bringup',
+        executable='button_stop_node',
+        name='button_stop_node',
+        parameters=[{
+            'pin': LaunchConfiguration('button_pin'),
+            'cmd_vel_topic': '/cmd_vel',
+            'web_port': 8088,
+        }],
+        condition=IfCondition(LaunchConfiguration('enable_button')),
+        output='screen'
+    )
+
     ld = LaunchDescription()
     ld.add_action(lidar_port_arg)
     ld.add_action(servo_port_arg)
     ld.add_action(esp32_port_arg)
     ld.add_action(enable_esp32_arg)
+    ld.add_action(enable_button_arg)
+    ld.add_action(button_pin_arg)
     ld.add_action(invert_left_arg)
     ld.add_action(invert_right_arg)
     ld.add_action(invert_angular_arg)
@@ -197,6 +223,7 @@ def generate_launch_description():
     ld.add_action(servo_node)
     ld.add_action(odom_node)
     ld.add_action(esp32_node)
+    ld.add_action(button_node)
     ld.add_action(rsp_node)
     ld.add_action(jsp_node)
 
