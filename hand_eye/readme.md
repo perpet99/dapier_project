@@ -494,7 +494,24 @@ python hand_eye/llm_client.py --auto "..."             # 실패해도 안 묻는
 ```
 
 **지시는 웹으로 받는다.** 실행하면 `http://127.0.0.1:8770` 이 열린다(`--port`, `--host`,
-`--no-browser`). 페이지는 stdlib `http.server` 하나로 서비스하고, 브라우저가 0.6초마다
+`--no-browser`).
+팔 REST(robot_arm.py), 이동 로봇(map_web), Gemini 호출이 실패해도 **프로세스와 웹 UI 는 끝나지 않는다.**
+화면 위 **연결 패널**에 팔 REST / 이동 로봇 map_web / Gemini 각각의 **주소, 상태(● 연결됨 / ✕ 실패 + 이유), [재연결]** 버튼이 있다.
+- 팔 REST 상태는 0.5초마다 자동 갱신된다. 재연결하면 화면도 새로 받는다.
+- Gemini 재연결은 `.env` 의 키를 **다시 읽고** 모델 접근만 확인한다(토큰 안 씀) — 키를 고친 뒤 프로세스를 다시 띄울 필요가 없다.
+- **[전체 재연결]**(CLI 는 `c`)은 셋 다 확인한 뒤 화면을 받아 설명을 다시 듣는다. 진행 중인 지시가 있으면 그것이 끝난 뒤에 한다.
+
+**[■ 긴급 정지]** 버튼(제목 줄 맨 앞, 키보드 `Esc`, 주소 `GET /estop`)을 누르면 다음을 한다.
+- 대기 중인 지시를 모두 지운다. 재연결 요청은 지운 목록에서 빠지고 남는다.
+- 이동 로봇을 바로 세운다. `/api/drive/stop`, Nav2 취소, 깊이·라이다 근접 이동 정지를 보낸다.
+- 진행 중인 지시를 다음 확인 지점에서 끝낸다.
+  - 몸체 이동 대기(Go to, base_move/turn, 근접 이동)는 1초 안에 끊긴다.
+  - 모델이 답하는 중이었으면, 그 답의 스킬은 실행하지 않는다.
+  - 재시도 질문이 떠 있으면 '아니오'로 답한다.
+- 팔은 정지 API가 없어서 이미 시작한 pick/place 동작은 끝까지 간다. 다만 그 뒤의 단계는 실행하지 않는다.
+- 새 지시를 보내면 긴급 정지가 풀린다.
+
+페이지는 stdlib `http.server` 하나로 서비스하고, 브라우저가 0.6초마다
 `/poll?since=N` 로 새 로그·화면·질문만 받아 간다.
 
 ```
@@ -520,6 +537,7 @@ python hand_eye/llm_client.py --auto "..."             # 실패해도 안 묻는
 |---|---|---|
 | `base_state` | `GET /api/state`, `/api/drive` | 위치·방향, 라벨 목록(reachable, 거리), Nav2 상태, 정면 장애물 거리, 정면 벽 |
 | `goto_label(label)` | `POST /api/nav/goto` | 라벨 이름 → id 로 Nav2 이동, 도착/실패까지 기다림 (최대 240초) |
+| `goto_label_wall(label, gap)` | `POST /api/wall/config`, `/api/nav/goto_wall` | goto_label 로 도착한 뒤 정면 벽과 수직으로 맞추고 차체 앞 gap m 까지 (근접 이동 끝까지 기다림) |
 | `save_label(label)` | `POST /api/labels` | 지금 위치를 라벨로 저장 |
 | `base_move(meters)` | `POST /api/drive` 반복 | 직진/후진 ±1 m, 0.08 m/s. 차체 앞/뒤 0.10 m 안에 라이다 점이 보이면 정지 |
 | `base_turn(degrees)` | `POST /api/drive` 반복 | 제자리 회전 ±180° (+ 왼쪽) |
@@ -527,6 +545,17 @@ python hand_eye/llm_client.py --auto "..."             # 실패해도 안 묻는
 | `relocalize(global_search)` | `POST /api/relocalize` | 지도 위 위치 다시 잡기 (로봇은 안 움직임) |
 | `wall_approach(gap)` | `POST /api/wall/config`, `/api/wall/start` | 정면 벽과 수직으로 맞추고 차체 앞 gap m 까지 |
 | `depth_approach` | `POST /api/approach/start` | 깊이 카메라 근접선까지 전진 |
+
+**이동은 `goto_label_wall`이 기본이다.** 프롬프트의 "이동 규칙"에 따라, 모델은 다른 장소로 가야 하는 지시를 `goto_label_wall`로 한다.
+팔이 작업대에 닿으려면 도착한 뒤 작업대 앞에 붙어야 하기 때문이다.
+`goto_label`은 사용자가 "붙지 말고", "근처까지만"처럼 붙지 말라고 했을 때만 쓴다.
+
+**지도 정보로 계획 세우기**
+- 지시를 처리하는 매 단계에 map_web의 `GET /api/get_map_info` 요약을 프롬프트에 "지도 정보"로 넣는다.
+  요약에는 내 위치, 라벨의 위치·거리·방향·reachable, 탐색된 지도 범위, Nav2 상태, 정면 벽이 들어 있다.
+- 첫 단계에서 모델은 이 정보와 화면을 보고 전체 실행 계획을 `plan`(단계별 문장 목록)으로 낸다.
+- 계획은 로그와 처리 단계 로그에 "실행 계획"으로 남고, 다음 단계 프롬프트에 "세운 계획"으로 들어간다.
+- 모델이 계획을 바꾸면 새 `plan`을 낸다.
 
 몸체가 움직이고 나면 클라이언트가 팔 카메라 화면을 새로 받는다. pick/place 와 마찬가지로 **확인 없이 바로 움직인다.**
 예: `python hand_eye/llm_client.py "책상으로 가서 책상 앞에 붙은 다음 컵을 집어"`

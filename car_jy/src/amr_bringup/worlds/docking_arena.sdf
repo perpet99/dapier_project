@@ -1,0 +1,141 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="docking_arena">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- Essential System Plugins -->
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+
+    <!-- 자연스러운 태양광 조명 -->
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.1 0.1 0.1 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- 바닥면 (Ground Plane - 깔끔한 짙은 회색) -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>50 50</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>50 50</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.4 0.4 0.4 1</ambient>
+            <diffuse>0.4 0.4 0.4 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 🏷️ AprilTag #1 전용 도킹 스테이션 벽면 (X=0, Y=0 에 위치, +X 방향을 바라봄) -->
+    <model name="apriltag_docking_wall">
+      <static>true</static>
+      <pose>0 0 0.60 0 0 0</pose>
+      <link name="wall_link">
+        <!-- 메인 도킹 벽면 (두께 0.1m, 너비 1.4m, 높이 1.2m, 바닥 0~1.2m) -->
+        <collision name="wall_collision">
+          <geometry>
+            <box>
+              <size>0.10 1.40 1.20</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="wall_visual">
+          <geometry>
+            <box>
+              <size>0.10 1.40 1.20</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.3 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+
+        <!-- 마커 흰색 지지 플레이트 (Quiet Zone 확보, 너비 38cm, 높이 18cm, 중심 바닥에서 60cm) -->
+        <visual name="plate_visual">
+          <pose>0.052 0 0.0 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.003 0.38 0.18</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+
+        <!-- AprilTag #1 좌측 마커 (Y = -0.095m, 바닥 기준 높이 60cm) -->
+        <visual name="tag_left_visual">
+          <pose>0.055 -0.095 0.0 0 1.570796 0</pose>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>0.14 0.14</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>1.0 1.0 1.0 1</ambient>
+            <diffuse>1.0 1.0 1.0 1</diffuse>
+            <emissive>0.4 0.4 0.4 1</emissive>
+            <pbr>
+              <metal>
+                <albedo_map>/home/juyeon/ros2_amr_ws/src/amr_bringup/models/apriltag_marker/materials/textures/tag36h11_0.png</albedo_map>
+                <roughness>0.1</roughness>
+                <metalness>0.0</metalness>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+
+        <!-- AprilTag #1 우측 마커 (Y = +0.095m, 기저선 19cm, 바닥 기준 높이 60cm) -->
+        <visual name="tag_right_visual">
+          <pose>0.055 0.095 0.0 0 1.570796 0</pose>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>0.14 0.14</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>1.0 1.0 1.0 1</ambient>
+            <diffuse>1.0 1.0 1.0 1</diffuse>
+            <emissive>0.4 0.4 0.4 1</emissive>
+            <pbr>
+              <metal>
+                <albedo_map>/home/juyeon/ros2_amr_ws/src/amr_bringup/models/apriltag_marker/materials/textures/tag36h11_1.png</albedo_map>
+                <roughness>0.1</roughness>
+                <metalness>0.0</metalness>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

@@ -57,6 +57,7 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | `goto_backup_m` / `goto_backup_speed` | 0.30 / 0.08 | Go to 전에 후진할 거리 (m, 0이면 후진 안 함) / 속도 (m/s) |
 | `robot_back` | 0.16 | 로봇 중심 → 차체 뒤까지 (m) |
 | `goto_backup_clear_m` | 0.12 | 후진 중 차체 뒤에서 이 거리 안에 물체가 있으면 후진을 멈춤 |
+| `goal_max_cost` | 50 | Go to 목표 칸의 비용지도 값 상한. 이 값 이상인 라벨은 가장 가까운 상한 미만 칸으로 옮겨 간다 (99면 예전처럼 막힌 라벨만 옮김) |
 | `wall_max_m` / `wall_timeout_s` | 3.0 / 90 | 라이다 근접 이동 최대 이동 거리 / 시간 |
 
 ## 공통 사항
@@ -87,6 +88,7 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | GET | `/` | 웹 UI 페이지 | |
 | GET | `/api/state` | 전체 상태 (위치, 스캔, 지도, 라벨, Nav2, 설정 등) | |
 | GET | `/api/map/meta` | 지도 정보 | |
+| GET | `/api/get_map_info` | 계획용 요약: 내 위치, 라벨(거리·방향·도달 가능), 지도 범위, Nav2 상태 | |
 | GET | `/map.png` | 지도 이미지 | |
 | GET | `/stream/rgb.mjpg` | RGB 카메라 MJPEG | |
 | GET | `/stream/depth.mjpg` | 깊이 영상 MJPEG (근접 이동 표시 포함) | |
@@ -97,7 +99,10 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | GET | `/api/labels` | 위치 라벨 목록 | |
 | POST | `/api/labels` | 라벨 추가 (현재 위치 또는 지정 좌표) | |
 | POST | `/api/labels/delete` | 라벨 삭제 | |
+| POST | `/api/labels/rename` | 라벨 이름 변경 | |
+| POST | `/api/labels/tolerance` | 라벨별 도착 오차 설정/해제 | |
 | POST | `/api/nav/goto` | 라벨 위치로 Nav2 자율 주행 (목표가 뒤쪽이면 먼저 30 cm 후진) | **예** |
+| POST | `/api/nav/goto_wall` | Go to 후 도착하면 라이다 근접 이동 | **예** |
 | POST | `/api/nav/cancel` | Nav2 목표 취소 | |
 | GET | `/api/nav/tolerance` | 도착 오차 | |
 | POST | `/api/nav/tolerance` | 도착 오차 설정 | |
@@ -154,11 +159,35 @@ export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 | `plan` | Nav2 경로 (`/plan`, 최대 약 400점). 30초 지나면 빈 목록 |
 | `amcl` | AMCL 위치 표준편차 `sx`, `sy` (m), `syaw` (rad). 30초 지나면 `null` |
 | `map` | 지도 정보 (`/api/map/meta` + 수신 후 경과 `age` s). 지도가 없으면 `null` |
-| `labels[].cost` | 라벨 위치의 Nav2 전역 비용지도 값 (0~100, -1 = 미탐색). **99 이상이면 갈 수 없음**. 비용지도가 없으면 `null` |
+| `labels[].cost` | 라벨 위치의 Nav2 전역 비용지도 값 (0~100, -1 = 미탐색). **99 이상이면 그 자리에는 갈 수 없다** (Go to는 가장 가까운 갈 수 있는 지점까지 간다). 비용지도가 없으면 `null` |
 | `robot_cost` | 로봇 현재 위치의 비용지도 값 (map 좌표일 때만) |
 | `nav` | Go to 상태 (아래 `/api/nav/goto` 참고). `server` = Nav2 `navigate_to_pose` 사용 가능 여부 |
 | `reloc` | 위치 다시 잡기 상태 (아래 `/api/relocalize` 참고). `amcl` = `/initialpose` 구독자(AMCL) 유무 |
 | `camera` | 영상별 수신 `fps`, 구독 중인지(`subscribed`), 토픽 발행자 수(`publishers`, 0이면 robot_rgbd 꺼짐) |
+
+### GET `/api/get_map_info`
+LLM 같은 계획기에 넘기려고 만든 작은 요약이다. 스캔, 궤적, 지도 이미지는 넣지 않는다.
+`hand_eye/llm_client.py`는 지시를 처리하는 매 단계에 이것을 읽어 프롬프트에 넣는다.
+```json
+{"frame": "map",
+ "pose": {"frame": "map", "x": -3.18, "y": 1.358, "yaw": 0.0357, "yaw_deg": 2.0},
+ "robot_cost": 0,
+ "robot": {"radius": 0.26, "front": 0.16, "back": 0.16},
+ "labels": [{"id": "1b4a6030", "name": "책상", "x": -3.975, "y": 0.822, "yaw": -3.1256, "yaw_deg": -179.1,
+             "cost": 99, "reachable": false, "dist_m": 0.96, "bearing_deg": -146.0}],
+ "map": {"frame": "map", "resolution": 0.05, "width_m": 14.55, "height_m": 9.45, "origin": [-8.455, -6.202, 0.0],
+         "bounds": [-8.2, -5.9, 5.6, 3.0], "known_m2": 56.6, "age_s": 12.3},
+ "nav": {"server": true, "state": "idle", "target": null, "message": null},
+ "wall_ahead": {"dist_m": 1.938, "err_deg": 51.0},
+ "units": "..."}
+```
+| 필드 | 설명 |
+|---|---|
+| `pose` | 로봇 위치. 2초 넘게 갱신이 없으면 `null`. `frame`이 `odom`이면 지도가 없다는 뜻 |
+| `labels[].reachable` | 비용지도 값이 99 미만이거나 비용지도가 없으면 `true`. `false`여도 Go to는 가장 가까운 지점까지 간다 |
+| `labels[].dist_m`, `bearing_deg` | 로봇에서 라벨까지 거리와 방향 (0 = 정면, + = 왼쪽, ±180 = 뒤). map 좌표일 때만 있다. 이때 목록은 가까운 순서다 |
+| `map.bounds` | 탐색된(unknown이 아닌) 칸의 범위 `[x_min, y_min, x_max, y_max]` (m) |
+| `wall_ahead` | 정면에 맞춘 벽 (2초 안의 결과만, 없으면 `null`) |
 
 ### GET `/api/map/meta`
 마지막으로 받은 `/map` 정보다. 지도를 아직 받지 못했으면 `null`.
@@ -269,6 +298,35 @@ curl -X POST http://192.168.0.31:8081/api/labels -d '{"name":"문 앞","x":1.2,"
 ### POST `/api/labels/delete`
 `{"id": "994b2b49"}` → `{"ok": true}`. 없는 id면 `404 {"error": "없는 라벨입니다"}`.
 
+### POST `/api/labels/rename`
+`{"id": "1b4a6030", "name": "책상 앞"}` → 바뀐 라벨 객체를 돌려준다. 위치, 방향, id는 그대로다.
+웹 UI에서는 라벨을 선택하고 **이름 변경** 버튼을 누르거나, 목록에서 라벨을 더블클릭한다.
+
+| 상태 | 원인 |
+|---|---|
+| 400 | 빈 이름, 40자 초과, 이미 있는 이름 |
+| 404 | 없는 라벨 |
+| 500 | 라벨 파일 저장 실패 |
+
+### POST `/api/labels/tolerance`
+라벨마다 도착 오차를 따로 정한다. 그 라벨로 Go to(`/api/nav/goto`, `/api/nav/goto_wall`)를 하는 동안에만 Nav2 goal checker에 이 값을 쓴다.
+정하지 않은 라벨은 `/api/nav/tolerance`의 기본값을 쓴다.
+```bash
+curl -X POST http://192.168.0.31:8081/api/labels/tolerance -d '{"id":"1b4a6030","xy":0.05,"yaw_deg":10}'   # 설정
+curl -X POST http://192.168.0.31:8081/api/labels/tolerance -d '{"id":"1b4a6030"}'                         # 해제 (기본값 사용)
+```
+- 응답은 바뀐 라벨이다. 설정한 라벨에는 `"tol": {"xy": 0.05, "yaw_deg": 10.0}`가 붙는다. 이 값은 `/api/labels`, `/api/state`, `/api/get_map_info`의 라벨에도 나온다.
+- 범위는 기본값과 같다 (`limits`).
+- 범위 밖이거나 `xy`, `yaw_deg` 중 하나만 주면 400, 없는 라벨이면 404.
+- **적용 시점:**
+  - Go to가 목표를 보낼 때 적용한다. 후진 단계가 있으면 후진이 끝난 뒤다. 약 0.2초 안에 Nav2에 들어간다.
+  - 목표가 끝나면(도착, 실패, 취소, 거부) 기본값으로 돌아간다.
+  - 적용 중에는 `/api/state`의 `tolerance.override`에 `{"xy", "yaw_deg", "label"}`이 나온다.
+- 웹 UI 사용법:
+  - 라벨을 선택하고 **도착 오차** 줄에서 값을 맞춘 뒤 **'라벨'에 저장**을 누른다. **라벨 값 지우기**를 누르면 기본값으로 돌아간다.
+  - 라벨 목록의 "도착 오차" 열에 값이나 "기본"이 보인다.
+  - 값이 있는 라벨을 선택하면 그 값이 입력칸에 채워진다.
+
 ### POST `/api/nav/goto`
 `{"id": "994b2b49"}` 라벨의 위치·방향으로 Nav2 `navigate_to_pose` 목표를 보낸다(RViz "Nav2 Goal"과 같음).
 **목표가 로봇 뒤쪽이면, 즉 로봇 정면에서 본 목표 방향이 ±90°를 넘으면, 먼저 똑바로 `goto_backup_m`(30 cm) 후진한다.**
@@ -286,6 +344,21 @@ curl -X POST http://192.168.0.31:8081/api/labels -d '{"name":"문 앞","x":1.2,"
   - `/api/drive`
   - `/api/drive/stop`
 - 진행 중인 Go to가 있을 때 새로 요청하면, 기존 목표를 취소하고 다시 후진부터 시작한다.
+- **라벨 위치가 막혀 있거나 장애물에 너무 가까우면, 가장 가까운 비용 낮은 지점까지 간다.**
+  - 라벨 칸의 비용지도 값이 `goal_max_cost`(50) 이상이면 대신 가장 가까운 칸으로 간다.
+    이 칸은 비용이 `goal_max_cost` 미만이고, 로봇이 지금 있는 빈 영역(비용 99 미만)과 이어져 있다.
+  - 이유: 비용 99 바로 아래 칸(장애물 옆 팽창 영역)을 목표로 주면, MPPI의 CostCritic이 그 안으로 들어가지 않는다.
+    그래서 로봇이 목표 앞에서 멈추고 `Failed to make progress`가 반복됐다.
+  - 지금 설정(팽창 반경 0.4 m)에서는 목표 중심이 장애물에서 약 0.4 m 떨어진다. 차체 앞으로는 약 24 cm가 남는다.
+    더 붙어야 하면 `/api/nav/goto_wall`로 도착 뒤 벽 근접 이동을 한다.
+  - 비용 50~98인 라벨 근처에 비용 낮은 칸이 없으면 라벨 위치 그대로 간다.
+  - 라벨에서 1.5 m 안에 있는 칸만 고른다.
+  - 방향은 라벨의 방향을 그대로 쓴다.
+  - 도착하면 멈춘다.
+  - 이때 `nav.target`은 옮긴 좌표다. `orig`에 원래 라벨 좌표, `shift`에 옮긴 거리(m)가 있다.
+    `nav.label`에는 원래 라벨이 있다. `nav.note`에는 "라벨 위치가 막혀 있어(cost 99) 18 cm 떨어진 가장 가까운 지점으로"가 남는다.
+  - 가는 도중에 장애물이 새로 보여 Nav2가 `aborted`로 끝날 수 있다. 이때 가장 가까운 지점이 5 cm 넘게 바뀌었으면
+    그 지점으로 다시 시도한다 (최대 2번, `nav.retries`).
 
 ```bash
 curl -X POST http://192.168.0.31:8081/api/nav/goto -d '{"id":"994b2b49"}'
@@ -298,7 +371,7 @@ curl -X POST http://192.168.0.31:8081/api/nav/goto -d '{"id":"994b2b49"}'
 | 상태 | 원인 |
 |---|---|
 | 404 | 없는 라벨 |
-| 400 | 라벨 위치의 비용지도 값이 99 이상 (장애물이나 로봇 반경 안이라 갈 수 없음) |
+| 400 | 라벨 위치의 비용지도 값이 99 이상이고, 1.5 m 안에 로봇이 지금 위치에서 갈 수 있는 지점도 없음 |
 
 **`nav` 상태** (`/api/state`):
 ```json
@@ -319,6 +392,26 @@ curl -X POST http://192.168.0.31:8081/api/nav/goto -d '{"id":"994b2b49"}'
 | `canceled` | 취소됨 (후진 중 취소 포함) |
 | `rejected` | Nav2가 목표를 거부함 |
 | `unavailable` | Nav2가 실행 중이 아님 |
+
+### POST `/api/nav/goto_wall`
+`/api/nav/goto`와 같다. 다만 Nav2가 도착(`succeeded`)하면 이어서 라이다 근접 이동(`/api/wall/start`)을 시작한다.
+라이다 근접 이동은 정면 벽과 수직으로 맞춘 뒤 `gap`까지 전진하는 동작이다.
+라벨 방향을 벽(책상) 쪽으로 저장해 두면 "책상 앞까지 가서 붙기"를 한 번에 할 수 있다.
+
+```bash
+curl -X POST http://192.168.0.31:8081/api/nav/goto_wall -d '{"id":"1b4a6030"}'
+```
+- 요청 본문, 응답, 오류는 `/api/nav/goto`와 같다.
+- 웹 UI: 라벨을 선택한 뒤 **Go to + 벽 근접** 버튼을 누른다.
+- 도착하고 0.5초 기다린 뒤 근접 이동을 시작한다. 멈춘 상태에서 찍힌 스캔을 쓰기 위해서다.
+  - 정면에 벽이 안 잡히면 3초 동안 다시 시도한 뒤 포기한다.
+  - Go to가 `succeeded`가 아니면(실패, 취소, 도착 오판) 근접 이동은 하지 않는다.
+- 진행 상황은 `/api/state`의 `nav`와 `wall`에서 확인한다.
+  - `nav.then` = `"wall"`
+  - `nav.then_state`: `pending`(도착, 시작 대기) → `started`(근접 이동 시작), `failed`(벽 못 찾음 등), `done`(이미 목표 거리 안)
+  - 이후 진행과 결과는 `wall.state`에 나온다.
+- 대기 중(0.5~3.5초)에 `/api/nav/cancel`, `/api/drive`, `/api/drive/stop`을 보내면 근접 이동을 시작하지 않는다.
+  근접 이동이 시작된 뒤에는 `/api/wall/stop`이나 `/api/drive/stop`으로 멈춘다.
 
 ### POST `/api/nav/cancel`
 진행 중인 Go to를 취소한다. → `{"ok": true}` (진행 중인 목표가 없어도 같은 응답).

@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='utf-8'?>
+<waypoints description="AMR 자율주행 목표 좌표 목록 (my_map SLAM 기반)">
+    <waypoint id="home" name="홈 스테이션">
+        <x>2.50</x>
+        <y>2.00</y>
+        <yaw>-116.5</yaw>
+        <wait_time>3.0</wait_time>
+        <tag_id>1</tag_id>
+    </waypoint>
+    <waypoint id="point_a" name="지점 A (물류 픽업)">
+        <x>1.0</x>
+        <y>1.0</y>
+        <yaw>0.0</yaw>
+        <wait_time>5.0</wait_time>
+    </waypoint>
+    <waypoint id="point_b" name="지점 B (작업 구역 1)">
+        <x>0.0</x>
+        <y>2.0</y>
+        <yaw>90.0</yaw>
+        <wait_time>5.0</wait_time>
+    </waypoint>
+    <waypoint id="point_c" name="지점 C (작업 구역 2)">
+        <x>-1.0</x>
+        <y>2.0</y>
+        <yaw>180.0</yaw>
+        <wait_time>3.0</wait_time>
+    </waypoint>
+</waypoints>

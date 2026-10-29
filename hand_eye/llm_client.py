@@ -13,6 +13,7 @@ llm_client.py - Gemini Robotics-ER 이 test4.py 의 REST API 를 스킬로 쓰�
   get_depth_at(y, x)     GET /get_depth?x=&y=    그 점의 깊이/로봇좌표/집기 가능 여부
   pick(y, x)             GET /pick?x=&y=         그 점의 물체를 집는다
   place(y, x)            GET /place?x=&y=        그 점에 내려놓는다
+  reset                  GET /reset              기본 상태(손 빔, waiting_pick)로 강제 리셋
   wait(seconds)          (/get_state 폴링)       동작이 끝날 때까지 기다린다
   say(message)           -                       사용자에게 한마디
   done(message)          -                       일을 마쳤다고 알리고 종료
@@ -20,6 +21,7 @@ llm_client.py - Gemini Robotics-ER 이 test4.py 의 REST API 를 스킬로 쓰�
 이동 로봇(car2) 스킬 (= ros2_slam/test/map_web.py 의 REST API, 문서 map_web_api.md)
   base_state             GET /api/state, /api/drive   위치·방향, 라벨 목록, Nav2/근접 상태
   goto_label(label)      POST /api/nav/goto           라벨 위치로 Nav2 자율 주행 (끝날 때까지 기다림)
+  goto_label_wall(label, gap)  POST /api/nav/goto_wall  라벨로 이동한 뒤 정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진
   save_label(label)      POST /api/labels             지금 위치를 라벨로 저장
   base_move(meters)      POST /api/drive (반복)       직진/후진 (±1 m, 앞뒤 라이다 장애물이면 정지)
   base_turn(degrees)     POST /api/drive (반복)       제자리 회전 (±180°, + = 왼쪽)
@@ -29,17 +31,41 @@ llm_client.py - Gemini Robotics-ER 이 test4.py 의 REST API 를 스킬로 쓰�
   depth_approach         POST /api/approach/*         깊이 카메라 근접선까지 전진
   주소는 기본으로 --api 와 같은 호스트의 8081 포트 (--map-api 로 지정).
   map_web 이 없으면(연결 실패 또는 --no-base) 이 스킬들은 빠진다.
+  지도 정보: 지시를 처리하는 매 단계에 GET /api/get_map_info (내 위치, 라벨 위치·거리·방향·
+  도달 가능 여부, 지도 범위, Nav2 상태)를 프롬프트에 넣고, 첫 단계에서 모델이 그걸 보고
+  전체 실행 계획(plan)을 세운다. 계획은 다음 단계 프롬프트에도 들어간다.
 
 좌표 규약은 이 프로젝트의 다른 VLM 코드(test3.py)와 같다 - **[y, x] 순서로
 0~1000 정규화**. 클라이언트가 실제 픽셀로 바꿔서 REST 에 넘긴다. 모델이 픽셀
 크기를 몰라도 되고, 화면 크기가 바뀌어도 프롬프트를 고칠 필요가 없다.
 
 지시는 **웹으로 받는다**. 실행하면 http://127.0.0.1:8770 이 열리고, 거기서
-현재 화면 / 진행 로그 / 로봇 상태를 보면서 명령을 넣는다. 터미널로 받고 싶으면
---cli 를 준다.
+현재 화면 / 진행 로그 / 로봇 상태를 보면서 명령을 넣는다. 기본으로 0.0.0.0 에
+바인드하므로 같은 네트워크의 다른 PC 에서도 http://<이 기계 IP>:8770 으로 들어올
+수 있다 (시작할 때 주소를 찍는다. 이 기계에서만 쓰려면 --host 127.0.0.1).
+인증이 없으니 접속할 수 있는 사람은 누구나 로봇을 움직일 수 있다는 점에 주의.
+터미널로 받고 싶으면 --cli 를 준다.
 
-pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고, **실패했을 때만**
-다시 할지 묻는다(--auto 를 주면 그것도 묻지 않고 그냥 넘어간다).
+웹에서는 [🎤 음성 명령] 으로 말로도 지시할 수 있다. 말하는 동안 브라우저가 16 kHz
+PCM 을 0.2초마다 서버로 흘리고, 서버는 Gemini Live API(--live-model, 기본
+gemini-3.5-transcribe-live)로 실시간 받아 적어 중간 결과를 입력칸에 바로 보여준다.
+녹음이 끝나면 확정 문장이 곧바로 나온다 (말 끝나고 3초 무음 뒤 멈추므로 그 사이 확정된다).
+Live 를 못 쓰면 쌓아 둔 음성을 --stt-model(기본 gemini-3.5-flash-lite)로 한 번에 받아 적는다.
+
+음성 답변: 지시를 받으면 무엇을 할지, 스킬마다 지금 할 행동을, 끝나면 결과를 짧은 한 문장으로 소리 내 알려 준다.
+모델이 스킬 JSON 의 speech 에 쓴 문장을 서버가 --tts-model(기본 gemini-3.8-flash-lite-tts)
+로 음성으로 만들고, 웹 UI 가 차례로 재생한다 ('🔊 음성 답변 듣기' 로 끄고 켠다). TTS 가 안
+되면 브라우저 내장 음성(ko-KR)으로 읽는다. --cli 에서는 글로 찍는다. 마이크는 브라우저 규칙상 https 또는 localhost(127.0.0.1) 에서만 열린다.
+그래서 다른 PC 용으로 https 포트(--https-port, 기본 8771)를 자체 서명 인증서
+(llm_tls_*.pem, 없으면 자동 생성)로 함께 연다 - https://<IP>:8771 로 들어가
+처음 한 번 브라우저 경고에서 '계속' 을 누르면 마이크를 쓸 수 있다.
+
+처리 단계 로그: 음성 입력(V1, V2 ...)과 AI 처리(지시 O1 ..., 화면 설명 B1 ...)의
+단계마다 시각 / 걸린 시간 / 프롬프트·응답 원문을 남긴다. 웹 UI 의 '처리 단계 로그'
+에서 진행 중인 단계를 보고, 전부는 hand_eye/llm_trace.jsonl 에 쌓인다 (5 MB 넘으면 .1 로).
+
+pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고, 실패하면 묻지 않고
+최대 MAX_RETRY 번까지 바로 다시 해 본다.
 
 사용:
   hand_eye/.env 에 GEMINI_API_KEY=... 한 줄 (hand_eye/.env.example 참고)
@@ -47,7 +73,6 @@ pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고,
   python hand_eye/llm_client.py                      # 웹 UI 로 지시
   python hand_eye/llm_client.py "주황색 통을 상자에 넣어"   # 첫 지시만 미리 주기
   python hand_eye/llm_client.py --cli                # 터미널로 지시
-  python hand_eye/llm_client.py --auto "책상 위 물건 하나만 집어봐"   # 재시도도 안 묻기
   python hand_eye/llm_client.py --api http://192.168.0.10:8765 "..."
   python hand_eye/llm_client.py --map-api http://192.168.0.31:8081 "책상으로 가서 컵을 집어"
   python hand_eye/llm_client.py --no-base            # 이동 로봇 스킬 없이 팔만
@@ -56,24 +81,34 @@ pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고,
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
+import hashlib
+import io
 import json
 import math
 import os
 import queue
+import re
+import socket
+import ssl
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
 import webbrowser
+import zoneinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
 import cv2
 import numpy as np
 from google import genai
+from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 
 for _s in (sys.stdout, sys.stderr):
@@ -89,14 +124,128 @@ BASE_SPEED = 0.08         # base_move 속도 (m/s)
 BASE_TURN_SPEED = 0.4     # base_turn 각속도 (rad/s)
 BASE_CLEAR = 0.10         # base_move: 차체 앞/뒤에서 이 거리 안에 라이다 점이 있으면 정지 (m)
 NAV_TIMEOUT = 240.0       # goto_label 최대 대기 (s)
+# 긴급 정지 (웹 '긴급 정지' 버튼). 켜지면 진행 중인 지시는 다음 확인 지점에서 끝나고, 몸체 이동
+# 대기 루프는 바로 멈춘다. 새 지시가 들어오면 꺼진다.
+ESTOP = threading.Event()
 MODEL_ID = os.environ.get("GEMINI_MODEL", "gemini-robotics-er-2-preview")
+# 음성 명령 받아쓰기. 실시간(Live API)이 기본이고, Live 가 안 되면 일괄 모델로 대신한다.
+# 측정 (Pi, 6.4초 한국어): Live = 말 끝나고 ~2초 안에 확정 / flash-lite 일괄 4~6초 /
+# 3.8-flash 일괄 12~158초.
+LIVE_STT_MODEL_ID = os.environ.get("GEMINI_LIVE_STT_MODEL", "gemini-3.5-transcribe-live")
+STT_MODEL_ID = os.environ.get("GEMINI_STT_MODEL", "gemini-3.5-flash-lite")
+VOICE_RATE = 16000                  # 브라우저가 보내는 PCM (16bit 모노)
+LIVE_END_WAIT = 5.0                 # 녹음이 끝난 뒤 확정 결과를 기다리는 최대 시간 (s)
+LIVE_IDLE_SEC = 15.0                # 이만큼 브라우저 소식이 없으면 세션을 닫는다 (탭을 닫은 경우)
+MAX_VOICE_BYTES = 4 * 1024 * 1024   # 음성 업로드 상한 (16 kHz 16bit 모노면 약 2분)
+# 음성 답변 (지시를 받으면 할 일 / 끝나면 결과를 한 문장으로 들려준다). 측정: 한 문장 3~5초.
+TTS_MODEL_ID = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
+TTS_KEEP = 30                       # 서버에 남겨 둘 최근 음성 답변 수
+# 모델 호출 시간 제한. API 가 답 없이 매달려도 에이전트가 멈추지 않게 (실측: 12분 넘게 무응답).
+# 시간 초과나 일시 오류(5xx, 429, 연결)는 MODEL_TRIES 번까지 시도한다.
+MODEL_TIMEOUT = 60.0                # 로봇 판단 / 화면 설명 한 번
+STT_TIMEOUT = 30.0                  # 일괄 받아쓰기 한 번
+TTS_TIMEOUT = 20.0                  # 음성 답변 한 번 (실패하면 브라우저 내장 음성)
+MODEL_TRIES = 2
+VOICE_MIN_PEAK = 800                # 이보다 작으면(16bit, 약 -32 dBFS) 말이 없다고 본다
+TLS_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_tls_cert.pem")
+TLS_KEY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_tls_key.pem")
 VIEW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_view.jpg")
 SKILLS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_skills.json")  # 웹에서 끈 스킬
+USAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_usage.json")    # 모델별 오늘 사용 횟수
+# 모델별 하루 요청 한도. Gemini API 는 남은 사용량을 알려주지 않아서, 이 한도에서 이 프로그램이
+# 센 횟수를 빼서 '남은 양' 을 보여 준다 (같은 키를 다른 곳에서 쓰면 실제보다 많게 보인다).
+# 429 오류에 'limit: N' 이 오면 그 값을 llm_usage.json 에 기억해 이 표보다 우선한다.
+# 바꾸려면 환경변수 GEMINI_DAILY_LIMITS="모델=횟수,모델=횟수".
+DAILY_LIMITS = {"gemini-robotics-er-2-preview": 20}
+for _kv in os.environ.get("GEMINI_DAILY_LIMITS", "").split(","):
+    _m, _sep, _n = _kv.partition("=")
+    if _sep and _n.strip().isdigit():
+        DAILY_LIMITS[_m.strip()] = int(_n)
+QUOTA_TZ = zoneinfo.ZoneInfo("America/Los_Angeles")    # Gemini 일일 할당량은 태평양 시간 자정에 초기화
+TRACE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_trace.jsonl")   # 처리 단계 로그
+TRACE_MAX_BYTES = 5 * 1024 * 1024   # 넘으면 llm_trace.jsonl.1 로 돌린다
+TRACE_KEEP = 1000                   # 메모리(웹 UI)에 남길 줄 수
+TRACE_DETAIL = 8000                 # 프롬프트/응답 원문은 이만큼만 남긴다
 SEND_WIDTH = 800          # 모델에 보낼 이미지 폭. 토큰을 아끼되 점을 찍을 만큼은 크게
 MAX_STEPS = 12            # 한 지시당 스킬 호출 상한 (무한루프 방지)
 MAX_RETRY = 3             # pick/place 가 실패했을 때 다시 해볼 최대 횟수
 WEB_PORT = 8770           # 웹 입력 UI 포트 (test4 의 REST 8765 와 다른 포트다)
-ASK_TIMEOUT = 300.0       # 재시도 질문에 답이 없으면 이 시간 뒤 '아니오' 로 본다
+
+
+# ---------------------------------------------------------------------------
+# 0. 처리 단계 로그
+# ---------------------------------------------------------------------------
+
+class Trace:
+    """음성 입력과 AI 처리의 단계별 내부 로그. 웹 UI 의 '처리 단계 로그' 가 읽는다.
+
+    일 한 건(job)마다 id 를 붙인다 - V3 = 3번째 음성 입력, O2 = 2번째 지시,
+    B1 = 화면 설명, S1 = 프로그램 시작. 단계(stage)마다 한 줄, 마지막 줄은 end=True.
+    최근 TRACE_KEEP 줄은 메모리에, 전부는 TRACE_PATH 에 JSONL 로 쌓는다.
+    """
+    KINDS = {"V": "음성", "O": "지시", "B": "화면 설명", "S": "시스템"}
+
+    def __init__(self, path: str = TRACE_PATH):
+        self.path = path
+        self.lock = threading.Lock()
+        self.items: List[dict] = []
+        self.seq = 0
+        self._count: dict = {}
+        self._start: dict = {}
+
+    def new_job(self, prefix: str) -> str:
+        with self.lock:
+            n = self._count[prefix] = self._count.get(prefix, 0) + 1
+        return f"{prefix}{n}"
+
+    def add(self, job: Optional[str], stage: str, msg: str = "", level: str = "info",
+            ms: Optional[float] = None, detail: Optional[str] = None, end: bool = False) -> None:
+        """level: info | ok | warn | error. ms = 이 단계에 걸린 시간."""
+        if not job:
+            return
+        now = time.time()
+        with self.lock:
+            self.seq += 1
+            start = self._start.setdefault(job, now)
+            e = {"seq": self.seq, "ts": round(now, 3),
+                 "t": time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}",
+                 "job": job, "kind": self.KINDS.get(job[:1], job[:1]), "stage": stage,
+                 "msg": str(msg), "level": level, "el": round(now - start, 2)}
+            if ms is not None:
+                e["ms"] = int(ms)
+            if detail:
+                e["detail"] = str(detail)[:TRACE_DETAIL]
+            if end:
+                e["end"] = True
+                self._start.pop(job, None)
+            self.items.append(e)
+            del self.items[:-TRACE_KEEP]
+            self._write(e)
+
+    def _write(self, e: dict) -> None:
+        try:
+            if os.path.exists(self.path) and os.path.getsize(self.path) > TRACE_MAX_BYTES:
+                os.replace(self.path, self.path + ".1")
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        except OSError:
+            pass                                  # 로그 때문에 로봇이 멈추면 안 된다
+
+    def since(self, seq: int) -> tuple[List[dict], bool]:
+        """seq 뒤의 줄들. 브라우저가 서버 재시작 전 번호를 들고 오면 처음부터 (reset=True)."""
+        with self.lock:
+            if seq > self.seq:
+                return list(self.items), True
+            return [e for e in self.items if e["seq"] > seq], False
+
+
+TRACE = Trace()
+
+
+def valid_job(job: str, prefixes: str = "VOBS") -> bool:
+    """브라우저가 보낸 job id 검사 (V12 같은 모양만)."""
+    return 2 <= len(job or "") <= 8 and job[0] in prefixes and job[1:].isdigit()
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +259,20 @@ class Api:
         self.base = base.rstrip("/")
 
     def _get(self, path: str, params: Optional[dict] = None) -> tuple[int, dict, bytes]:
+        """접속 실패도 예외 대신 (0, {}, 오류 JSON) 으로 돌려준다 - 웹 UI 가 죽지 않게."""
         q = f"?{urllib.parse.urlencode(params)}" if params else ""
         try:
             with urllib.request.urlopen(f"{self.base}{path}{q}", timeout=10) as r:
                 return r.status, dict(r.headers), r.read()
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers), e.read()
+        except (urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            return 0, {}, json.dumps({"ok": False, "error": f"{self.base} 접속 실패: {reason}"},
+                                     ensure_ascii=False).encode()
+
+    def connected(self) -> bool:
+        return bool(self.json("/get_state").get("ok"))
 
     def json(self, path: str, params: Optional[dict] = None) -> dict:
         code, _, body = self._get(path, params)
@@ -174,6 +331,22 @@ class MapApi:
     def state(self) -> dict:
         return self.call("/api/state")
 
+    def map_info(self) -> Optional[dict]:
+        """GET /api/get_map_info 를 모델에게 줄 모양으로 (못 읽으면 None)."""
+        r = self.call("/api/get_map_info", timeout=3.0)
+        if r.get("http") != 200:
+            return None
+        p, m = r.get("pose"), r.get("map") or {}
+        return {
+            "frame": r.get("frame"),       # map = 지도 위 위치, odom = 지도 없음
+            "pose": None if not p else {"x": p["x"], "y": p["y"], "yaw_deg": p["yaw_deg"]},
+            "labels": [{k: lb.get(k) for k in ("name", "x", "y", "yaw_deg", "reachable", "dist_m", "bearing_deg")
+                        if lb.get(k) is not None} for lb in r.get("labels", [])],
+            "map": None if not m else {k: m.get(k) for k in ("bounds", "known_m2", "resolution")},
+            "nav": r.get("nav"),
+            "wall_ahead": r.get("wall_ahead"),
+        }
+
     @staticmethod
     def _deg(rad) -> Optional[float]:
         return None if rad is None else round(math.degrees(rad), 1)
@@ -202,7 +375,8 @@ class MapApi:
         }
 
     # --- Go to ------------------------------------------------------------
-    def goto_label(self, name: str) -> dict:
+    def goto_label(self, name: str, wall: bool = False, gap: Optional[float] = None) -> dict:
+        """라벨로 Nav2 이동. wall 이면 /api/nav/goto_wall: 도착 뒤 라이다 근접 이동까지 기다린다."""
         labels = self.call("/api/labels").get("labels", [])
         exact = [lb for lb in labels if lb["name"] == name]
         part = exact or [lb for lb in labels if name and name.lower() in lb["name"].lower()]
@@ -210,13 +384,20 @@ class MapApi:
             return {"ok": False, "message": ("그런 라벨이 없다" if not part else "여러 라벨이 맞는다")
                     + f" - 있는 라벨: {[lb['name'] for lb in labels]}"}
         lb = part[0]
-        r = self.call("/api/nav/goto", {"id": lb["id"]})
+        if wall and gap is not None:
+            c = self.call("/api/wall/config", {"gap": float(gap)})
+            if c.get("http") != 200:
+                return {"ok": False, "message": c.get("error", f"HTTP {c.get('http')}")}
+        r = self.call("/api/nav/goto_wall" if wall else "/api/nav/goto", {"id": lb["id"]})
         if r.get("http") != 200:
             return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
-        self.log(f"    >> goto '{lb['name']}' (x {lb['x']:.2f}, y {lb['y']:.2f})")
+        self.log(f"    >> goto{'+wall' if wall else ''} '{lb['name']}' (x {lb['x']:.2f}, y {lb['y']:.2f})")
         t0, nav = time.time(), {}
         while time.time() - t0 < NAV_TIMEOUT:
             time.sleep(1.0)
+            if ESTOP.is_set():
+                self.stop()
+                return {"ok": False, "message": "긴급 정지로 이동을 멈췄다"}
             nav = self.state().get("nav") or {}
             if nav.get("state") not in ("backing", "sending", "active", "canceling"):
                 break
@@ -227,6 +408,25 @@ class MapApi:
             return {"ok": False, "message": f"{NAV_TIMEOUT:.0f}초 안에 도착하지 못해 취소했다"}
         out = {"ok": nav.get("state") == "succeeded", "state": nav.get("state"),
                "message": nav.get("message"), "note": nav.get("note")}
+        if (nav.get("target") or {}).get("shift") is not None:   # label blocked -> closest reachable point
+            out["stopped_short_m"] = nav["target"]["shift"]
+        if wall and out["ok"]:
+            # 도착 뒤 map_web 이 0.5초 쉬고(벽 못 찾으면 3초까지 재시도) 라이다 근접 이동을 시작한다
+            t1 = time.time()
+            while nav.get("then_state") in (None, "pending") and time.time() - t1 < 6.0 \
+                    and not ESTOP.is_set():
+                time.sleep(0.5)
+                nav = self.state().get("nav") or {}
+            ts = nav.get("then_state")
+            out["message"] = nav.get("message")
+            if ts == "started":
+                a = self._wait_approach("wall", self.call("/api/wall"), 120.0)
+                out["ok"] = a["ok"]
+                out["wall"] = {k: a.get(k) for k in ("state", "message", "moved_m")}
+            elif ts != "done":            # done = 이미 목표 거리 안 (성공으로 본다)
+                out["ok"] = False
+                if ts is None:
+                    out["message"] = (nav.get("message") or "") + " · 라이다 근접 이동이 시작되지 않았다"
         p = self.state().get("pose")
         if p:
             out["error_m"] = round(math.hypot(p["x"] - lb["x"], p["y"] - lb["y"]), 3)
@@ -277,6 +477,9 @@ class MapApi:
         self.log(f"    >> base_move {meters:+.2f} m")
         try:
             while True:
+                if ESTOP.is_set():
+                    why = "긴급 정지"
+                    break
                 st = self.state()
                 p = st.get("pose")
                 if not p:
@@ -317,6 +520,9 @@ class MapApi:
         self.log(f"    >> base_turn {degrees:+.0f}°")
         try:
             while True:
+                if ESTOP.is_set():
+                    why = "긴급 정지"
+                    break
                 p = self.state().get("pose")
                 if not p:
                     why = "위치(TF)를 잃었다"
@@ -351,7 +557,7 @@ class MapApi:
             return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
         t0, rl = time.time(), {}
         time.sleep(0.5)
-        while time.time() - t0 < 40:
+        while time.time() - t0 < 40 and not ESTOP.is_set():
             rl = self.state().get("reloc") or {}
             if rl.get("state") in ("done", "failed"):
                 break
@@ -365,9 +571,15 @@ class MapApi:
         r = self.call(f"/api/{kind}/start", {})
         if r.get("http") != 200:
             return {"ok": False, "message": r.get("error", f"HTTP {r.get('http')}")}
-        t0, a = time.time(), r
+        return self._wait_approach(kind, r, timeout)
+
+    def _wait_approach(self, kind: str, a: dict, timeout: float) -> dict:
+        t0 = time.time()
         while a.get("state") == "running" and time.time() - t0 < timeout:
             time.sleep(0.5)
+            if ESTOP.is_set():
+                self.stop()
+                return {"ok": False, "message": "긴급 정지로 근접 이동을 멈췄다"}
             a = self.call(f"/api/{kind}")
             self.status(f"{kind} 근접 이동 중 - {a.get('message', '')}")
         if a.get("state") == "running":
@@ -387,9 +599,9 @@ class MapApi:
         return self._approach("approach", 90.0)
 
 
-BASE_SKILLS = ("base_state", "goto_label", "save_label", "base_move", "base_turn", "base_stop",
+BASE_SKILLS = ("base_state", "goto_label", "goto_label_wall", "save_label", "base_move", "base_turn", "base_stop",
                "relocalize", "wall_approach", "depth_approach")
-BASE_MOVING = ("goto_label", "base_move", "base_turn", "wall_approach", "depth_approach")
+BASE_MOVING = ("goto_label", "goto_label_wall", "base_move", "base_turn", "wall_approach", "depth_approach")
 
 # 웹 UI 의 '등록된 스킬' 표 (이름, 인자, REST, 설명)
 ARM_SKILL_LIST = [
@@ -398,13 +610,15 @@ ARM_SKILL_LIST = [
     ("get_depth_at", "point", "GET /get_depth", "그 점의 깊이/로봇좌표/집기 가능 여부"),
     ("pick", "point", "GET /pick", "그 점의 물체를 집는다"),
     ("place", "point", "GET /place", "그 점에 내려놓는다"),
+    ("reset", "", "GET /reset", "기본 상태(손 빔)로 강제 리셋"),
     ("wait", "seconds", "/get_state 폴링", "동작이 끝날 때까지 기다린다"),
     ("say", "message", "-", "사용자에게 한마디"),
     ("done", "message", "-", "일을 마쳤다고 알리고 종료"),
 ]
 BASE_SKILL_LIST = [
     ("base_state", "", "GET /api/state", "위치·방향, 라벨 목록, Nav2/근접 상태"),
-    ("goto_label", "label", "POST /api/nav/goto", "라벨 위치로 Nav2 자율 주행"),
+    ("goto_label", "label", "POST /api/nav/goto", "라벨 위치로 Nav2 자율 주행만 (붙지 말라고 할 때만 - 기본은 goto_label_wall)"),
+    ("goto_label_wall", "label, gap", "POST /api/nav/goto_wall", "이동 기본: 라벨로 이동한 뒤 정면 벽과 수직으로 맞추고 gap(m) 앞까지 전진"),
     ("save_label", "label", "POST /api/labels", "지금 위치를 라벨로 저장"),
     ("base_move", "meters", "POST /api/drive", "직진/후진 (±1 m, 장애물이면 정지)"),
     ("base_turn", "degrees", "POST /api/drive", "제자리 회전 (±180°, + = 왼쪽)"),
@@ -422,7 +636,7 @@ LOCKED_SKILLS = ("done",)     # 끌 수 없다 - 이게 없으면 지시를 끝�
 
 class SkillCall(BaseModel):
     skill: str = Field(description="get_state | get_rgb | get_depth_at | pick | place "
-                                   "| wait | say | done | base_state | goto_label | save_label "
+                                   "| reset | wait | say | done | base_state | goto_label | goto_label_wall | save_label "
                                    "| base_move | base_turn | base_stop | relocalize "
                                    "| wall_approach | depth_approach 중 하나")
     point: Optional[List[int]] = Field(
@@ -430,11 +644,19 @@ class SkillCall(BaseModel):
         description="[y, x] 순서, 0~1000 정규화. get_depth_at/pick/place 에만 쓴다")
     seconds: Optional[float] = Field(default=None, description="wait 의 대기 시간(초)")
     message: Optional[str] = Field(default=None, description="say/done 에서 사용자에게 할 말")
-    label: Optional[str] = Field(default=None, description="goto_label/save_label 의 라벨 이름")
+    label: Optional[str] = Field(default=None, description="goto_label/goto_label_wall/save_label 의 라벨 이름")
     meters: Optional[float] = Field(default=None, description="base_move 거리 (m, + 전진, - 후진, ±1 이내)")
     degrees: Optional[float] = Field(default=None, description="base_turn 각도 (°, + 왼쪽, ±180 이내)")
-    gap: Optional[float] = Field(default=None, description="wall_approach 에서 차체 앞과 벽 사이 남길 거리 (m)")
+    gap: Optional[float] = Field(default=None, description="wall_approach/goto_label_wall 에서 차체 앞과 벽 사이 남길 거리 (m)")
     global_search: Optional[bool] = Field(default=None, description="relocalize: 지도 전체 검색이면 true")
+    speech: Optional[str] = Field(
+        default=None,
+        description="사용자에게 소리로 들려줄 아주 짧은 한국어 한 문장 (30자 안팎). "
+                    "매 스킬마다 지금 할 행동을 말한다 (첫 스킬은 전체적으로 무엇을 할지, done 은 결과)")
+    plan: Optional[List[str]] = Field(
+        default=None,
+        description="첫 스킬에서 지도 정보와 화면을 보고 세운 전체 실행 계획 (단계마다 짧은 한 문장, "
+                    "예: '책상으로 이동해 앞에 붙는다 (goto_label_wall)'). 계획을 바꿀 때만 다시 쓰고, 그 밖에는 비운다")
     reason: str = Field(description="왜 이 스킬을 지금 부르는지 한 문장")
 
 
@@ -446,11 +668,17 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
                        waiting_pick(잡기 기다림) picking(잡는중)
                        waiting_place(놓기 기다림) placing(놓는중)
                        homing busy calibrating not_calibrated
+                       pick_failed(잡기 실패 - 그리퍼 부하로 보니 빈손. 다시 pick 하면 된다)
   get_rgb              카메라 영상을 새로 본다 (물체가 움직였거나 결과를 확인할 때)
   get_depth_at(point)  그 점의 깊이와 로봇좌표, 집기 가능 여부를 미리 확인한다.
                        팔은 움직이지 않는다. pick 전에 확인하는 습관이 좋다.
-  pick(point)          그 점의 물체를 집는다. waiting_pick 상태에서만 된다.
+  pick(point)          그 점의 물체를 집는다. waiting_pick / pick_failed / waiting_place 에서 된다
+                       (waiting_place 에서 하면 들고 있던 물체는 홈 자리에서 놓친다).
+                       물체를 못 잡으면(pick_failed) ok 가 false, pick_failed 가 true 로 온다.
   place(point)         그 점에 내려놓는다. waiting_place 상태에서만 된다.
+  reset                상태를 기본(waiting_pick, 손 빔)으로 강제로 되돌린다. 팔은 움직이지
+                       않고 그리퍼도 열지 않는다. 상태가 실제와 어긋나 pick/place 가 계속
+                       거부될 때(예: 손이 비었는데 waiting_place)만 쓴다.
   wait(seconds)        동작이 끝날 때까지 기다린다 (picking/placing 이면 필요).
   say(message)         사용자에게 한마디 하고 계속한다.
   done(message)        일이 끝났거나 더 할 수 없을 때. 이유를 message 에 적는다.
@@ -460,19 +688,57 @@ SKILL_DOC = """너는 탁상 위 물체를 집어 옮기는 로봇 팔의 조종
   - 집을 물체의 '가운데 윗면' 을 가리켜라. 가장자리는 깊이가 튄다.
   - pick 은 손이 비었을 때만, place 는 물체를 물고 있을 때만 된다.
     확실하지 않으면 get_state 를 먼저 불러라.
-  - pick/place 는 확인 없이 바로 실행된다. 실패하면 클라이언트가 사용자에게 물어
+  - pick/place 는 확인 없이 바로 실행된다. 실패하면 클라이언트가 묻지 않고
     최대 3번까지 스스로 다시 해 본다. 그래도 ok 가 false 로 오면 그 지점은 이미
     포기한 것이다 - 같은 지점을 다시 부르지 말고, 다른 지점을 고르거나 done 을
     불러 message 에 이유를 적어라.
+  - pick 결과가 pick_failed(팔은 움직였지만 빈손)이면 그 물체를 다시 잡는다. 이때는 같은
+    점이 아니라, 처음 고른 점에서 화면 기준 왼쪽 위로 조금씩 옮긴 점으로 다시 pick 한다.
+    정규화 좌표로 n번째 재시도는 처음 점 [y, x] 에서 [y - 15*n, x - 15*n] 이다
+    (1번째 -15, 2번째 -30, 3번째 -45). 단 물체의 윗면을 벗어나면 안 된다 - 벗어날 것 같으면
+    옮기는 양을 줄여라. 실패 뒤에는 클라이언트가 화면을 새로 받으니, 물체가 밀려서 자리가
+    바뀌었으면 새 화면에서 물체 가운데를 다시 고르고 거기서부터 같은 방식으로 옮긴다.
+    이렇게 3번 다시 해도 못 잡으면 done 을 불러 못 잡았다고 알린다.
   - 한 번에 스킬 하나만 낸다. 결과를 보고 다음을 정한다.
-  - 할 일이 없거나 사용자의 지시가 끝나면 done 을 불러라."""
+  - 할 일이 없거나 사용자의 지시가 끝나면 done 을 불러라.
+  - speech 는 사용자에게 소리로 들려준다. 스킬을 낼 때마다 지금 할 행동을 짧은 한
+    문장(20자 안팎, 존댓말)으로 꼭 쓴다 (예: "컵을 집을게요", "왼쪽 위로 옮겨 다시 잡아볼게요",
+    "책상으로 이동할게요"). 첫 스킬은 지시 전체로 무엇을 할지, done 은 결과를 말한다.
+    좌표나 스킬 이름은 말하지 말고, 바로 앞에서 한 말을 그대로 되풀이하지 마라."""
+
+# 모델이 speech 를 비웠을 때 대신 들려줄 말
+SKILL_SPEECH = {
+    "get_state": "상태를 확인할게요.",
+    "get_rgb": "화면을 다시 볼게요.",
+    "get_depth_at": "위치를 확인할게요.",
+    "pick": "물건을 집을게요.",
+    "place": "내려놓을게요.",
+    "reset": "상태를 초기화할게요.",
+    "wait": "잠시 기다릴게요.",
+    "base_state": "위치를 확인할게요.",
+    "goto_label_wall": "이동할게요.",
+    "goto_label": "이동할게요.",
+    "save_label": "이 위치를 저장할게요.",
+    "base_move": "조금 움직일게요.",
+    "base_turn": "방향을 돌릴게요.",
+    "base_stop": "멈출게요.",
+    "relocalize": "위치를 다시 잡을게요.",
+    "wall_approach": "작업대에 붙을게요.",
+    "depth_approach": "앞으로 다가갈게요.",
+}
 
 BASE_DOC = """
 팔은 이동 로봇(car2) 위에 있다. 로봇 몸체를 움직이는 스킬 (끝날 때까지 기다렸다가 결과를 준다):
   base_state           위치(map 좌표 x,y m / 방향°), 저장된 라벨 목록(이름, reachable, 거리),
                        Nav2 상태, 정면 장애물 거리(front_clear_m), 정면 벽(wall_ahead).
-  goto_label(label)    저장된 라벨 위치로 자율 주행 (Nav2). label 은 base_state 의 이름 그대로.
-                       reachable 이 false 인 라벨은 갈 수 없다.
+  goto_label_wall(label, gap)
+                       ** 라벨로 이동할 때 기본으로 쓰는 스킬 **. 라벨 위치로 자율 주행(Nav2)한 뒤
+                       이어서 정면 벽(작업대 앞면)과 수직으로 맞추고 차체 앞이 gap m 남을 때까지
+                       붙는다 (= goto_label + wall_approach). label 은 지도 정보/base_state 의 이름 그대로.
+                       gap 생략 시 저장된 값. reachable 이 false 인 라벨도 가장 가까운 갈 수 있는
+                       지점까지 간 뒤 붙는다.
+  goto_label(label)    라벨 위치로 자율 주행만 하고 벽에 붙지 않는다. 직접 쓰지 마라 - 아래 이동 규칙의
+                       예외일 때만 쓴다.
   save_label(label)    지금 위치를 새 라벨 이름으로 저장 (지도가 있을 때만).
   base_move(meters)    똑바로 직진(+)/후진(-), 한 번에 ±1 m 이내. 앞/뒤에 장애물이 보이면 멈춘다.
   base_turn(degrees)   제자리 회전, + 왼쪽(반시계) / - 오른쪽, ±180° 이내.
@@ -482,6 +748,22 @@ BASE_DOC = """
   wall_approach(gap)   정면 벽(책상 앞면 등)과 수직으로 맞추고 차체 앞이 gap m 남을 때까지 다가간다.
                        gap 생략 시 저장된 값. 물건을 집기 전 작업대에 붙을 때 쓴다.
   depth_approach       깊이 카메라 기준선까지 천천히 다가간다.
+
+지도 정보:
+  프롬프트의 '지도 정보' 는 매 단계 새로 읽은 GET /api/get_map_info 요약이다.
+  pose(x, y m, yaw_deg), labels(이름, 위치, 방향, reachable, 로봇에서 거리 dist_m,
+  방향 bearing_deg: 0 = 정면, + 왼쪽, ±180 = 뒤), map(탐색된 범위 bounds [x_min, y_min,
+  x_max, y_max]), nav(Nav2 상태), wall_ahead(정면 벽). 좌표 단위 m, 각도 °, yaw 0 = +x, 반시계 +.
+  지시에 나온 장소는 labels 의 이름과 맞춰 보고, 어느 라벨로 갈지 계획을 세워라.
+  맞는 라벨이 없으면 지어내지 말고 say/done 으로 사용자에게 물어라.
+
+이동 규칙 (중요):
+  - 이동 명령("~로 가", "~에서 집어", "~에 놓아" 처럼 다른 장소가 필요한 일)은 goto_label 이 아니라
+    항상 goto_label_wall 로 한다. 팔이 작업대에 닿으려면 도착 뒤 작업대에 붙어야 하기 때문이다.
+  - goto_label 은 사용자가 "붙지 말고", "근처까지만" 처럼 붙지 말라고 했거나, 라벨 앞에 붙을
+    벽/작업대가 없다고 말했을 때만 쓴다.
+  - goto_label_wall 결과에서 state 가 succeeded 인데 벽을 못 찾아 ok 가 false 면, 라벨까지 이동은
+    된 것이다. 같은 이동을 다시 부르지 말고 화면을 보고 다음 일을 하거나, 필요하면 wall_approach 를 따로 불러라.
 
 몸체 규칙:
   - 몸체가 움직이면 카메라 화면이 바뀐다. 움직인 뒤에는 클라이언트가 화면을 새로 받는다.
@@ -494,13 +776,396 @@ BASE_DOC = """
 # 3. 모델 호출
 # ---------------------------------------------------------------------------
 
+class ModelTimeout(Exception):
+    """모델이 시간 제한 안에 답하지 않았다."""
+
+
+def with_deadline(fn, seconds: float):
+    """fn() 을 별도 스레드에서 돌려 seconds 까지만 기다린다. SDK 가 안에서 재시도하거나
+    연결이 매달려도 부른 쪽은 반드시 돌아온다 (남은 스레드는 SDK 시간 제한으로 곧 끝난다)."""
+    box: dict = {}
+
+    def run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:            # 부른 쪽 스레드로 넘긴다
+            box["e"] = e
+
+    th = threading.Thread(target=run, daemon=True, name="model-call")
+    th.start()
+    th.join(seconds)
+    if th.is_alive():
+        raise ModelTimeout(f"{seconds:.0f}초 안에 응답이 없다")
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
+
+
+def quota_message(e: BaseException) -> Optional[str]:
+    """일일 할당량을 다 쓴 429 면 사람이 읽을 설명, 아니면 None.
+    (무료 등급 gemini-robotics-er-2-preview 는 하루 20회 - 다시 해도 소용없다)"""
+    text = str(e)
+    if not ("429" in text or "RESOURCE_EXHAUSTED" in text or "too_many_requests" in text):
+        return None
+    if not re.search(r"per day|PerDay|quota", text, re.I):
+        return None                             # 분당 한도 같은 짧은 제한은 다시 해 볼 만하다
+    m = re.search(r"limit: (\d+)[^.]*?per day", text) or re.search(r"limit: (\d+)", text)
+    wait = re.search(r"retry in ([0-9hms.]+)", text)
+    return ("모델 일일 할당량을 다 썼다"
+            + (f" (하루 {m.group(1)}회)" if m else "")
+            + (f" - {re.sub(r'\.\d+s$', 's', wait.group(1).rstrip('.'))} 뒤에 다시 쓸 수 있다" if wait else ""))
+
+
+def quota_limit(e: BaseException) -> Optional[int]:
+    """일일 할당량 429 에 적힌 하루 한도 (없으면 None)."""
+    text = str(e)
+    m = re.search(r"limit: (\d+)[^.]*?per day", text) or re.search(r"limit: (\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def usage_tokens(res) -> Optional[int]:
+    """응답에 붙은 토큰 수 (SDK 응답 모양마다 이름이 달라서 아는 것만 본다)."""
+    for name in ("usage_metadata", "usage"):
+        u = getattr(res, name, None)
+        if u is None:
+            continue
+        for f in ("total_token_count", "total_tokens"):
+            v = getattr(u, f, None)
+            if isinstance(v, int):
+                return v
+    return None
+
+
+def key_id(api_key: str) -> str:
+    """키를 파일에 남기지 않고 구분하는 짧은 지문."""
+    return hashlib.sha256(api_key.encode()).hexdigest()[:12]
+
+
+def key_label(api_key: str) -> str:
+    """사람이 알아볼 키 이름: .env 에서 같은 값을 가진 변수 이름 + 끝 4자리."""
+    names = []
+    try:
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                name, sep, value = line.strip().partition("=")
+                if sep and value.strip().strip("'\"") == api_key:
+                    names.append(name.strip())
+    except OSError:
+        pass
+    if not names and os.environ.get("GEMINI_API_KEY", "").strip() == api_key:
+        names.append("$GEMINI_API_KEY")
+    # GEMINI_API_KEY 에 다른 이름의 키를 복사해 쓰는 경우가 많아 원래 이름을 앞에 둔다
+    names.sort(key=lambda n: n == "GEMINI_API_KEY")
+    return (names[0] if names else "키") + " …" + api_key[-4:]
+
+
+class Usage:
+    """API 키별·모델별 오늘(태평양 시간 기준) 요청 횟수와 토큰.
+
+    할당량은 키(프로젝트)마다 따로라서 키를 바꾸면 그 키의 횟수로 센다. USAGE_PATH 에
+    남겨 재시작해도 이어 센다 - 키 값은 남기지 않고 지문(key_id)과 끝 4자리만 남긴다.
+    """
+
+    def __init__(self, path: str = USAGE_PATH):
+        self.path = path
+        self.lock = threading.Lock()
+        self.keys: dict = {}         # key_id -> {"label", "day", "models", "limits"}
+        self.cur = ""                # 지금 쓰는 키의 key_id
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            self.keys = d.get("keys", {})
+            if "models" in d:            # 키별로 나누기 전 형식 - 처음 쓰는 키의 것으로 본다
+                self._legacy = {"label": "", "day": d.get("day", ""), "models": d["models"],
+                                "limits": d.get("limits", {})}
+        except (OSError, ValueError):
+            pass
+
+    _legacy: Optional[dict] = None
+
+    def set_key(self, api_key: str) -> None:
+        with self.lock:
+            self.cur = key_id(api_key)
+            if self._legacy is not None and self.cur not in self.keys:
+                self.keys[self.cur] = self._legacy
+            self._legacy = None
+            k = self.keys.setdefault(self.cur, {"label": "", "day": "", "models": {}, "limits": {}})
+            k["label"] = key_label(api_key)       # .env 이름이 바뀌었을 수 있어 매번 새로
+            self._save()
+
+    @staticmethod
+    def _today() -> str:
+        import datetime
+        return datetime.datetime.now(QUOTA_TZ).strftime("%Y-%m-%d")
+
+    def _key(self, kid: Optional[str] = None) -> dict:
+        """그 키의 기록. 날이 바뀌었으면 횟수를 0 으로 (한도는 유지)."""
+        k = self.keys.setdefault(kid or self.cur, {"label": "?", "day": "", "models": {}, "limits": {}})
+        today = self._today()
+        if k["day"] != today:
+            k["day"], k["models"] = today, {}
+        return k
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"keys": self.keys}, f, indent=1, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add(self, model: str, tokens: Optional[int] = None) -> None:
+        with self.lock:
+            m = self._key()["models"].setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})
+            m["count"] += 1
+            m["tokens"] += tokens or 0
+            m["exhausted"] = False
+            self._save()
+
+    def exhausted(self, model: str, limit: Optional[int]) -> None:
+        """일일 할당량 429 - 이 키로는 오늘 남은 게 없다."""
+        with self.lock:
+            k = self._key()
+            if limit:
+                k["limits"][model] = limit
+            k["models"].setdefault(model, {"count": 0, "tokens": 0, "exhausted": False})["exhausted"] = True
+            self._save()
+
+    def _rows(self, k: dict, all_limits: bool) -> list:
+        rows = []
+        names = set(k["models"]) | (set(DAILY_LIMITS) if all_limits else set())
+        for model in sorted(names):
+            m = k["models"].get(model, {"count": 0, "tokens": 0, "exhausted": False})
+            limit = k["limits"].get(model) or DAILY_LIMITS.get(model)
+            left = 0 if m["exhausted"] else (max(0, limit - m["count"]) if limit else None)
+            rows.append({"model": model, "used": m["count"], "tokens": m["tokens"],
+                         "limit": limit, "left": left, "exhausted": m["exhausted"]})
+        return rows
+
+    def summary(self) -> dict:
+        """지금 키는 모델별 자세히, 다른 키는 오늘 쓴 것이 있으면 요약."""
+        import datetime
+        with self.lock:
+            cur = self._key() if self.cur else None
+            others = []
+            for kid in list(self.keys):
+                if kid == self.cur:
+                    continue
+                k = self._key(kid)
+                if k["models"]:
+                    others.append({"key": k["label"], "models": self._rows(k, False)})
+            out = {"key": cur["label"] if cur else None, "day": self._today(),
+                   "models": self._rows(cur, True) if cur else [], "others": others}
+        now = datetime.datetime.now(QUOTA_TZ)
+        reset = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        out["reset_at"] = reset.timestamp()
+        return out
+
+
+def quota_retry_s(e: BaseException) -> Optional[float]:
+    """할당량 오류의 'retry in 1h2m3.4s' / retryDelay '3600s' 를 초로 (없으면 None)."""
+    text = str(e)
+    m = re.search(r"retry in ((?:\d+h)?(?:\d+m)?(?:[\d.]+s)?)", text) or \
+        re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?((?:\d+h)?(?:\d+m)?(?:[\d.]+s))", text)
+    if not m or not m.group(1):
+        return None
+    sec = 0.0
+    for num, unit in re.findall(r"([\d.]+)([hms])", m.group(1)):
+        sec += float(num) * {"h": 3600, "m": 60, "s": 1}[unit]
+    return sec or None
+
+
+def is_transient(e: BaseException) -> bool:
+    """다시 해 볼 만한 오류인가 (시간 초과, 서버 5xx, 짧은 429, 연결)."""
+    if isinstance(e, ModelTimeout):
+        return True
+    if quota_message(e):
+        return False
+    name = type(e).__name__
+    if any(k in name for k in ("Timeout", "Connection", "Server", "RateLimit", "Unavailable")):
+        return True
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    return isinstance(code, int) and (code == 429 or code >= 500)
+
+
 class Vlm:
     """test3.py 와 같은 호출 방식(interactions + JSON 스키마)을 쓴다."""
 
-    def __init__(self, api_key: str, log=None, model: str = MODEL_ID):
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: str, log=None, model: str = MODEL_ID,
+                 stt_model: str = STT_MODEL_ID, live_model: Optional[str] = LIVE_STT_MODEL_ID,
+                 tts_model: Optional[str] = TTS_MODEL_ID):
+        self._make_client(api_key)
         self.model = model
+        self.stt_model = stt_model
+        self.live_model = live_model          # None 이면 실시간 없이 일괄 받아쓰기만
+        self.tts_model = tts_model            # None 이면 음성 답변은 브라우저 내장 음성으로
         self.log = log or print
+        # 일일 할당량을 다 쓴 모델: model -> {what, message, at, until}. 그 모델 호출이 성공하거나
+        # 다시 쓸 수 있는 시각(until)이 지나면 빠진다. 웹 UI 가 경고로 보여 준다.
+        self.quota: dict = {}
+        self.quota_lock = threading.Lock()
+        self.usage = Usage()                  # 키별·모델별 오늘 사용 횟수 (웹 UI 의 '남은 사용량')
+        self.usage.set_key(api_key)
+
+    def quota_list(self) -> List[dict]:
+        now = time.time()
+        with self.quota_lock:
+            for m in [m for m, q in self.quota.items() if q["until"] and q["until"] < now]:
+                del self.quota[m]
+            return [{"model": m, **q} for m, q in self.quota.items()]
+
+    def _make_client(self, api_key: str) -> None:
+        self.client = genai.Client(api_key=api_key)
+        # interactions 클라이언트는 기본으로 429/5xx 를 최대 1시간 동안 조용히 재시도한다 -
+        # 할당량 초과(429)가 '응답 없음' 으로 보이게 된다. 재시도는 _call 이 한 번만 한다.
+        try:
+            from google.genai._gaos.utils.retries import RetryConfig
+            self.client.interactions.sdk_configuration.retry_config = RetryConfig("none", None, False)
+        except Exception:                      # SDK 내부 구조가 바뀌면 그냥 기본값으로
+            pass
+
+    def reload_key(self, api_key: str) -> None:
+        """.env 를 고친 뒤 Gemini 재연결 - 프로세스를 다시 띄우지 않고 새 키로 바꾼다."""
+        self._make_client(api_key)
+        self.usage.set_key(api_key)           # 사용량은 키마다 따로 센다
+        with self.quota_lock:
+            self.quota.clear()                # 소진 경고도 이전 키의 것이다
+
+    def check(self) -> None:
+        """키와 모델 접근 권한만 확인한다 (모델 정보 조회 - 토큰을 쓰지 않는다). 실패하면 예외."""
+        with_deadline(lambda: self.client.models.get(model=self.model), 15)
+
+    def live(self, job: str) -> "LiveStt":
+        """음성 하나를 실시간으로 받아 적는 세션을 연다 (웹 녹음 시작 때)."""
+        return LiveStt(self, job)
+
+    def _call(self, fn, timeout: float, job: Optional[str], what: str, tries: int = MODEL_TRIES,
+              model: Optional[str] = None):
+        """모델 호출 하나에 시간 제한과 재시도를 건다. fn(timeout) 은 SDK 에도 같은 제한을 넘긴다.
+        model: 할당량 경고에 쓸 모델 이름."""
+        for attempt in range(1, tries + 1):
+            try:
+                out = with_deadline(lambda: fn(timeout), timeout + 5)
+                if model:
+                    self.usage.add(model, usage_tokens(out))
+                if model and model in self.quota:
+                    with self.quota_lock:
+                        self.quota.pop(model, None)     # 다시 쓸 수 있게 됐다
+                return out
+            except Exception as e:
+                quota = quota_message(e)
+                if quota and model:
+                    self.usage.exhausted(model, quota_limit(e))
+                    wait = quota_retry_s(e)
+                    with self.quota_lock:
+                        use = {self.model: "지시 처리·화면 설명이 안 됨",
+                               self.stt_model: "음성 받아쓰기가 안 됨 (글로 입력하세요)",
+                               self.tts_model: "음성 답변은 브라우저 내장 음성으로 대신함"}.get(model, what.strip())
+                        self.quota[model] = {"what": use, "message": quota, "at": time.time(),
+                                             "until": time.time() + wait if wait else None}
+                    TRACE.add(job, "할당량 소진", f"{model}: {quota}", level="error")
+                if attempt >= tries or not is_transient(e):
+                    raise
+                why = "시간 초과" if isinstance(e, ModelTimeout) else type(e).__name__
+                self.log(f"      ({what} {why} - 다시 시도 {attempt + 1}/{tries})")
+                TRACE.add(job, f"{what} 다시 시도", f"{why}: {e}"[:200] + f" ({attempt + 1}/{tries})",
+                          level="warn")
+                time.sleep(1.0)
+
+    def tts(self, text: str, job: Optional[str] = None) -> bytes:
+        """음성 답변용 WAV. 재생은 브라우저가 한다."""
+        TRACE.add(job, "음성 답변 만들기", f"{self.tts_model}: {text}")
+        t0 = time.perf_counter()
+        try:
+            r = self._call(lambda t: self.client.models.generate_content(
+                model=self.tts_model, contents=text,
+                config=genai_types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    http_options=genai_types.HttpOptions(timeout=int(t * 1000)),
+                    speech_config=genai_types.SpeechConfig(voice_config=genai_types.VoiceConfig(
+                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=TTS_VOICE))))),
+                TTS_TIMEOUT, job, "음성 답변", tries=1, model=self.tts_model)    # 실패하면 브라우저 내장 음성이 대신한다
+            part = r.candidates[0].content.parts[0].inline_data
+            data = part.data
+            if data[:4] != b"RIFF":                # 날 PCM 이면 WAV 로 싼다 (24 kHz 16bit)
+                rate = 24000
+                for kv in (part.mime_type or "").split(";"):
+                    if kv.strip().startswith("rate="):
+                        rate = int(kv.split("=")[1])
+                data = Vlm.pcm_to_wav(data, rate)
+        except Exception as e:
+            TRACE.add(job, "음성 답변 오류", f"{type(e).__name__}: {e}"[:300], level="warn",
+                      ms=(time.perf_counter() - t0) * 1000)
+            raise
+        TRACE.add(job, "음성 답변 준비", f"WAV {len(data) / 1024:.0f} KB", level="ok",
+                  ms=(time.perf_counter() - t0) * 1000)
+        return data
+
+    def transcribe(self, wav: bytes, job: Optional[str] = None) -> str:
+        """웹에서 녹음한 음성(WAV)을 받아 적는다. cookbook quickstarts/Audio.ipynb 와 같은
+        방식 - interactions 에 audio 를 base64 로 넣는다."""
+        # 무음이면 모델을 부르지 않는다 - 조용한 녹음에서도 그럴듯한 문장을 지어내기 때문
+        peak = self._voice_peak(wav)
+        loud = peak >= VOICE_MIN_PEAK
+        TRACE.add(job, "음량 검사", f"최대 {peak:.0f} / 기준 {VOICE_MIN_PEAK} - "
+                  + ("통과" if loud else "너무 작아 모델을 부르지 않는다"), level="info" if loud else "warn")
+        if not loud:
+            self.log(f"      (음성이 너무 작다 - 최대 {peak:.0f} < {VOICE_MIN_PEAK})")
+            return ""
+        prompt = ("이 음성은 사람이 로봇에게 내리는 명령이다. 들리는 말을 그대로 받아 적어라. "
+                  "한국어는 한국어로 적고, 받아 적은 문장 하나만 출력하라. "
+                  "설명, 따옴표, 타임스탬프는 붙이지 마라. 사람 말소리가 분명히 들리지 않으면 "
+                  "추측하지 말고 정확히 NONE 한 단어만 출력하라.")
+        TRACE.add(job, "받아쓰기 요청", f"{self.stt_model} 에 WAV {len(wav) / 1024:.0f} KB 보냄",
+                  detail=prompt)
+        t0 = time.perf_counter()
+        try:
+            audio_b64 = base64.b64encode(wav).decode()
+            res = self._call(lambda t: self.client.interactions.create(
+                model=self.stt_model,
+                input=[
+                    {"type": "text", "text": prompt},
+                    {"type": "audio", "data": audio_b64, "mime_type": "audio/wav"},
+                ],
+                timeout=t,
+            ), STT_TIMEOUT, job, "받아쓰기", model=self.stt_model)
+        except Exception as e:
+            TRACE.add(job, "받아쓰기 오류", f"{type(e).__name__}: {e}", level="error",
+                      ms=(time.perf_counter() - t0) * 1000)
+            raise
+        dt = time.perf_counter() - t0
+        self.log(f"      (받아쓰기 {dt:.1f}s)")
+        raw = res.output_text or ""
+        text = raw.strip().strip('"\'')
+        text = "" if text.upper().rstrip(".") == "NONE" else text
+        TRACE.add(job, "받아쓰기 응답", repr(text) if text else "말소리 없음 (NONE)",
+                  level="ok" if text else "warn", ms=dt * 1000, detail=raw)
+        return text
+
+    @staticmethod
+    def _voice_peak(wav: bytes) -> float:
+        """16bit WAV 의 음량 - 상위 0.5% 샘플 크기 (튀는 잡음 한두 개는 무시)."""
+        try:
+            with wave.open(io.BytesIO(wav)) as w:
+                if w.getsampwidth() != 2:
+                    return float("inf")          # 모르는 형식이면 거르지 않는다
+                return Vlm.pcm_peak(w.readframes(w.getnframes()))
+        except (wave.Error, EOFError):
+            return float("inf")
+
+    @staticmethod
+    def pcm_peak(pcm: bytes) -> float:
+        a = np.frombuffer(pcm[:len(pcm) // 2 * 2], "<i2")
+        return float(np.percentile(np.abs(a.astype(np.int32)), 99.5)) if a.size else 0.0
+
+    @staticmethod
+    def pcm_to_wav(pcm: bytes, rate: int = VOICE_RATE) -> bytes:
+        b = io.BytesIO()
+        with wave.open(b, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(pcm[:len(pcm) // 2 * 2])
+        return b.getvalue()
 
     @staticmethod
     def _b64(bgr: np.ndarray) -> tuple[str, int, int]:
@@ -512,9 +1177,13 @@ class Vlm:
             raise RuntimeError("이미지 인코딩 실패")
         return base64.b64encode(buf.tobytes()).decode(), w, h
 
-    def ask(self, bgr: np.ndarray, prompt: str,
-            schema: Optional[dict] = None) -> str:
-        img_b64, _, _ = self._b64(bgr)
+    def ask(self, bgr: np.ndarray, prompt: str, schema: Optional[dict] = None,
+            job: Optional[str] = None, label: str = "") -> str:
+        """label 은 처리 단계 로그의 단계 이름 앞에 붙는다 (예: '3단계 ')."""
+        img_b64, w, h = self._b64(bgr)
+        TRACE.add(job, f"{label}모델 요청",
+                  f"{self.model} | 화면 {w}x{h} -> {SEND_WIDTH}px | 프롬프트 {len(prompt)}자"
+                  + (" | JSON 스키마" if schema else ""), detail=prompt)
         body = {
             "model": self.model,
             "input": [{"type": "user_input", "content": [
@@ -528,9 +1197,175 @@ class Vlm:
                                        "mime_type": "application/json",
                                        "schema": schema}
         t0 = time.perf_counter()
-        res = self.client.interactions.create(**body)
-        self.log(f"      (모델 {time.perf_counter() - t0:.1f}s)")
-        return res.output_text
+        try:
+            res = self._call(lambda t: self.client.interactions.create(**body, timeout=t),
+                             MODEL_TIMEOUT, job, f"{label}모델", model=self.model)
+        except Exception as e:
+            TRACE.add(job, f"{label}모델 오류", f"{type(e).__name__}: {e}", level="error",
+                      ms=(time.perf_counter() - t0) * 1000)
+            raise
+        dt = time.perf_counter() - t0
+        self.log(f"      (모델 {dt:.1f}s)")
+        out = res.output_text or ""
+        TRACE.add(job, f"{label}모델 응답", f"{len(out)}자 받음", ms=dt * 1000, detail=out)
+        return out
+
+
+class LiveStt:
+    """음성 하나를 Gemini Live API 로 실시간 받아 적는다.
+
+    브라우저가 0.2초마다 16 kHz PCM 조각을 보내면(feed) 그대로 Live 세션에 흘린다.
+    서버가 0.5초마다 중간 결과(interim)를, 말이 끝나면(서버 VAD) 확정 결과를 준다 -
+    text 는 '확정 + 지금 중간' 이라 말하는 동안 입력칸에 바로 보여줄 수 있다.
+    연결은 녹음 시작과 함께 백그라운드에서 맺고, 그동안 온 조각은 큐에서 기다린다.
+    Live 가 안 되면(finish 때) 쌓아 둔 PCM 을 일괄 모델로 받아 적는다.
+    """
+
+    def __init__(self, vlm: "Vlm", job: str):
+        self.vlm, self.job = vlm, job
+        self.q: "queue.Queue" = queue.Queue()     # bytes = 오디오, None = 끝, False = 취소
+        self.lock = threading.Lock()
+        self.pcm = bytearray()
+        self.finals: List[str] = []
+        self.interim = ""
+        self.speaking = False                     # 서버 VAD: 말하는 중
+        self.heard = False                        # 서버가 말소리를 한 번이라도 들었나
+        self.error = ""
+        self.connected = threading.Event()
+        self.closed = threading.Event()
+        self.t0 = time.perf_counter()
+        self._first = True
+        if vlm.live_model:
+            TRACE.add(job, "서버 받아쓰기 시작", f"{vlm.live_model} 연결을 백그라운드로 맺는다 (그동안 조각은 큐에)")
+            threading.Thread(target=self._run, daemon=True, name=f"live-{job}").start()
+        else:
+            self.error = "실시간 받아쓰기 꺼짐 (--live-model none)"
+            TRACE.add(job, "서버 받아쓰기 시작", f"실시간 꺼짐 - 녹음이 끝나면 {vlm.stt_model} 로 한 번에")
+            self.closed.set()
+
+    # --- 웹 핸들러 스레드에서 부른다 -------------------------------------------
+    @property
+    def text(self) -> str:
+        with self.lock:
+            return " ".join(self.finals + ([self.interim] if self.interim else [])).strip()
+
+    def feed(self, pcm: bytes) -> None:
+        if len(self.pcm) > MAX_VOICE_BYTES:       # 상한을 넘으면 버린다 (브라우저도 30초에 멈춘다)
+            return
+        self.pcm += pcm
+        if not self.closed.is_set():
+            self.q.put(bytes(pcm))
+
+    def cancel(self) -> None:
+        self.q.put(False)
+
+    def finish(self) -> str:
+        """녹음이 끝났다. 확정 결과를 기다려 최종 문장을 돌려준다."""
+        t0 = time.perf_counter()
+        self.q.put(None)
+        self.closed.wait(LIVE_END_WAIT + 3)
+        sec = len(self.pcm) / 2 / VOICE_RATE
+        text = self.text
+        TRACE.add(self.job, "Live 끝", f"오디오 {sec:.1f}초, 확정 {len(self.finals)}개"
+                  + (f", 오류: {self.error}" if self.error else ""),
+                  ms=(time.perf_counter() - t0) * 1000, level="warn" if self.error else "info")
+        peak = Vlm.pcm_peak(bytes(self.pcm))
+        if peak < VOICE_MIN_PEAK:                 # 조용한 녹음에서 지어낸 문장은 버린다
+            TRACE.add(self.job, "음량 검사", f"최대 {peak:.0f} / 기준 {VOICE_MIN_PEAK} - 너무 작아 버린다",
+                      level="warn")
+            return ""
+        if not text and (self.error or not self.connected.is_set()) and self.pcm:
+            TRACE.add(self.job, "일괄 받아쓰기로 대신", f"Live 를 못 써서 {self.vlm.stt_model} 로", level="warn")
+            return self.vlm.transcribe(Vlm.pcm_to_wav(bytes(self.pcm)), self.job)
+        return text
+
+    # --- Live 세션 (자기 스레드의 asyncio) -------------------------------------
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception as e:                    # asyncio 자체 오류까지
+            self.error = self.error or f"{type(e).__name__}: {e}"
+        finally:
+            self.closed.set()
+
+    async def _main(self) -> None:
+        cfg = {"response_modalities": ["TEXT"], "input_audio_transcription": {}}
+        t0 = time.perf_counter()
+        try:
+            async with self.vlm.client.aio.live.connect(model=self.vlm.live_model, config=cfg) as s:
+                self.connected.set()
+                self.vlm.usage.add(self.vlm.live_model)       # Live 는 세션 하나를 한 번으로 센다
+                TRACE.add(self.job, "Live 연결", f"{self.vlm.live_model} (대기 중이던 조각 {self.q.qsize()}개)",
+                          ms=(time.perf_counter() - t0) * 1000)
+                recv = asyncio.create_task(self._recv(s))
+                try:
+                    if await self._send(s):       # 정상 끝 -> 확정 결과를 조금 기다린다
+                        await self._settle(recv)
+                finally:
+                    recv.cancel()
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            TRACE.add(self.job, "Live 오류", self.error[:300], level="error",
+                      ms=(time.perf_counter() - t0) * 1000)
+
+    async def _send(self, s) -> bool:
+        """오디오를 흘린다. 끝(None)이면 True, 취소/방치면 False."""
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                item = await loop.run_in_executor(None, self.q.get, True, LIVE_IDLE_SEC)
+            except queue.Empty:
+                TRACE.add(self.job, "Live 닫음", f"{LIVE_IDLE_SEC:.0f}초 동안 브라우저 소식이 없다", level="warn",
+                          end=True)
+                return False
+            if item is False:
+                return False
+            if item is None:
+                await s.send_realtime_input(audio_stream_end=True)
+                return True
+            await s.send_realtime_input(
+                audio=genai_types.Blob(data=item, mime_type=f"audio/pcm;rate={VOICE_RATE}"))
+
+    async def _settle(self, recv: "asyncio.Task") -> None:
+        """말이 끝나 확정됐으면 바로, 아니면 확정 결과(서버 VAD)를 LIVE_END_WAIT 까지 기다린다."""
+        t_end = time.perf_counter() + LIVE_END_WAIT
+        t_quiet = time.perf_counter() + 1.5       # 아무 소식도 없던 경우 잠깐만 더 본다
+        while time.perf_counter() < t_end and not recv.done():
+            with self.lock:
+                pending = self.speaking or bool(self.interim)
+                anything = self.heard or bool(self.finals)
+            if not pending and (anything or time.perf_counter() > t_quiet):
+                return
+            await asyncio.sleep(0.05)
+
+    async def _recv(self, s) -> None:
+        while True:
+            async for msg in s.receive():
+                va = getattr(msg, "voice_activity", None)
+                kind = str(getattr(va, "voice_activity_type", "") or "")
+                if kind.endswith("START"):
+                    with self.lock:
+                        self.speaking = self.heard = True
+                elif kind.endswith("END"):
+                    with self.lock:
+                        self.speaking = False
+                sc = msg.server_content
+                if not sc:
+                    continue
+                part = getattr(sc, "interim_input_transcription", None)
+                if part and part.text:
+                    with self.lock:
+                        self.interim = part.text
+                    if self._first:
+                        self._first = False
+                        TRACE.add(self.job, "첫 글자", part.text, ms=(time.perf_counter() - self.t0) * 1000)
+                fin = sc.input_transcription
+                if fin and fin.text:
+                    with self.lock:
+                        self.finals.append(fin.text.strip())
+                        self.interim = ""
+                    TRACE.add(self.job, "확정", fin.text.strip(), level="ok",
+                              ms=(time.perf_counter() - self.t0) * 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +1382,12 @@ class Vlm:
 class ConsoleUi:
     """예전 방식. --cli 일 때 쓴다."""
 
+    def set_conn(self, conn: dict) -> None:
+        pass
+
+    def speak(self, text: str, job: Optional[str] = None) -> None:
+        print(f"    (음성 답변) {text}")        # 터미널에는 소리 대신 글로
+
     def log(self, text: str = "") -> None:
         print(text)
 
@@ -558,18 +1399,12 @@ class ConsoleUi:
 
     def next_order(self) -> Optional[str]:
         try:
-            return input("> ")
+            text = input("> ")
+            ESTOP.clear()
+            return text
         except (EOFError, KeyboardInterrupt):
             print()
             return None
-
-    def ask(self, question: str) -> bool:
-        try:
-            ans = input(f"    >> {question} (Y/n) ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-        return ans in ("", "y", "yes", "예")
 
     def close(self) -> None:
         pass
@@ -594,16 +1429,36 @@ PAGE = """<!doctype html>
   pre { background: #0e1013; border: 1px solid #262a30; border-radius: 8px;
         padding: 10px; height: 420px; overflow: auto; white-space: pre-wrap;
         word-break: break-all; margin: 0; font-size: 12.5px; }
-  .ask { background: #3a2d18; border: 1px solid #7a5c22; border-radius: 8px;
-         padding: 12px; margin-bottom: 10px; }
-  .ask div { margin-bottom: 8px; }
   form { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
   input { flex: 1 1 320px; padding: 10px 12px; border-radius: 8px;
           border: 1px solid #333a44; background: #0e1013; color: #e6e6e6; font-size: 15px; }
   button { padding: 10px 16px; border-radius: 8px; border: 1px solid #2f6fb0;
            background: #1d4f80; color: #fff; font-size: 14px; cursor: pointer; }
   button.no { background: #3a2027; border-color: #7a3646; }
+  button.estop { background: #c62828; border-color: #ff5252; font-weight: 700; }
+  .quota { background: #4a1414; border: 1px solid #c62828; color: #ffd6d6; border-radius: 8px;
+           padding: 10px 12px; margin: 0 0 12px; font-size: 14px; }
+  .quota b { color: #ff8a80; }
+  .quota small { color: #e0a8a8; }
+  .usage { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; font-size: 13px;
+           color: #8b939c; margin: 0 0 12px; }
+  .usage .u { white-space: nowrap; }
+  .usage .u b { color: #e6e6e6; font-weight: 600; }
+  .usage .uo { flex-basis: 100%; font-size: 12px; }
+  .usage .ok { color: #7bd88f; } .usage .low { color: #ffb74d; } .usage .out { color: #ff8a80; }
+  button.estop:active { background: #8e0000; }
   .hint { color: #8b939c; font-size: 12.5px; margin-top: 8px; }
+  button.small { padding: 4px 12px; font-size: 13px; }
+  .conns { display: grid; grid-template-columns: auto 1fr auto auto; gap: 6px 12px; align-items: center;
+           background: #1a1d22; border: 1px solid #262a30; border-radius: 8px; padding: 8px 12px;
+           margin: 0 0 12px; font-size: 13px; }
+  .conns b { font-weight: 600; white-space: nowrap; }
+  .conns code { color: #9fb3c8; font-size: 12.5px; word-break: break-all; }
+  .conns .st { white-space: nowrap; border-radius: 999px; padding: 2px 10px; background: #1f3a26; color: #8fe39f; }
+  .conns .st.bad { background: #3a2027; color: #ff9aa8; }
+  .conns .st.off { background: #26292e; color: #8b939c; }
+  .conns .st.wait { background: #3a2d18; color: #ffc46b; }
+  .conns button:disabled { opacity: .4; cursor: default; }
   details { margin-top: 14px; background: #0e1013; border: 1px solid #262a30;
             border-radius: 8px; padding: 8px 12px; }
   summary { cursor: pointer; font-weight: bold; }
@@ -627,18 +1482,57 @@ PAGE = """<!doctype html>
   .sw input:checked + span::before { transform: translateX(16px); }
   .sw input:disabled + span { cursor: not-allowed; opacity: .6; }
   .grp button { padding: 2px 8px; font-size: 12px; margin-left: 6px; }
+  button.mic { background: #24303c; border-color: #3d5a73; }
+  button.mic.rec { background: #7a1f2b; border-color: #c0394d; animation: pulse 1s infinite; }
+  button.mic.wait { background: #3a2d18; border-color: #7a5c22; cursor: progress; }
+  @keyframes pulse { 50% { opacity: .65; } }
+  .voice { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+           color: #8b939c; font-size: 12.5px; margin-top: 6px; }
+  .voice input { flex: none; padding: 0; }
+  #voiceMsg.err { color: #ff8a8a; }
+  input.live { color: #9fc4e8; font-style: italic; }
+  .tracebar { display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+              color: #8b939c; font-size: 12.5px; margin: 8px 0; }
+  .tracebar input { flex: none; padding: 0; }
+  .tracebar a { color: #7ec8ff; }
+  .tracebar button { padding: 2px 8px; font-size: 12px; }
+  #traceActive div { color: #ffc46b; font-size: 12.5px; margin: 2px 0 6px; }
+  #traceActive div::before { content: "⏳ "; }
+  .tracewrap { max-height: 380px; overflow: auto; border-top: 1px solid #262a30; }
+  #traceTbl td { word-break: break-word; }
+  #traceTbl td.tt { white-space: nowrap; color: #8b939c; font-variant-numeric: tabular-nums; }
+  #traceTbl td.st { white-space: nowrap; }
+  #traceTbl td.dur { white-space: nowrap; color: #8b939c; text-align: right;
+                     font-variant-numeric: tabular-nums; }
+  #traceTbl th { position: sticky; top: 0; background: #0e1013; }
+  .jt { display: inline-block; min-width: 34px; padding: 0 6px; border-radius: 4px;
+        font-size: 11.5px; text-align: center; background: #2a2d33; color: #aab0b8; }
+  tr.k-V .jt { background: #3a2550; color: #d6b4ff; }
+  tr.k-O .jt { background: #1d3550; color: #7ec8ff; }
+  tr.k-B .jt { background: #173c38; color: #7ee0cf; }
+  tr.lv-ok td.st { color: #7ee08a; }
+  tr.lv-warn td.st, tr.lv-warn td.msg { color: #ffc46b; }
+  tr.lv-error td.st, tr.lv-error td.msg { color: #ff8a8a; }
+  tr.end td { border-bottom: 1px solid #3a4250; }
+  tr.has-det { cursor: pointer; }
+  tr.has-det:hover td { background: #161a20; }
+  .more { color: #7ec8ff; font-size: 11.5px; margin-left: 6px; white-space: nowrap; }
+  tr.det pre { height: auto; max-height: 320px; margin: 2px 0 6px; }
+  table.hideV tr.k-V, table.hideO tr.k-O, table.hideB tr.k-B, table.hideS tr.k-S { display: none; }
 </style>
 <div class="wrap">
   <h1>로봇 조종 <span id="state" class="chip">-</span>
-      <span id="status" class="chip busy" hidden></span></h1>
+      <span id="status" class="chip busy" hidden></span>
+      <button type="button" class="small estop" onclick="estop()"
+              title="대기 중인 지시를 모두 지우고, 이동 중이면 바로 멈추고, 진행 중인 지시를 끝낸다 (Esc)">■ 긴급 정지</button>
+      <button type="button" class="small" onclick="reconnect('all')"
+              title="모두 다시 접속하고 화면을 새로 받아 설명을 다시 듣는다">전체 재연결</button></h1>
+  <div id="quota" class="quota" hidden></div>
+  <div id="usage" class="usage" hidden></div>
+  <div id="conns" class="conns"></div>
   <div class="row">
     <img id="view" src="/view.jpg?v=0" alt="현재 화면">
     <div class="side">
-      <div id="ask" class="ask" hidden>
-        <div id="askText"></div>
-        <button onclick="answer('y')">예, 다시 해봐</button>
-        <button class="no" onclick="answer('n')">아니오</button>
-      </div>
       <pre id="log"></pre>
     </div>
   </div>
@@ -646,25 +1540,60 @@ PAGE = """<!doctype html>
     <input id="order" autocomplete="off" autofocus
            placeholder="무엇을 시킬까요?  예) 주황색 통을 상자에 넣어">
     <button>보내기</button>
+    <button type="button" id="mic" class="mic" onclick="toggleMic()"
+            title="눌러서 말하고, 다시 눌러 끝낸다">🎤 음성 명령</button>
     <button type="button" onclick="quick('r')">화면 다시 보기</button>
     <button type="button" class="no" onclick="quick('q')">종료</button>
   </form>
+  <div class="voice">
+    <label><input type="checkbox" id="autoSend" onchange="saveAutoSend()">
+      받아 적으면 바로 보내기</label>
+    <label><input type="checkbox" id="speakOn" checked onchange="saveSpeakOn()">
+      🔊 음성 답변 듣기</label>
+    <span id="speakMsg"></span>
+    <span id="voiceMsg"></span>
+  </div>
   <div class="hint">지시 하나가 끝나면 화면을 새로 받고 다음 지시를 기다린다.
-    pick/place 는 묻지 않고 바로 실행하고, 실패했을 때만 위에서 다시 할지 묻는다.</div>
+    pick/place 는 묻지 않고 바로 실행하고, 실패했을 때만 위에서 다시 할지 묻는다.
+    팔(robot_arm.py)·이동 로봇(map_web)·Gemini 연결이 끊겨도 이 화면은 유지된다 — 위 연결 패널의 '재연결'.
+    진행 중인 지시가 있으면 재연결은 그 지시가 끝난 뒤에 한다.</div>
+  <details id="traceBox" open>
+    <summary>처리 단계 로그 <span id="traceCount"></span></summary>
+    <div class="tracebar">
+      <span>보기:</span>
+      <label><input type="checkbox" checked onchange="traceFilter('V', this.checked)"> 음성</label>
+      <label><input type="checkbox" checked onchange="traceFilter('O', this.checked)"> 지시(AI)</label>
+      <label><input type="checkbox" checked onchange="traceFilter('B', this.checked)"> 화면 설명</label>
+      <label><input type="checkbox" checked onchange="traceFilter('S', this.checked)"> 시스템</label>
+      <label><input type="checkbox" id="traceFollow" checked> 새 줄 따라가기</label>
+      <a href="/trace.jsonl" download>로그 파일 받기 (llm_trace.jsonl)</a>
+      <button type="button" onclick="clearTrace()">화면에서 지우기</button>
+    </div>
+    <div id="traceActive"></div>
+    <div class="tracewrap" id="traceWrap">
+      <table id="traceTbl">
+        <thead><tr><th>시각</th><th>작업</th><th>단계</th><th>내용 (줄을 누르면 원문)</th>
+          <th>걸린 시간 / 경과</th></tr></thead>
+        <tbody id="traceBody"></tbody>
+      </table>
+    </div>
+  </details>
   <details id="skills" open>
     <summary>등록된 스킬 <span id="skillCount"></span></summary>
     <div id="skillBody" class="hint">불러오는 중...</div>
   </details>
 </div>
 <script>
-let since = 0, viewSeq = -1, asking = 0;
+let since = 0, viewSeq = -1, tsince = 0, ssince = -1;
 const $ = function (id) { return document.getElementById(id); };
 
 async function poll() {
   try {
-    const r = await fetch('/poll?since=' + since);
+    const r = await fetch('/poll?since=' + since + '&tsince=' + tsince + '&ssince=' + ssince);
     const d = await r.json();
     since = d.seq;
+    onTrace(d);
+    onSpeech(d);
     if (d.text) {
       const el = $('log');
       el.textContent += d.text;
@@ -675,35 +1604,172 @@ async function poll() {
       $('view').src = '/view.jpg?v=' + viewSeq;
     }
     $('state').textContent = d.state || '-';
+    renderConns(d.conn || []);
+    renderQuota(d.quota || [], d.now);
+    renderUsage(d.usage, d.now);
     $('status').textContent = d.status || '';
     $('status').hidden = !d.status;
-    if (d.ask) {
-      asking = d.ask.id;
-      $('askText').textContent = d.ask.text;
-      $('ask').hidden = false;
-    } else {
-      asking = 0;
-      $('ask').hidden = true;
-    }
   } catch (e) {
     $('state').textContent = '연결 끊김';
   }
   setTimeout(poll, 600);
 }
 
-async function send() {
+async function send(src) {
   const el = $('order');
   const v = el.value.trim();
   if (!v) return;
   el.value = '';
-  await fetch('/order?text=' + encodeURIComponent(v));
+  await fetch('/order?text=' + encodeURIComponent(v) + (src ? '&src=' + src : ''));
+}
+
+// --- 처리 단계 로그 --------------------------------------------------------
+// 서버가 /poll 로 새 줄을 준다. 작업(job)마다 마지막 줄을 기억해 '진행 중' 을 보여준다.
+const TRACE_ROWS = 1500;
+let traceJobs = {}, clockOff = 0, traceN = 0;
+
+function fmtSec(ms) { return ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's'; }
+
+function onTrace(d) {
+  if (d.now) clockOff = d.now - Date.now() / 1000;
+  if (d.treset) { $('traceBody').innerHTML = ''; traceJobs = {}; traceN = 0; }
+  tsince = d.tseq;
+  const wrap = $('traceWrap');
+  (d.trace || []).forEach(function (e) {
+    traceJobs[e.job] = e;
+    addTraceRow(e);
+  });
+  if (d.trace && d.trace.length && $('traceFollow').checked) wrap.scrollTop = wrap.scrollHeight;
+  const body = $('traceBody');
+  while (body.rows.length > TRACE_ROWS) body.deleteRow(0);
+  renderActive();
+}
+
+function addTraceRow(e) {
+  traceN++;
+  const tr = document.createElement('tr');
+  tr.className = 'k-' + e.job[0] + ' lv-' + e.level + (e.end ? ' end' : '') + (e.detail ? ' has-det' : '');
+  const dur = (e.ms != null ? fmtSec(e.ms) : '') + ' <span class="hint">+' + e.el.toFixed(1) + 's</span>';
+  tr.innerHTML = '<td class="tt">' + esc(e.t) + '</td><td><span class="jt" title="' + esc(e.kind) + '">'
+    + esc(e.job) + '</span></td><td class="st">' + esc(e.stage) + '</td><td class="msg">' + esc(e.msg)
+    + (e.detail ? '<span class="more">▸ 원문</span>' : '') + '</td><td class="dur">' + dur + '</td>';
+  if (e.detail) {
+    tr.onclick = function () {
+      const nx = tr.nextSibling;
+      if (nx && nx.classList.contains('det')) { nx.remove(); tr.querySelector('.more').textContent = '▸ 원문'; return; }
+      const det = document.createElement('tr');
+      det.className = 'det k-' + e.job[0];
+      det.innerHTML = '<td colspan="5"><pre></pre></td>';
+      det.querySelector('pre').textContent = e.detail;
+      tr.after(det);
+      tr.querySelector('.more').textContent = '▾ 접기';
+    };
+  }
+  $('traceBody').appendChild(tr);
+  $('traceCount').textContent = '(' + traceN + '줄)';
+}
+
+function renderActive() {
+  // 끝나지 않은 작업 = 진행 중. 10분 넘게 소식이 없으면 버려진 것으로 본다.
+  const now = Date.now() / 1000 + clockOff;
+  let html = '';
+  Object.keys(traceJobs).forEach(function (j) {
+    const e = traceJobs[j];
+    if (e.end || now - e.ts > 600) return;
+    html += '<div><span class="jt">' + esc(j) + '</span> ' + esc(e.kind) + ' · ' + esc(e.stage)
+          + ' 다음 단계 기다리는 중 ' + (now - e.ts).toFixed(1) + 's (작업 전체 '
+          + (now - e.ts + e.el).toFixed(1) + 's)</div>';
+  });
+  $('traceActive').innerHTML = html;
+}
+
+function traceFilter(k, on) { $('traceTbl').classList.toggle('hide' + k, !on); }
+
+function clearTrace() { $('traceBody').innerHTML = ''; traceN = 0; $('traceCount').textContent = ''; }
+
+// 브라우저 쪽 음성 단계를 서버 로그에 남긴다 (실패해도 녹음은 계속)
+function vtrace(job, stage, msg, level, end) {
+  if (!job) return;
+  fetch('/trace?job=' + job + '&stage=' + encodeURIComponent(stage) + '&msg=' + encodeURIComponent(msg || '')
+        + '&level=' + (level || 'info') + (end ? '&end=1' : '')).catch(function () {});
 }
 
 function quick(v) { fetch('/order?text=' + encodeURIComponent(v)); }
 
-function answer(v) {
-  fetch('/answer?id=' + asking + '&v=' + v);
-  $('ask').hidden = true;
+function reconnect(target) { fetch('/reconnect?target=' + target); }
+
+function estop() {
+  if (window.speechSynthesis) speechSynthesis.cancel();
+  fetch('/estop').catch(function () {});
+}
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') estop(); });
+
+// 연결 패널: 이름 | 주소 | 상태 | [재연결]. 매 poll 마다 통째로 다시 그린다(행 3개뿐).
+function renderQuota(list, now) {
+  const el = $('quota');
+  el.hidden = !list.length;
+  if (!list.length) return;
+  const hm = function (sec) { const h = Math.floor(sec / 3600), m = Math.ceil(sec % 3600 / 60);
+                              return (h ? h + '시간 ' : '') + m + '분'; };
+  el.innerHTML = list.map(function (q) {
+    const at = new Date(q.at * 1000).toLocaleTimeString();
+    const left = q.until ? ' · 약 ' + hm(Math.max(0, q.until - now)) + ' 뒤 다시 쓸 수 있음' : '';
+    return '<div>⚠ <b>모델 일일 할당량을 다 썼습니다</b> - ' + esc(q.model) + ': ' + esc(q.what)
+         + '<br><small>' + esc(q.message) + ' · ' + at + ' 발생' + left + '</small></div>';
+  }).join('');
+}
+
+// 모델 사용량: 오늘 이 프로그램이 부른 횟수와 하루 한도에서 남은 양 (태평양 시간 자정 초기화)
+function renderUsage(u, now) {
+  const el = $('usage');
+  el.hidden = !u || (!u.models.length && !(u.others || []).length);
+  if (el.hidden) return;
+  const left = Math.max(0, u.reset_at - now);
+  const reset = Math.floor(left / 3600) + '시간 ' + Math.ceil(left % 3600 / 60) + '분 뒤 초기화';
+  el.innerHTML = '<span title="Gemini API 는 남은 양을 알려주지 않는다 - 이 프로그램이 센 횟수를 하루 한도에서 뺀 값">'
+    + '모델 사용량 (오늘, <b>' + esc(u.key || '-') + '</b>)</span>'
+    + u.models.map(function (m) {
+        let cls = 'ok', txt;
+        if (m.limit) {
+          txt = '남은 ' + m.left + ' / ' + m.limit + '회';
+          if (m.left <= 0) cls = 'out'; else if (m.left <= Math.max(2, m.limit * 0.2)) cls = 'low';
+        } else {
+          txt = m.used + '회 사용 (한도 모름)';
+          if (m.exhausted) { cls = 'out'; txt += ' · 소진'; }
+        }
+        const tok = m.tokens ? ' · ' + m.tokens.toLocaleString() + ' 토큰' : '';
+        return '<span class="u"><b>' + esc(m.model) + '</b> <span class="' + cls + '">' + txt + '</span>'
+             + (m.limit ? ' <small>(' + m.used + '회 사용' + tok + ')</small>' : (tok ? ' <small>' + tok + '</small>' : ''))
+             + '</span>';
+      }).join('')
+    + '<span><small>' + reset + '</small></span>'
+    + (u.others && u.others.length ? '<div class="uo">다른 키: ' + u.others.map(function (k) {
+        return esc(k.key) + ' ' + k.models.map(function (m) {
+          return esc(m.model) + ' ' + m.used + (m.limit ? '/' + m.limit : '') + '회' + (m.exhausted ? ' 소진' : '');
+        }).join(', ');
+      }).join(' · ') + '</div>' : '');
+}
+
+function renderConns(list) {
+  const box = $('conns');
+  box.textContent = '';
+  list.forEach(function (c) {
+    const name = document.createElement('b'); name.textContent = c.name;
+    const addr = document.createElement('code'); addr.textContent = c.addr || '-';
+    const st = document.createElement('span');
+    st.className = 'st ' + c.cls; st.textContent = c.text; st.title = c.detail || '';
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'small'; btn.textContent = '재연결';
+    btn.disabled = !c.can; btn.title = c.can ? c.name + ' 에 다시 접속' : '이 연결은 꺼져 있다 (--no-base)';
+    btn.onclick = function () { reconnect(c.key); };
+    [name, addr, st, btn].forEach(function (el) { box.appendChild(el); });
+    if (c.detail && c.cls !== '') {          // 실패 이유는 한 줄 더
+      const why = document.createElement('div');
+      why.style.cssText = 'grid-column: 2 / -1; color: #8b939c; font-size: 12px; margin-top: -4px';
+      why.textContent = c.detail;
+      box.appendChild(why);
+    }
+  });
 }
 
 function esc(s) {
@@ -775,6 +1841,308 @@ async function loadSkills() {
   }
 }
 
+// --- 음성 명령 (실시간 받아쓰기) -------------------------------------------
+// 녹음을 시작하면 서버가 Gemini Live 세션을 연다(/voice_start). 마이크 소리를 16 kHz
+// 16bit PCM 으로 바꿔 0.2초마다 /voice_chunk 로 흘리고, 응답에 오는 중간 결과를 입력칸에
+// 바로 보여준다. 녹음이 끝나면 /voice_end 가 확정 문장을 돌려준다.
+const VOICE_RATE = 16000, VOICE_MAX_SEC = 30;
+// 말소리 감지 (조각마다 RMS): 말을 시작하지 않으면 VOICE_WAIT_SEC 뒤 녹음을 멈추고(버림),
+// 말을 시작한 뒤 VOICE_TAIL_SEC 동안 조용하면 거기서 끝낸다.
+const VOICE_WAIT_SEC = 5, VOICE_TAIL_SEC = 3;
+const VOICE_LEVEL = 0.015;      // 이 RMS(약 -36 dBFS) 이상이고 배경 잡음의 3배를 넘으면 말소리
+const VOICE_START_MS = 150;     // 이만큼 이어져야 말 시작으로 본다 (딸깍 소리 무시)
+const VOICE_SEND_MS = 200;      // 서버로 흘리는 간격
+const HTTPS_PORT = __HTTPS_PORT__;   // 서버가 채운다. 0 = https 없음
+let rec = null;
+
+function httpsUrl() {
+  return 'https://' + location.hostname + ':' + HTTPS_PORT + location.pathname;
+}
+
+// 다른 PC 에서 http 로 들어오면 마이크가 막힌다 - https 주소를 미리 알려 준다
+if (!window.isSecureContext) {
+  if (HTTPS_PORT) {
+    $('voiceMsg').innerHTML = '음성 명령은 <a href="' + httpsUrl() + '" style="color:#7ec8ff">'
+      + httpsUrl() + '</a> 에서 (처음 한 번 인증서 경고에서 계속)';
+  } else {
+    voiceMsg('이 주소(http)에선 마이크를 쓸 수 없다 - 서버의 https 포트가 꺼져 있다', true);
+  }
+}
+
+function voiceMsg(text, err) {
+  $('voiceMsg').textContent = text || '';
+  $('voiceMsg').className = err ? 'err' : '';
+}
+
+function micState(cls, label) {
+  $('mic').className = 'mic' + (cls ? ' ' + cls : '');
+  $('mic').textContent = label;
+}
+
+function showLive(text) {          // 말하는 동안의 중간 결과 (확정 전이라 흐리게)
+  const el = $('order');
+  el.value = text;
+  el.classList.add('live');
+}
+
+// 마이크 샘플레이트(보통 48 kHz) -> 16 kHz Int16. 조각 경계에서 남는 샘플은 다음으로 넘긴다.
+function resample(r, d) {
+  const x = new Float32Array(r.carry.length + d.length);
+  x.set(r.carry); x.set(d, r.carry.length);
+  const ratio = r.ctx.sampleRate / VOICE_RATE, n = Math.floor(x.length / ratio);
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = Math.floor(i * ratio), b = Math.min(x.length, Math.floor((i + 1) * ratio));
+    let s = 0;
+    for (let j = a; j < b; j++) s += x[j];
+    s = Math.max(-1, Math.min(1, b > a ? s / (b - a) : x[a]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  r.carry = x.slice(Math.floor(n * ratio));
+  return out;
+}
+
+// 모인 PCM 을 한 번에 하나씩(순서 보장) 서버로 보낸다
+function pumpVoice(r) {
+  if (r.busy || !r.out.length) return;
+  let n = 0;
+  r.out.forEach(function (a) { n += a.length; });
+  const buf = new Int16Array(n);
+  let off = 0;
+  r.out.forEach(function (a) { buf.set(a, off); off += a.length; });
+  r.out = [];
+  r.sent += n;
+  r.busy = fetch('/voice_chunk?job=' + r.job, {method: 'POST',
+      headers: {'Content-Type': 'application/octet-stream'}, body: buf.buffer})
+    .then(function (res) { return res.json(); })
+    .then(function (d) {
+      if (d.text && !r.stopped) showLive(d.text);
+      if (d.error && !r.warned) { r.warned = true; r.err = d.error; }
+    })
+    .catch(function () {})
+    .finally(function () { r.busy = null; });
+}
+
+async function flushVoice(r) {
+  while (r.busy) await r.busy;
+  pumpVoice(r);
+  while (r.busy) await r.busy;
+}
+
+async function toggleMic() {
+  if ($('mic').classList.contains('wait')) return;
+  if (rec) { stopMic('manual'); return; }
+  if (!window.isSecureContext && HTTPS_PORT) {
+    location.href = httpsUrl();          // 같은 화면의 https 쪽으로 옮긴다
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    voiceMsg('이 주소에선 마이크를 쓸 수 없다 - 브라우저는 https 또는 localhost(127.0.0.1) 에서만 마이크를 허용한다', true);
+    return;
+  }
+  if (speaking) {                          // 답변을 읽는 중이면 끊고 듣는다
+    if (speaking.pause) speaking.pause();
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    speaking = null;
+    speakMsg('');
+  }
+  micState('wait', '준비 중...');
+  let stream, job = null;
+  try {
+    job = (await (await fetch('/trace_new')).json()).job;
+    const st = await (await fetch('/voice_start?job=' + job)).json();
+    if (!st.ok) throw new Error(st.error || '받아쓰기를 시작하지 못했다');
+  } catch (e) {
+    micState('', '🎤 음성 명령');
+    voiceMsg('서버 받아쓰기를 시작하지 못했다: ' + e.message, true);
+    return;
+  }
+  vtrace(job, '마이크 열기', '권한 요청');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(
+      {audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true}});
+  } catch (e) {
+    micState('', '🎤 음성 명령');
+    voiceMsg('마이크를 열지 못했다: ' + e.message, true);
+    vtrace(job, '마이크 오류', e.name + ': ' + e.message, 'error', true);
+    fetch('/voice_cancel?job=' + job);
+    return;
+  }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const r = {stream: stream, ctx: ctx, src: src, proc: proc, t0: Date.now(), job: job,
+             noise: VOICE_LEVEL / 3, run: 0, first: -1, lastAt: 0, n: 0,
+             carry: new Float32Array(0), out: [], busy: null, sent: 0, stopped: false};
+  proc.onaudioprocess = function (e) {
+    const d = new Float32Array(e.inputBuffer.getChannelData(0));
+    r.out.push(resample(r, d));
+    r.n++;
+    let s = 0;
+    for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+    const rms = Math.sqrt(s / d.length), ms = d.length / ctx.sampleRate * 1000;
+    if (rms > Math.max(VOICE_LEVEL, r.noise * 3)) {
+      r.run += ms;
+      if (r.first < 0 && r.run >= VOICE_START_MS) {
+        r.first = r.n;
+        vtrace(r.job, '말 감지', ((Date.now() - r.t0) / 1000).toFixed(1) + 's 에서 말 시작 (RMS '
+               + rms.toFixed(3) + ', 배경 ' + r.noise.toFixed(3) + ')');
+      }
+      if (r.first >= 0) r.lastAt = Date.now();
+    } else {
+      r.run = 0;
+      r.noise = r.noise * 0.95 + rms * 0.05;     // 조용한 조각으로만 배경 잡음을 따라간다
+    }
+  };
+  src.connect(proc);
+  proc.connect(ctx.destination);
+  r.pump = setInterval(function () { pumpVoice(r); }, VOICE_SEND_MS);
+  r.timer = setInterval(function () {
+    const now = Date.now(), sec = (now - r.t0) / 1000;
+    if (r.first < 0) {
+      const left = Math.ceil(VOICE_WAIT_SEC - sec);
+      micState('rec', '● 듣는 중 - 눌러서 취소');
+      voiceMsg('말하세요... (' + Math.max(0, left) + '초 안에 말이 없으면 멈춘다)');
+      if (sec >= VOICE_WAIT_SEC) stopMic('silent');
+    } else {
+      const quiet = (now - r.lastAt) / 1000;
+      micState('rec', '● 받아 적는 중 ' + Math.floor(sec) + 's - 눌러서 끝내기');
+      voiceMsg(quiet >= 1 ? '조용하면 ' + Math.max(0, Math.ceil(VOICE_TAIL_SEC - quiet)) + '초 뒤 끝낸다'
+                          : (r.err ? '실시간 받아쓰기 안 됨 - 끝나면 한 번에 받아 적는다' : '듣고 있다...'));
+      if (quiet >= VOICE_TAIL_SEC) stopMic('tail');
+    }
+    if (rec && sec >= VOICE_MAX_SEC) stopMic('max');
+  }, 200);
+  rec = r;
+  micState('rec', '● 듣는 중 - 눌러서 취소');
+  voiceMsg('말하세요...');
+  vtrace(job, '녹음 시작', ctx.sampleRate + ' Hz -> 16 kHz 로 ' + VOICE_SEND_MS + 'ms 마다 서버로, '
+         + VOICE_WAIT_SEC + '초 안에 말이 없으면 멈춘다');
+}
+
+async function stopMic(why) {
+  const r = rec;
+  rec = null;
+  r.stopped = true;
+  clearInterval(r.timer);
+  clearInterval(r.pump);
+  r.proc.disconnect(); r.src.disconnect();
+  r.stream.getTracks().forEach(function (t) { t.stop(); });
+  r.ctx.close();
+  const total = ((Date.now() - r.t0) / 1000).toFixed(1);
+  if (r.first < 0) {                     // 말소리가 한 번도 없었다 - 세션을 버린다
+    const silent = why === 'silent';
+    micState('', '🎤 음성 명령');
+    $('order').classList.remove('live');
+    voiceMsg(silent ? VOICE_WAIT_SEC + '초 동안 말이 없어 녹음을 멈췄다' : '말소리가 없어 취소했다', silent);
+    vtrace(r.job, '녹음 끝', (silent ? VOICE_WAIT_SEC + '초 동안 말 없음' : '사용자가 취소')
+           + ' - 버림 (' + total + 's)', 'warn', true);
+    fetch('/voice_cancel?job=' + r.job);
+    playNext();                            // 녹음 중 밀린 답변
+    return;
+  }
+  const reason = {tail: VOICE_TAIL_SEC + '초 조용해서', max: VOICE_MAX_SEC + '초 상한', manual: '사용자가 끝냄'}[why] || why;
+  micState('wait', '마무리 중...');
+  await flushVoice(r);
+  vtrace(r.job, '녹음 끝', reason + ' - 전체 ' + total + 's, 보낸 오디오 ' + (r.sent / VOICE_RATE).toFixed(1) + 's');
+  finishVoice(r.job);
+}
+
+async function finishVoice(job) {
+  voiceMsg('확정 결과를 받는 중...');
+  try {
+    const d = await (await fetch('/voice_end?job=' + job)).json();
+    if (!d.ok) { voiceMsg(d.error || '받아쓰기 실패', true); return; }      // 서버가 이미 끝을 남겼다
+    if (!d.text) {
+      $('order').value = '';
+      voiceMsg('말소리를 알아듣지 못했다 - 다시 해보세요', true);
+      return;
+    }
+    $('order').value = d.text;
+    if ($('autoSend').checked) {
+      voiceMsg('보냄: ' + d.text);
+      vtrace(job, '지시로 보냄', d.text, 'ok', true);
+      send(job);
+    } else {
+      voiceMsg('받아 적었다 - 확인하고 [보내기] 를 누르세요');
+      vtrace(job, '입력칸에 넣음', '사용자가 확인하고 [보내기] 를 누를 차례', 'ok', true);
+      $('order').focus();
+    }
+  } catch (e) {
+    voiceMsg('확정 결과를 받지 못했다: ' + e.message, true);
+    vtrace(job, '결과 못 받음', e.message, 'error', true);
+  } finally {
+    $('order').classList.remove('live');
+    micState('', '🎤 음성 명령');
+    playNext();                            // 녹음 중 밀린 답변
+  }
+}
+
+// --- 음성 답변 ------------------------------------------------------------
+// 서버가 /poll 로 새 답변(번호, 글)을 알려 주면 차례로 /tts?id= 의 WAV 를 재생한다.
+// 서버 음성이 없으면(실패/--tts-model none) 브라우저 내장 음성(ko-KR)으로 읽는다.
+let speakQ = [], speaking = null;
+
+function onSpeech(d) {
+  if (ssince >= 0 && d.speech && $('speakOn').checked) {
+    d.speech.forEach(function (it) { speakQ.push(it); });
+    playNext();
+  }
+  if (d.sseq < ssince) speakQ = [];          // 서버가 다시 시작했다
+  ssince = d.sseq;
+}
+
+function speakMsg(t) { $('speakMsg').textContent = t ? '🔊 ' + t : ''; }
+
+function playNext() {
+  if (speaking || !speakQ.length || rec) return;   // 녹음 중엔 기다린다 (마이크에 섞이지 않게)
+  const it = speakQ.shift();
+  const done = function () { speaking = null; speakMsg(''); playNext(); };
+  speakMsg(it.text);
+  const a = new Audio('/tts?id=' + it.id);
+  speaking = a;
+  a.onended = done;
+  a.onerror = function () { speaking = null; sayBuiltin(it.text, done); };
+  a.play().catch(function (e) {
+    if (e.name === 'NotAllowedError') {
+      speakMsg('브라우저가 자동 재생을 막았다 - 페이지를 한 번 누르면 들린다');
+      speaking = null;
+      document.addEventListener('click', playNext, {once: true});
+      speakQ.unshift(it);
+    }
+  });
+}
+
+function sayBuiltin(text, done) {
+  if (!window.speechSynthesis) { done(); return; }
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'ko-KR';
+  u.onend = u.onerror = done;
+  speaking = u;
+  speechSynthesis.speak(u);
+}
+
+function stopSpeaking() {
+  speakQ = [];
+  if (speaking && speaking.pause) speaking.pause();
+  if (window.speechSynthesis) speechSynthesis.cancel();
+  speaking = null;
+  speakMsg('');
+}
+
+function saveSpeakOn() {
+  if (!$('speakOn').checked) stopSpeaking();
+  try { localStorage.setItem('llm_speakOn', $('speakOn').checked ? '1' : '0'); } catch (e) {}
+}
+
+try { $('speakOn').checked = localStorage.getItem('llm_speakOn') !== '0'; } catch (e) {}
+
+function saveAutoSend() {
+  try { localStorage.setItem('llm_autoSend', $('autoSend').checked ? '1' : '0'); } catch (e) {}
+}
+
+try { $('autoSend').checked = localStorage.getItem('llm_autoSend') === '1'; } catch (e) {}
+
 poll();
 loadSkills();
 </script>
@@ -814,7 +2182,8 @@ def _make_handler(ui: "WebUi"):
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
             if u.path in ("/", "/index.html"):
-                self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
+                page = PAGE.replace("__HTTPS_PORT__", str(ui.https_port))
+                self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
             elif u.path == "/view.jpg":
                 data = ui.view_bytes
                 if data:
@@ -822,7 +2191,47 @@ def _make_handler(ui: "WebUi"):
                 else:
                     self._send(404, "text/plain; charset=utf-8", b"no view yet")
             elif u.path == "/poll":
-                self._json(ui.snapshot(self._int(q, "since")))
+                try:
+                    ssince = int(q.get("ssince", ["-1"])[0])
+                except ValueError:
+                    ssince = -1
+                self._json(ui.snapshot(self._int(q, "since"), self._int(q, "tsince"), ssince))
+            elif u.path == "/tts":                 # 음성 답변 WAV (만드는 중이면 기다렸다가)
+                data = ui.speech_wav(self._int(q, "id"))
+                if data:
+                    self._send(200, "audio/wav", data)
+                else:                              # 브라우저가 내장 음성으로 대신 읽는다
+                    self._send(503, "text/plain; charset=utf-8", "음성 없음".encode("utf-8"))
+            elif u.path == "/voice_start":
+                self._json(ui.voice_start(q.get("job", [""])[0]))
+            elif u.path == "/voice_end":
+                self._json(ui.voice_end(q.get("job", [""])[0]))
+            elif u.path == "/voice_cancel":
+                self._json(ui.voice_cancel(q.get("job", [""])[0]))
+            elif u.path == "/trace_new":           # 브라우저가 음성 녹음을 시작할 때 id 를 받는다
+                self._json({"job": TRACE.new_job("V")})
+            elif u.path == "/trace":               # 브라우저 쪽 음성 단계 (녹음 시작/말 감지/업로드 ...)
+                job = q.get("job", [""])[0]
+                if not valid_job(job, "V"):
+                    self._json({"ok": False})
+                    return
+                level = q.get("level", ["info"])[0]
+                TRACE.add(job, "[웹] " + q.get("stage", ["?"])[0][:40], q.get("msg", [""])[0][:300],
+                          level=level if level in ("info", "ok", "warn", "error") else "info",
+                          end=q.get("end", ["0"])[0] == "1")
+                self._json({"ok": True})
+            elif u.path == "/trace.jsonl":         # 처리 단계 로그 파일 내려받기
+                try:
+                    with open(TRACE.path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    data = b""
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="llm_trace.jsonl"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             elif u.path == "/skills":
                 ready = ui.skills_fn is not None
                 self._json({"ready": ready, "groups": ui.skills_fn() if ready else []})
@@ -837,16 +2246,123 @@ def _make_handler(ui: "WebUi"):
             elif u.path == "/order":
                 text = (q.get("text", [""])[0] or "").strip()
                 if text:
-                    ui.put_order(text)
+                    src = q.get("src", [""])[0]
+                    ui.put_order(text, src if valid_job(src, "V") else "")
                 self._json({"ok": bool(text)})
-            elif u.path == "/answer":
-                ok = ui.answer(self._int(q, "id"), q.get("v", ["n"])[0] == "y")
-                self._json({"ok": ok})
+            elif u.path == "/estop":
+                self._json(ui.estop())
+            elif u.path == "/reconnect":
+                target = q.get("target", ["all"])[0]
+                if target not in ("all", "arm", "base", "gemini"):
+                    target = "all"
+                ui.mark_waiting(target)
+                ui.put_order(f"{RECONNECT}:{target}")
+                self._json({"ok": True, "target": target})
             else:
                 self._send(404, "text/plain; charset=utf-8",
                            "없는 주소".encode("utf-8"))
 
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            if u.path == "/voice_chunk":
+                try:
+                    n = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    n = -1
+                if not 0 <= n <= MAX_VOICE_BYTES:
+                    self.close_connection = True
+                    self._json({"ok": False, "error": f"조각 크기가 이상하다 ({n})"})
+                    return
+                self._json(ui.voice_chunk(q.get("job", [""])[0], self.rfile.read(n)))
+                return
+            if u.path != "/voice":
+                self._send(404, "text/plain; charset=utf-8", "없는 주소".encode("utf-8"))
+                return
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                n = 0
+            job = q.get("job", [""])[0]
+            if n <= 44 or n > MAX_VOICE_BYTES:
+                if 0 < n <= MAX_VOICE_BYTES * 4:
+                    self.rfile.read(n)            # 연결을 깔끔히 끝내려고 버린다
+                self.close_connection = True
+                if valid_job(job, "V"):
+                    TRACE.add(job, "서버 수신", f"크기가 이상해 거부 ({n} 바이트)", level="error", end=True)
+                self._json({"ok": False, "error": f"음성 크기가 이상하다 ({n} 바이트)"})
+                return
+            self._json(ui.voice(self.rfile.read(n), job))
+
     return Handler
+
+
+class _QuietHTTPServer(ThreadingHTTPServer):
+    """자체 서명 인증서를 거부한 브라우저가 끊는 연결마다 스택트레이스를 찍지 않는다."""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def local_ips() -> List[str]:
+    """이 기계의 바깥 IPv4 (접속 주소 안내와 인증서 SAN 에 쓴다)."""
+    ips: List[str] = []
+    try:                                       # 기본 경로의 IP (패킷은 실제로 안 나간다)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ips.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:                                       # 리눅스: 모든 인터페이스
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2).stdout
+        ips += [ip for ip in out.split() if "." in ip]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return [ip for i, ip in enumerate(ips) if ip not in ips[:i] and not ip.startswith("127.")]
+
+
+def ensure_tls_cert(ips: List[str]) -> tuple[str, str]:
+    """https 용 자체 서명 인증서. 없거나 지금 IP 가 빠져 있으면 새로 만든다 (10년)."""
+    import datetime
+    import ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    want = {"127.0.0.1", *ips}
+    try:
+        with open(TLS_CERT, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        have = {str(a) for a in cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value.get_values_for_type(x509.IPAddress)}
+        if want <= have and os.path.exists(TLS_KEY):
+            return TLS_CERT, TLS_KEY
+    except (OSError, ValueError, x509.ExtensionNotFound):
+        pass
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"llm_client {socket.gethostname()}")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    san = [x509.DNSName("localhost"), x509.DNSName(socket.gethostname())]
+    san += [x509.IPAddress(ipaddress.ip_address(ip)) for ip in sorted(want)]
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName(san), critical=False)
+            .sign(key, hashes.SHA256()))
+    fd = os.open(TLS_KEY, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()))
+    with open(TLS_CERT, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    print(f"[web] https 인증서를 새로 만들었다: {TLS_CERT} ({', '.join(sorted(want))})")
+    return TLS_CERT, TLS_KEY
 
 
 class WebUi:
@@ -856,30 +2372,67 @@ class WebUi:
     스레드에서 받는다. 둘 사이는 큐 하나와 Event 하나로만 만난다.
     """
 
-    def __init__(self, port: int = WEB_PORT, host: str = "127.0.0.1",
-                 state_fn=None, open_browser: bool = True):
+    def __init__(self, port: int = WEB_PORT, host: str = "0.0.0.0",
+                 state_fn=None, open_browser: bool = True, https_port: int = 0):
         self.lock = threading.Lock()
         self.lines: List[str] = []
         self.orders: "queue.Queue[str]" = queue.Queue()
         self.view_bytes: bytes = b""
         self.view_seq = 0
         self.status_text = ""
-        self.pending: Optional[dict] = None
-        self._ask_id = 0
-        self._answer = False
-        self._answered = threading.Event()
         self.state_fn = state_fn
         self._state: dict = {}
         self._state_at = 0.0
+        self.conn: list = []                 # 연결 패널 행 (set_conn)
         # Agent 가 만들어지면 채운다 (skill_groups / set_skills). 그 전엔 None
         self.skills_fn = None
         self.toggle_fn = None
+        self.estop_fn = None                 # 긴급 정지 때 몸체를 세우는 함수 (Agent 가 채운다)
+        self.usage_fn = None                 # Vlm.usage.summary - 모델별 오늘 사용량/남은 양
+        self.quota_fn = None                 # Vlm.quota_list - 일일 할당량을 다 쓴 모델 (경고 띠)
+        self.transcribe_fn = None            # Vlm.transcribe - (WAV bytes, job) -> 글
+        self.live_fn = None                  # Vlm.live - job -> LiveStt (실시간 받아쓰기)
+        self.live: dict = {}                 # job -> 진행 중인 LiveStt
+        self.tts_fn = None                   # Vlm.tts - (글, job) -> WAV. None 이면 브라우저 내장 음성
+        self.speech: List[dict] = []         # 음성 답변 {id, text, job} (브라우저가 차례로 재생)
+        self.speech_audio: dict = {}         # id -> WAV bytes / None(실패)
+        self._speech_seq = 0
+        self._speech_q: "queue.Queue" = queue.Queue()
+        self._speech_ready = threading.Condition(self.lock)
+        threading.Thread(target=self._speech_worker, daemon=True, name="tts").start()
+        self.last_job: Optional[str] = None  # next_order 가 꺼낸 지시의 처리 단계 로그 id
 
-        self.srv = ThreadingHTTPServer((host, port), _make_handler(self))
-        self.srv.daemon_threads = True
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-        self.url = f"http://{host}:{port}/"
+        handler = _make_handler(self)
+        self.servers = [_QuietHTTPServer((host, port), handler)]
+
+        # 브라우저는 https 나 localhost 에서만 마이크를 열어 준다. 다른 PC 에서 음성 명령을
+        # 쓰려면 https 가 필요해서, 자체 서명 인증서로 https 포트를 하나 더 연다.
+        self.https_port = 0
+        lan = local_ips() if host in ("0.0.0.0", "") else []
+        if https_port:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(*ensure_tls_cert(lan or ([host] if host[:1].isdigit() else [])))
+                tls = _QuietHTTPServer((host, https_port), handler)
+                # 핸드셰이크는 accept 스레드가 아니라 요청 스레드에서 (느린 클라이언트가 막지 않게)
+                tls.socket = ctx.wrap_socket(tls.socket, server_side=True,
+                                             do_handshake_on_connect=False)
+                self.servers.append(tls)
+                self.https_port = https_port
+            except (OSError, ssl.SSLError, ImportError, ValueError) as e:
+                print(f"[web] https 포트 {https_port} 를 열지 못했다 ({type(e).__name__}: {e})"
+                      " - 다른 PC 에서는 음성 명령을 쓸 수 없다")
+        for srv in self.servers:
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        local = "127.0.0.1" if host in ("0.0.0.0", "") else host
+        self.url = f"http://{local}:{port}/"
         print(f"[web] 지시는 여기서 넣으세요: {self.url}")
+        for ip in lan:
+            print(f"[web]   다른 PC 에서: http://{ip}:{port}/"
+                  + (f"   (음성 명령: https://{ip}:{self.https_port}/)" if self.https_port else ""))
+        if self.https_port and lan:
+            print("[web]   https 는 자체 서명 인증서라 처음 한 번 브라우저 경고에서 '계속' 을 눌러야 한다")
         if open_browser:
             try:
                 webbrowser.open(self.url)
@@ -904,7 +2457,8 @@ class WebUi:
         with self.lock:
             self.status_text = text
 
-    def snapshot(self, since: int) -> dict:
+    def snapshot(self, since: int, tsince: int = 0, ssince: int = -1) -> dict:
+        trace, reset = TRACE.since(tsince)
         with self.lock:
             since = max(0, min(since, len(self.lines)))
             out = {
@@ -912,9 +2466,27 @@ class WebUi:
                 "text": "".join(line + "\n" for line in self.lines[since:]),
                 "view": self.view_seq,
                 "status": self.status_text,
-                "ask": dict(self.pending) if self.pending else None,
+                "trace": trace,
+                "treset": reset,
+                "tseq": trace[-1]["seq"] if trace else (0 if reset else tsince),
+                "now": time.time(),          # 브라우저 시계와 차이를 맞춘다 (진행 경과 시간)
+                # 음성 답변: 처음(ssince<0)엔 번호만 알려 준다 - 새로 연 탭이 지난 답변을 읽지 않게
+                "speech": [] if ssince < 0 else
+                          [{"id": it["id"], "text": it["text"]} for it in self.speech if it["id"] > ssince],
+                "sseq": self._speech_seq,
+                "conn": [dict(r) for r in self.conn],
             }
         out["state"] = self._robot_state()
+        out["quota"] = self.quota_fn() if self.quota_fn else []
+        out["usage"] = self.usage_fn() if self.usage_fn else None
+        # 팔 REST 행은 0.5초마다 하는 상태 조회 결과로 바로 갱신한다
+        for r in out["conn"]:
+            if r["key"] == "arm" and r["cls"] != "wait" and self._state:
+                if self._state.get("ok", True):
+                    r.update(ok=True, text="● 연결됨", cls="", detail=self._state.get("label", ""))
+                else:
+                    r.update(ok=False, text="✕ 실패", cls="bad",
+                             detail=self._state.get("error", "응답 없음"))
         return out
 
     def _robot_state(self) -> str:
@@ -926,45 +2498,194 @@ class WebUi:
             except Exception:
                 self._state = {"label": "?"}
             self._state_at = now
+        if not self._state.get("ok", True):
+            return "팔 연결 안 됨"
         return self._state.get("label", "-")
 
+    CONN_NAMES = (("arm", "팔 REST"), ("base", "이동 로봇 map_web"), ("gemini", "Gemini"))
+
+    def set_conn(self, conn: dict) -> None:
+        """conn = {key: (ok True|False|None, detail, address)}  key = arm | base | gemini"""
+        rows = []
+        for key, name in self.CONN_NAMES:
+            ok, detail, addr = conn.get(key, (None, "", ""))
+            off = ok is None and key == "base"
+            rows.append({"key": key, "name": name, "addr": addr, "detail": detail or "",
+                         "ok": ok, "can": not (off and detail == "--no-base"),
+                         "text": "● 연결됨" if ok else ("꺼짐" if off else ("? 미확인" if ok is None else "✕ 실패")),
+                         "cls": "" if ok else ("off" if ok is None else "bad")})
+        with self.lock:
+            self.conn = rows
+
+    def mark_waiting(self, target: str) -> None:
+        """재연결을 누른 행을 바로 '재연결 중' 으로 보여준다 (실제 확인은 메인 루프가 한다)."""
+        with self.lock:
+            for r in self.conn:
+                if (target == "all" or r["key"] == target) and r["can"]:
+                    r.update(text="… 재연결 중", cls="wait")
+
     # --- 사람에게서 받는 쪽 --------------------------------------------------
-    def put_order(self, text: str) -> None:
-        self.orders.put(text)
+    def voice(self, wav: bytes, job: str = "") -> dict:
+        """웹에서 녹음한 음성 명령을 받아 적는다. 보내기는 브라우저가 한다.
+        job: 브라우저가 녹음을 시작할 때 받은 처리 단계 로그 id."""
+        job = job if valid_job(job, "V") else TRACE.new_job("V")
+        try:
+            with wave.open(io.BytesIO(wav)) as w:
+                info = f"{w.getnframes() / w.getframerate():.1f}초, {w.getframerate()} Hz"
+        except (wave.Error, EOFError, ZeroDivisionError):
+            info = "WAV 형식 아님"
+        TRACE.add(job, "서버 수신", f"{len(wav) / 1024:.0f} KB ({info})")
+        if self.transcribe_fn is None:
+            TRACE.add(job, "실패", "아직 준비 중 (모델 연결 전)", level="error", end=True)
+            return {"ok": False, "error": "아직 준비 중이다 - 잠시 뒤에 다시"}
+        t0 = time.perf_counter()
+        try:
+            text = self.transcribe_fn(wav, job)
+        except Exception as e:
+            self.log(f"[음성] 받아쓰기 실패: {type(e).__name__}: {e}")
+            TRACE.add(job, "실패", f"{type(e).__name__}: {e}", level="error", end=True,
+                      ms=(time.perf_counter() - t0) * 1000)
+            return {"ok": False, "error": f"받아쓰기 실패: {type(e).__name__}: {e}"}
+        self.log(f"[음성] {text or '(알아듣지 못함)'}")
+        if not text:                         # 브라우저는 더 할 일이 없다 - 여기서 끝
+            TRACE.add(job, "끝", "알아듣지 못함", level="warn", end=True,
+                      ms=(time.perf_counter() - t0) * 1000)
+        return {"ok": True, "text": text, "job": job}
+
+    # --- 음성 답변 ------------------------------------------------------------
+    def speak(self, text: str, job: Optional[str] = None) -> None:
+        """한 문장을 소리로 들려준다. 음성은 뒤에서 만들고, 브라우저가 /poll 로 알고 /tts 로 받는다."""
+        text = (text or "").strip()
+        if not text:
+            return
+        with self.lock:
+            self._speech_seq += 1
+            item = {"id": self._speech_seq, "text": text, "job": job}
+            self.speech.append(item)
+            del self.speech[:-TTS_KEEP]
+        TRACE.add(job, "음성 답변", text)
+        self.log(f"      🔊 {text}")
+        self._speech_q.put(item)
+
+    def _speech_worker(self) -> None:
+        """음성을 차례로 만든다 (한 번에 하나 - 순서가 지켜지고 API 를 몰아치지 않는다)."""
+        while True:
+            item = self._speech_q.get()
+            data = None
+            if self.tts_fn is not None:
+                try:
+                    data = self.tts_fn(item["text"], item["job"])
+                except Exception:
+                    data = None                # 브라우저가 내장 음성으로 읽는다
+            with self.lock:
+                self.speech_audio[item["id"]] = data
+                for old in [k for k in self.speech_audio if k <= item["id"] - TTS_KEEP]:
+                    del self.speech_audio[old]
+                self._speech_ready.notify_all()
+
+    def speech_wav(self, sid: int, wait: float = 20.0) -> Optional[bytes]:
+        """그 음성 답변의 WAV. 아직 만드는 중이면 wait 초까지 기다린다. 실패/없음이면 None."""
+        with self.lock:
+            if not any(it["id"] == sid for it in self.speech):
+                return None
+            self._speech_ready.wait_for(lambda: sid in self.speech_audio, timeout=wait)
+            return self.speech_audio.get(sid)
+
+    # --- 실시간 음성 (녹음 시작 -> 조각들 -> 끝/취소) ------------------------------
+    def voice_start(self, job: str) -> dict:
+        if not valid_job(job, "V"):
+            return {"ok": False, "error": "잘못된 음성 id"}
+        if self.live_fn is None:
+            TRACE.add(job, "실패", "아직 준비 중 (모델 연결 전)", level="error", end=True)
+            return {"ok": False, "error": "아직 준비 중이다 - 잠시 뒤에 다시"}
+        with self.lock:
+            for j in [j for j, ls in self.live.items() if ls.closed.is_set() or j == job]:
+                self.live.pop(j).cancel()         # 끝난 세션 / 같은 id 재시작 정리
+            while len(self.live) >= 3:            # 탭 여러 개가 동시에 녹음하는 경우의 상한
+                self.live.pop(next(iter(self.live))).cancel()
+            self.live[job] = self.live_fn(job)
+        return {"ok": True}
+
+    def voice_chunk(self, job: str, pcm: bytes) -> dict:
+        with self.lock:
+            ls = self.live.get(job)
+        if ls is None:
+            return {"ok": False, "error": "받아쓰기 세션이 없다 (서버 재시작?)"}
+        ls.feed(pcm)
+        return {"ok": True, "text": ls.text, "live": ls.connected.is_set(), "error": ls.error}
+
+    def voice_end(self, job: str) -> dict:
+        with self.lock:
+            ls = self.live.pop(job, None)
+        if ls is None:
+            return {"ok": False, "error": "받아쓰기 세션이 없다 (서버 재시작?)"}
+        t0 = time.perf_counter()
+        try:
+            text = ls.finish()
+        except Exception as e:
+            self.log(f"[음성] 받아쓰기 실패: {type(e).__name__}: {e}")
+            TRACE.add(job, "실패", f"{type(e).__name__}: {e}", level="error", end=True,
+                      ms=(time.perf_counter() - t0) * 1000)
+            return {"ok": False, "error": f"받아쓰기 실패: {type(e).__name__}: {e}"}
+        self.log(f"[음성] {text or '(알아듣지 못함)'}")
+        if not text:
+            TRACE.add(job, "끝", "알아듣지 못함", level="warn", end=True)
+        return {"ok": True, "text": text, "job": job}
+
+    def voice_cancel(self, job: str) -> dict:
+        with self.lock:
+            ls = self.live.pop(job, None)
+        if ls:
+            ls.cancel()
+        return {"ok": True}
+
+    def estop(self) -> dict:
+        """긴급 정지: 대기 중인 지시를 모두 지우고, 몸체 이동을 세우고, 진행 중인 지시를 끝낸다."""
+        ESTOP.set()
+        dropped, keep = [], []
+        while True:
+            try:
+                item = self.orders.get_nowait()
+            except queue.Empty:
+                break
+            (keep if item[0].startswith(RECONNECT) else dropped).append(item)
+        for item in keep:                    # 재연결 요청은 지시가 아니라 남긴다
+            self.orders.put(item)
+        for text, job in dropped:
+            TRACE.add(job, "긴급 정지로 취소", text, level="warn", end=True)
+        err = ""
+        if self.estop_fn is not None:
+            try:
+                self.estop_fn()
+            except Exception as e:           # 몸체에 못 보내도 지시는 멈춘다
+                err = f"{type(e).__name__}: {e}"
+        self.log(f"[긴급 정지] 대기 지시 {len(dropped)}개 삭제, 이동 정지"
+                 + (f" (몸체 정지 실패: {err})" if err else ""))
+        return {"ok": True, "dropped": len(dropped), "error": err or None}
+
+    def put_order(self, text: str, src: str = "") -> None:
+        """src: 음성 입력에서 바로 보낸 지시면 그 처리 단계 로그 id (V3 ...)."""
+        job = None
+        if text.strip().lower() not in ("r", "c", "q", "quit", "exit", "종료") and not text.startswith(RECONNECT):
+            ESTOP.clear()                    # 긴급 정지 뒤에 새로 넣은 지시는 실행한다
+            job = TRACE.new_job("O")
+            TRACE.add(job, "지시 접수", text + (f"  (음성 {src} 에서)" if src else "")
+                      + (f" - 앞에 {self.orders.qsize()}개 대기" if self.orders.qsize() else ""))
+        self.orders.put((text, job))
 
     def next_order(self) -> Optional[str]:
         self.set_status("")
         try:
-            return self.orders.get()
+            text, self.last_job = self.orders.get()
+            return text
         except KeyboardInterrupt:
             return None
 
-    def ask(self, question: str) -> bool:
-        self._answered.clear()
-        with self.lock:
-            self._ask_id += 1
-            self.pending = {"id": self._ask_id, "text": question}
-        self.log(f"    ?? {question}  -> 웹에서 [예/아니오]")
-        got = self._answered.wait(ASK_TIMEOUT)
-        with self.lock:
-            self.pending = None
-            ans = self._answer if got else False
-        self.log("    -> " + ("예" if ans else
-                              ("아니오" if got else "답이 없어 아니오로 본다")))
-        return ans
-
-    def answer(self, ask_id: int, yes: bool) -> bool:
-        with self.lock:
-            if not self.pending or self.pending["id"] != ask_id:
-                return False
-            self._answer = yes
-        self._answered.set()
-        return True
-
     def close(self) -> None:
         try:
-            self.srv.shutdown()
-            self.srv.server_close()
+            for srv in self.servers:
+                srv.shutdown()
+                srv.server_close()
         except Exception:
             pass
 
@@ -974,9 +2695,10 @@ class WebUi:
 # ---------------------------------------------------------------------------
 
 class Agent:
-    def __init__(self, api: Api, vlm: Vlm, ui, auto: bool = False, base: Optional[MapApi] = None):
-        self.api, self.vlm, self.ui, self.auto, self.base = api, vlm, ui, auto, base
+    def __init__(self, api: Api, vlm: Vlm, ui, base: Optional[MapApi] = None):
+        self.api, self.vlm, self.ui, self.base = api, vlm, ui, base
         self.frame: Optional[np.ndarray] = None
+        self.job: Optional[str] = None       # 지금 처리 중인 일의 처리 단계 로그 id (O3, B1 ...)
         self.disabled: set[str] = self._load_disabled()   # 웹 UI 에서 끈 스킬 (재시작해도 유지)
         if self.disabled:
             self.ui.log(f"[skill] 꺼 둔 스킬 (저장된 설정): {', '.join(sorted(self.disabled))}")
@@ -1003,6 +2725,11 @@ class Agent:
             os.replace(tmp, SKILLS_PATH)       # 쓰다 죽어도 이전 파일은 멀쩡하게
         except OSError as e:
             self.ui.log(f"[skill] 설정 저장 실패 ({SKILLS_PATH}): {e}")
+
+    def speak(self, text: Optional[str], job: Optional[str] = None) -> None:
+        """사용자에게 음성으로 한 문장 (웹이면 브라우저가 재생, 터미널이면 글로)."""
+        if text and text.strip() and hasattr(self.ui, "speak"):
+            self.ui.speak(text.strip(), job)
 
     def skill_doc(self) -> str:
         doc = SKILL_DOC + (BASE_DOC if self.base else "")
@@ -1044,15 +2771,19 @@ class Agent:
     # --- 화면 -------------------------------------------------------------
     def look(self) -> bool:
         """지금 화면을 받아 저장한다. 사용자도 같은 그림을 볼 수 있어야 한다."""
+        t0 = time.perf_counter()
         frame = self.api.rgb()
         if frame is None:
-            self.ui.log("[error] /get_rgb 실패 - test4.py 가 떠 있는지 확인하세요")
+            self.ui.log("[error] /get_rgb 실패 - robot_arm.py 가 떠 있는지 확인하고 '재연결'")
+            TRACE.add(self.job, "화면 받기", "/get_rgb 실패", level="error",
+                      ms=(time.perf_counter() - t0) * 1000)
             return False
         self.frame = frame
         cv2.imwrite(VIEW_PATH, frame)
         self.ui.set_view(frame)
         h, w = frame.shape[:2]
         self.ui.log(f"[view] 현재 화면 {w}x{h} (저장: {VIEW_PATH})")
+        TRACE.add(self.job, "화면 받기", f"{w}x{h}", ms=(time.perf_counter() - t0) * 1000)
         return True
 
     def to_pixel(self, point: List[int]) -> tuple[int, int]:
@@ -1064,11 +2795,27 @@ class Agent:
 
     # --- 첫 인사: 무엇이 보이고 무엇을 할 수 있는지 -------------------------
     def brief(self) -> str:
+        job = self.job = TRACE.new_job("B")
+        TRACE.add(job, "시작", "로봇 상태를 읽고 화면 설명을 요청한다")
+        t0 = time.perf_counter()
+        try:
+            out = self._brief(job)
+        except Exception as e:
+            TRACE.add(job, "실패", f"{type(e).__name__}: {e}", level="error", end=True,
+                      ms=(time.perf_counter() - t0) * 1000)
+            self.job = None
+            raise
+        TRACE.add(job, "완료", (out.strip().splitlines() or [""])[0][:120], level="ok",
+                  ms=(time.perf_counter() - t0) * 1000, detail=out, end=True)
+        self.job = None
+        return out
+
+    def _brief(self, job: str) -> str:
         state = self.api.json("/get_state")
         base = ""
         if self.base:
             bs = self.base.summary()
-            names = [lb["name"] for lb in bs.get("labels", []) if lb.get("reachable")]
+            names = [lb["name"] for lb in bs.get("labels", [])]
             base = ("이 팔은 이동 로봇 위에 있어서 저장된 장소로 이동할 수 있다"
                     + (f" (장소: {', '.join(names)})" if names else "") + ".\n")
         prompt = (
@@ -1078,7 +2825,7 @@ class Agent:
             "두세 가지 제안해라. 각 제안은 한 줄로, 사용자가 그대로 지시할 수 있는 "
             "문장으로 써라. 좌표는 아직 말하지 마라."
         )
-        return self.vlm.ask(self.frame, prompt)
+        return self.vlm.ask(self.frame, prompt, job=job)
 
     # --- 스킬 실행 ---------------------------------------------------------
     def run_skill(self, call: SkillCall) -> dict:
@@ -1093,6 +2840,8 @@ class Agent:
             return self.api.json("/get_state")
         if s == "get_rgb":
             return {"ok": self.look(), "note": "새 화면을 받았다"}
+        if s == "reset":
+            return self.api.json("/reset")
         if s == "wait":
             return self.wait_idle(float(call.seconds or 3.0))
         if s in ("get_depth_at", "pick", "place"):
@@ -1113,10 +2862,12 @@ class Agent:
             return b.summary()
         if s == "base_stop":
             return b.stop()
-        if s in ("goto_label", "save_label"):
+        if s in ("goto_label", "goto_label_wall", "save_label"):
             if not call.label:
                 return {"ok": False, "message": "label 이 필요하다"}
-            return b.goto_label(call.label) if s == "goto_label" else b.save_label(call.label)
+            if s == "save_label":
+                return b.save_label(call.label)
+            return b.goto_label(call.label, wall=s == "goto_label_wall", gap=call.gap)
         if s == "base_move":
             if call.meters is None:
                 return {"ok": False, "message": "meters 가 필요하다"}
@@ -1134,7 +2885,7 @@ class Agent:
         return {"ok": False, "message": f"모르는 스킬: {s}"}
 
     def act(self, action: str, x: int, y: int) -> dict:
-        """팔을 움직인다. 확인 없이 바로 하고, 실패했을 때만 다시 할지 묻는다."""
+        """팔을 움직인다. 확인 없이 바로 하고, 실패하면 묻지 않고 MAX_RETRY 번까지 다시 한다."""
         out: dict = {}
         for attempt in range(1, MAX_RETRY + 1):
             self.ui.set_status(f"{action} 실행 중")
@@ -1143,31 +2894,35 @@ class Agent:
             out = self.api.json(f"/{action}", {"x": x, "y": y})
             if out.get("ok"):                      # 접수됐으면 끝날 때까지 기다린다
                 out["after_wait"] = self.wait_idle(20.0)
+                if action == "pick" and out["after_wait"].get("state") == "pick_failed":
+                    # 팔은 끝까지 움직였는데 빈손이다. 같은 점을 그대로 다시 해도 같은 결과라
+                    # 여기서 재시도하지 않고, 점을 옮겨 다시 고르도록 모델에게 넘긴다.
+                    why = "물체를 못 잡았다 (그리퍼 부하로 보니 빈손)"
+                    self.ui.log(f"    !! pick 실패: {why}")
+                    TRACE.add(self.job, "pick 실패", f"({x},{y}) {why}", level="warn")
+                    self.look()                    # 팔이 물체를 밀었을 수 있다
+                    return {**out, "ok": False, "pick_failed": True,
+                            "message": why + " - 왼쪽 위로 조금 옮긴 점으로 다시 pick 하라"}
                 if out["after_wait"].get("ok"):
                     return out
                 why = out["after_wait"].get("message", "동작이 끝나지 않았다")
             else:
                 why = out.get("message") or out.get("error") or f"HTTP {out.get('http')}"
             self.ui.log(f"    !! {action} 실패: {why}")
-            if attempt >= MAX_RETRY or not self.ask_retry(action, x, y, why):
+            TRACE.add(self.job, f"{action} 실패", f"({x},{y}) {attempt}번째 시도: {why}", level="warn")
+            if attempt >= MAX_RETRY or ESTOP.is_set():
                 break
+            time.sleep(1.0)
         out["ok"] = False
         out["message"] = why
         out["tries"] = attempt
         return out
 
-    def ask_retry(self, action: str, x: int, y: int, why: str) -> bool:
-        """실패했을 때만 묻는다. --auto 면 묻지 않고 모델에게 실패를 알린다."""
-        if self.auto:
-            return False
-        self.ui.set_status(f"{action} 실패 - 다시 할지 기다리는 중")
-        return self.ui.ask(f"{action}({x},{y}) 실패: {why} / 다시 할까요?")
-
     def wait_idle(self, timeout: float) -> dict:
         """동작이 끝날 때까지 상태를 지켜본다."""
         t0 = time.time()
         last = {}
-        while time.time() - t0 < timeout:
+        while time.time() - t0 < timeout and not ESTOP.is_set():
             last = self.api.json("/get_state")
             if last.get("state") not in ("picking", "placing", "homing", "busy"):
                 return {"ok": True, "state": last.get("state"), "label": last.get("label")}
@@ -1175,37 +2930,127 @@ class Agent:
         return {"ok": False, "state": last.get("state"), "message": "동작이 아직 안 끝났다"}
 
     # --- 지시 하나를 끝까지 --------------------------------------------------
-    def follow(self, order: str) -> None:
+    def follow(self, order: str, job: Optional[str] = None) -> None:
+        """job: 웹에서 지시를 받을 때 이미 붙인 처리 단계 로그 id (없으면 새로)."""
+        job = self.job = job or TRACE.new_job("O")
+        TRACE.add(job, "지시 시작", order)
+        t0 = time.perf_counter()
+        # 지시를 받은 지금의 화면으로 판단한다 - 지난 지시 뒤에 사람이 물건을 옮겼을 수 있다
+        self.ui.set_status("최신 화면 받는 중")
+        if not self.look():
+            self.speak("카메라 화면을 받지 못해 시작하지 못했어요.", job)
+            TRACE.add(job, "중단", "최신 화면을 받지 못했다 - 예전 화면으로는 판단하지 않는다",
+                      level="error", end=True, ms=(time.perf_counter() - t0) * 1000)
+            self.job = None
+            return
+        try:
+            self._follow(order, job, t0)
+        except BaseException as e:           # Ctrl-C 도 '끝났다' 는 줄을 남긴다
+            TRACE.add(job, "중단", f"{type(e).__name__}: {e}", level="error", end=True,
+                      ms=(time.perf_counter() - t0) * 1000)
+            raise
+        finally:
+            self.job = None                  # 끝난 일에 화면 갱신 같은 줄이 붙지 않게
+
+    def _estopped(self, job: str, t0: float) -> None:
+        if self.base is not None:
+            self.base.stop()                 # 버튼에서도 세웠지만, 그 뒤에 보낸 이동이 있을 수 있다
+        self.ui.log("[긴급 정지] 지시를 멈췄다")
+        self.speak("긴급 정지했어요.", job)
+        TRACE.add(job, "긴급 정지", "사용자가 긴급 정지를 눌러 지시를 멈췄다", level="warn", end=True,
+                  ms=(time.perf_counter() - t0) * 1000)
+
+    def _follow(self, order: str, job: str, t0: float) -> None:
         history: list[str] = []
+        plan: list[str] = []
+        last_said = ""                       # 바로 앞에서 들려준 말 (같은 말 반복 방지)
         for step in range(1, MAX_STEPS + 1):
+            if ESTOP.is_set():
+                self._estopped(job, t0)
+                return
             state = self.api.json("/get_state")
             self.ui.set_status(f"생각 중 ({step}/{MAX_STEPS})")
+            info = self.base.map_info() if self.base else None    # 매 단계 새로: 움직이면 바뀐다
+            if step == 1 and info:
+                TRACE.add(job, "지도 정보", f"라벨 {len(info['labels'])}개, 위치 {info['pose']}",
+                          detail=json.dumps(info, ensure_ascii=False))
             prompt = (
                 f"{self.skill_doc()}\n\n"
                 f"사용자 지시: {order}\n"
                 f"로봇 상태: {state.get('state')} ({state.get('label')})\n"
+                + (f"지도 정보 (지금): {json.dumps(info, ensure_ascii=False)}\n" if info
+                   else "지도 정보: 없음 (이동 로봇 연결 안 됨)\n" if self.base else "")
+                + ("세운 계획:\n" + "\n".join(f"  {i}. {p}" for i, p in enumerate(plan, 1)) + "\n" if plan else "")
                 + ("지금까지 한 일:\n" + "\n".join(history) + "\n" if history else "")
+                + ("이번이 이 지시의 첫 스킬이다 - speech 에 무엇을 할지 짧은 한 문장을 꼭 써라.\n"
+                   + ("지도 정보와 화면을 보고 지시를 끝낼 전체 실행 계획을 plan 에 단계별로 써라.\n"
+                      if self.base else "")
+                   if step == 1 else "")
+                + "speech 에 지금 할 행동을 짧은 한 문장으로 꼭 써라 (done 이면 결과).\n"
                 + "다음에 부를 스킬 하나를 JSON 으로 내라."
             )
+            TRACE.add(job, f"{step}단계 판단", f"로봇 상태 {state.get('state')} ({state.get('label')})"
+                      f", 지금까지 스킬 {len(history)}개")
+            raw = ""
             try:
-                raw = self.vlm.ask(self.frame, prompt, SkillCall.model_json_schema())
+                raw = self.vlm.ask(self.frame, prompt, SkillCall.model_json_schema(),
+                                   job=job, label=f"{step}단계 ")
                 call = SkillCall(**json.loads(raw))
             except Exception as e:
                 self.ui.log(f"[error] 모델 응답을 읽지 못했다: {type(e).__name__}: {e}")
+                quota = quota_message(e)
+                if quota:
+                    self.ui.log(f"[error] {quota}")
+                self.speak("오늘 쓸 수 있는 모델 사용량을 다 써서 지금은 할 수 없어요." if quota
+                           else "모델 응답이 너무 늦어 멈췄어요. 다시 말씀해 주세요."
+                           if isinstance(e, ModelTimeout) else "죄송해요, 지금은 처리하지 못했어요.", job)
+                TRACE.add(job, f"{step}단계 응답 해석 실패", f"{type(e).__name__}: {e}", level="error",
+                          detail=raw, end=True, ms=(time.perf_counter() - t0) * 1000)
                 return
 
             arg = "".join(f" {v}" for v in (call.point, call.label, call.meters, call.degrees, call.gap)
                           if v is not None)
+            if call.plan:
+                plan = [p for p in call.plan if p][:12]
+                self.ui.log("  계획: " + " → ".join(plan))
+                TRACE.add(job, "실행 계획" if step == 1 else "계획 변경", " → ".join(plan))
             self.ui.log(f"  [{step}] {call.skill}{arg}  - {call.reason}")
             if call.message:
                 self.ui.log(f"      말: {call.message}")
-
-            result = self.run_skill(call)
-            self.ui.log(f"      결과: {json.dumps(result, ensure_ascii=False)[:200]}")
-            history.append(f"- {call.skill}{arg} -> "
-                           f"{json.dumps(result, ensure_ascii=False)[:160]}")
-
+            TRACE.add(job, f"{step}단계 스킬 선택", f"{call.skill}{arg} - {call.reason}"
+                      + (f" / 말: {call.message}" if call.message else ""))
+            # 음성 답변: 스킬마다 지금 할 행동을 한 문장씩. say 는 그 말, done 은 결과.
+            # (모델이 speech 를 비우기도 해서 비었을 때 할 말을 정해 둔다)
             if call.skill == "done":
+                self.speak(call.speech or call.message or call.reason, job)
+            elif call.skill == "say":
+                self.speak(call.message or call.speech, job)
+            else:
+                said = call.speech or ("네, 시작할게요." if step == 1 else SKILL_SPEECH.get(call.skill))
+                if said and said != last_said:     # 같은 말을 연달아 하지 않는다
+                    self.speak(said, job)
+                    last_said = said
+
+            if ESTOP.is_set():                # 모델이 답하는 동안 눌렸으면 스킬을 실행하지 않는다
+                self._estopped(job, t0)
+                return
+            ts = time.perf_counter()
+            result = self.run_skill(call)
+            res_txt = json.dumps(result, ensure_ascii=False)
+            self.ui.log(f"      결과: {res_txt[:200]}")
+            TRACE.add(job, f"{step}단계 스킬 결과",
+                      f"{call.skill} " + ("성공" if result.get("ok") else "실패")
+                      + (f" - {result.get('message')}" if result.get("message") else ""),
+                      level="ok" if result.get("ok") else "warn",
+                      ms=(time.perf_counter() - ts) * 1000, detail=res_txt)
+            history.append(f"- {call.skill}{arg} -> {res_txt[:160]}")
+
+            if ESTOP.is_set():
+                self._estopped(job, t0)
+                return
+            if call.skill == "done":
+                TRACE.add(job, "지시 완료", call.message or "", level="ok", end=True,
+                          ms=(time.perf_counter() - t0) * 1000)
                 return
             if call.skill in ("pick", "place") and result.get("ok"):
                 self.look()          # 움직였으면 화면이 바뀐다
@@ -1213,22 +3058,145 @@ class Agent:
                                               or result.get("state") in ("succeeded", "done")):
                 self.look()          # 몸체가 움직였으면 카메라가 보는 곳이 바뀐다
         self.ui.log("[warn] 스킬 호출 상한에 도달했다 - 지시를 더 구체적으로 주세요")
+        self.speak("단계가 너무 많아 멈췄어요. 조금 더 구체적으로 말씀해 주세요.", job)
+        TRACE.add(job, "상한 도달", f"스킬 {MAX_STEPS}번을 불렀는데 끝나지 않았다", level="warn",
+                  end=True, ms=(time.perf_counter() - t0) * 1000)
 
 
 # ---------------------------------------------------------------------------
 # 6. 실행
 # ---------------------------------------------------------------------------
 
-def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
-    """지시 하나를 끝내면 화면을 새로 받고 다음 지시를 기다린다."""
-    if not agent.look():
-        return
+RECONNECT = "\x00reconnect"      # 웹 '재연결' 버튼 / CLI 'c' 가 넣는 내부 명령
 
+
+class Links:
+    """팔 REST / 이동 로봇 map_web / Gemini 의 연결 상태. 끊겨도 프로세스는 계속 산다."""
+
+    def __init__(self, agent: "Agent", api: Api, ui, map_api: str, use_base: bool):
+        self.agent, self.api, self.ui = agent, api, ui
+        self.map_api, self.use_base = map_api, use_base
+        self.arm = (False, "")
+        self.base_state: tuple = (None, "")
+        self.gemini: tuple = (None, "아직 확인 안 함")
+        self._base_obj = MapApi(map_api, log=ui.log, status=ui.set_status) if use_base else None
+
+    def connect_arm(self) -> bool:
+        st = self.api.json("/get_state")
+        if st.get("ok"):
+            self.arm = (True, st.get("label", ""))
+            self.ui.log(f"[api] {self.api.base} | 로봇 상태: {st.get('label')} ({st.get('state')})")
+            if st.get("state") == "not_calibrated":
+                self.ui.log("      주의: hand-eye 미보정이라 pick 이 거부된다")
+        else:
+            self.arm = (False, st.get("error", "응답 없음"))
+            self.ui.log(f"[error] 팔 REST {self.api.base} 에 연결하지 못했다 - robot_arm.py 를 켠 뒤 '재연결'")
+        self.publish()
+        return self.arm[0]
+
+    def connect_base(self) -> None:
+        if self._base_obj is None:
+            return
+        if self._base_obj.alive():
+            self.agent.base = self._base_obj
+            self.base_state = (True, "")
+            self.ui.log(f"[base] {self.map_api} | 이동 로봇 스킬 사용 (base_state, goto_label, base_move ...)")
+        else:
+            self.agent.base = None
+            self.base_state = (False, "map_web 응답 없음 - remote_map_web.sh start 확인")
+            self.ui.log(f"[base] {self.map_api} 에 연결하지 못했다 - 이동 로봇 스킬 없이 진행 (켠 뒤 '재연결')")
+        self.publish()
+
+    def connect_gemini(self, reload_key: bool = True) -> bool:
+        """키(.env 다시 읽기)와 모델 접근을 확인한다. 토큰은 쓰지 않는다."""
+        if reload_key:
+            key = load_api_key()
+            if not key:
+                self.gemini_result(False, f"GEMINI_API_KEY 가 없다 ({ENV_FILE})")
+                self.ui.log(f"[gemini] GEMINI_API_KEY 가 없다 - {ENV_FILE} 확인")
+                return False
+            self.agent.vlm.reload_key(key)
+        try:
+            self.agent.vlm.check()
+        except Exception as e:
+            self.gemini_result(False, _model_error(e))
+            self.ui.log(f"[gemini] 확인 실패: {_model_error(e)}")
+            return False
+        self.gemini_result(True, "")
+        self.ui.log(f"[gemini] {self.agent.vlm.model} 사용 가능")
+        return True
+
+    def gemini_result(self, ok: bool, detail: str = "") -> None:
+        self.gemini = (ok, detail)
+        self.publish()
+
+    def publish(self) -> None:
+        if self._base_obj is None:
+            base = (None, "--no-base", "(사용 안 함)")
+        else:
+            base = (self.base_state[0], self.base_state[1], self.map_api)
+        self.ui.set_conn({
+            "arm": (*self.arm, self.api.base),
+            "base": base,
+            "gemini": (*self.gemini, f"{self.agent.vlm.model} @ generativelanguage.googleapis.com"),
+        })
+
+
+def _model_error(e: BaseException) -> str:
+    quota = quota_message(e)
+    if quota:
+        return quota
+    msg = f"{type(e).__name__}: {e}"
+    if any(k in msg for k in ("401", "UNAUTHENTICATED", "AuthenticationError", "API_KEY_INVALID",
+                              "API key not valid")):
+        return ("Gemini API 키 오류 - .env 의 GEMINI_API_KEY 가 올바른 API 키(AIza...)인지 확인 후 '재연결'. "
+                + msg[:160])
+    return msg[:300]
+
+
+def start_session(agent: "Agent", links: Links, ui, reload_key: bool = False) -> None:
+    """(재)연결 직후: 셋 다 확인하고 화면을 받아 설명을 듣는다. 실패해도 계속 산다."""
+    arm_ok = links.connect_arm()
+    links.connect_base()
+    gem_ok = links.connect_gemini(reload_key=reload_key)
+    if not arm_ok or not agent.look():
+        return
+    if not gem_ok:
+        ui.log("[화면 설명] 생략 - Gemini 연결을 고친 뒤 Gemini '재연결'")
+        return
     ui.set_status("화면 살펴보는 중")
     ui.log("[화면 설명]")
-    ui.log(agent.brief())
+    try:
+        ui.log(agent.brief())
+        links.gemini_result(True, "")
+    except Exception as e:                   # 키 오류, 할당량, 시간 초과 - 웹 UI 는 유지
+        links.gemini_result(False, _model_error(e))
+        ui.log(f"[error] 화면 설명을 받지 못했다 - {_model_error(e)}")
+    ui.set_status("")
+
+
+def safe_brief(agent: Agent) -> str:
+    """화면 설명이 실패해도(시간 초과 등) 프로그램은 계속 지시를 받는다."""
+    if agent.frame is None:
+        return "[error] 화면이 없어 설명할 수 없다 - 팔 REST 연결 후 '재연결'"
+    try:
+        return agent.brief()
+    except Exception as e:
+        quota = quota_message(e)
+        if quota:
+            return f"[error] 화면 설명을 받지 못했다 - {quota}"
+        return f"[error] 화면 설명을 받지 못했다 ({type(e).__name__}: {e}) - 지시는 그대로 할 수 있다"
+
+
+def run(agent: Agent, api: Api, ui, links: Links, first_order: str = "") -> None:
+    """지시 하나를 끝내면 화면을 새로 받고 다음 지시를 기다린다.
+
+    팔/이동 로봇/Gemini 연결이 실패해도 끝내지 않는다 - 로그에 남기고 '재연결'
+    (웹 연결 패널, CLI 는 'c') 이나 다음 지시를 기다린다.
+    """
+    start_session(agent, links, ui)
     ui.log("")
-    ui.log("무엇을 시킬까요? ('r' 화면 다시 보기, 'q' 종료)")
+    ui.log("무엇을 시킬까요? ('r' 화면 다시 보기, 'c' 재연결, 'q' 종료)")
 
     pending = (first_order or "").strip()
     while True:
@@ -1236,25 +3204,53 @@ def run(agent: Agent, api: Api, ui, first_order: str = "") -> None:
             order, pending = pending, ""
             ui.log("")
             ui.log(f"[지시] {order}")
-            agent.follow(order)
+            if not api.connected():
+                links.connect_arm()
+                ui.log("[error] 팔 REST 에 연결되어 있지 않다 - robot_arm.py 를 켠 뒤 '재연결'")
+                continue
+            try:
+                agent.follow(order, getattr(ui, "last_job", None))
+            except Exception as e:             # 한 지시가 실패해도 다음 지시는 받는다
+                ui.log(f"[error] 지시를 처리하다 멈췄다: {_model_error(e)}")
+                if "genai" in type(e).__module__ or isinstance(e, ModelTimeout):
+                    links.gemini_result(False, _model_error(e))     # 모델 쪽 오류면 연결 패널에도
+                if agent.base is not None:
+                    agent.base.stop()          # 몸체가 움직이던 중이면 세운다
+                agent.speak("문제가 생겨 지시를 멈췄어요.")
             # 명령이 끝났으니 화면을 새로 보고 다음 명령을 기다린다
             ui.set_status("화면 갱신 중")
             agent.look()
             st = api.json("/get_state")
+            ui.set_status("")
             ui.log("")
-            ui.log(f"[완료] 로봇 상태: {st.get('label', '?')} - 다음 지시를 기다립니다")
+            ui.log(f"[완료] 로봇 상태: {st.get('label', st.get('error', '?'))} - 다음 지시를 기다립니다")
             continue
 
         order = ui.next_order()
         if order is None:
             break
+        if order.startswith(RECONNECT) or order.strip().lower() in ("c", "재연결"):
+            target = order.partition(":")[2] if order.startswith(RECONNECT) else "all"
+            ui.log("")
+            ui.log(f"[재연결] {dict(all='전체', arm='팔 REST', base='이동 로봇', gemini='Gemini').get(target, target)}")
+            if target == "arm":
+                if links.connect_arm():
+                    agent.look()
+            elif target == "base":
+                links.connect_base()
+            elif target == "gemini":
+                links.connect_gemini(reload_key=True)
+            else:
+                start_session(agent, links, ui, reload_key=True)
+            links.publish()
+            continue
         order = order.strip()
         if not order or order.lower() in ("q", "quit", "exit", "종료"):
             break
         if order.lower() == "r":
             ui.set_status("화면 다시 보는 중")
             agent.look()
-            ui.log(agent.brief())
+            ui.log(safe_brief(agent))
             continue
         pending = order
 
@@ -1284,18 +3280,29 @@ def main() -> None:
     ap.add_argument("order", nargs="*", help="첫 지시 (없으면 웹/터미널에서 받는다)")
     ap.add_argument("--api", default=DEFAULT_API, help=f"REST 주소 (기본 {DEFAULT_API})")
     ap.add_argument("--auto", action="store_true",
-                    help="실패해도 다시 할지 묻지 않는다 (기본은 실패 때만 묻는다)")
+                    help="(예전 옵션 - 이제 재시도는 언제나 묻지 않고 한다. 받기만 하고 무시)")
     ap.add_argument("--cli", action="store_true", help="웹 대신 터미널로 지시를 받는다")
     ap.add_argument("--port", type=int, default=WEB_PORT,
                     help=f"웹 입력 UI 포트 (기본 {WEB_PORT})")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="웹 입력 UI 바인드 주소 (기본 127.0.0.1)")
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="웹 입력 UI 바인드 주소 (기본 0.0.0.0 = 다른 PC 에서도 접속. "
+                         "이 기계에서만 쓰려면 127.0.0.1)")
+    ap.add_argument("--https-port", type=int, default=None,
+                    help="음성 명령용 https 포트 (자체 서명 인증서. 기본 --port + 1, 0 = 끔)")
     ap.add_argument("--no-browser", action="store_true",
                     help="브라우저를 자동으로 열지 않는다")
     ap.add_argument("--map-api", default="",
                     help=f"이동 로봇 map_web REST 주소 (기본: --api 와 같은 호스트의 {MAP_WEB_PORT} 포트)")
     ap.add_argument("--no-base", action="store_true",
                     help="이동 로봇 스킬을 쓰지 않는다 (팔만)")
+    ap.add_argument("--live-model", default=LIVE_STT_MODEL_ID,
+                    help=f"웹 음성 명령 실시간 받아쓰기 모델 (Live API, 기본 {LIVE_STT_MODEL_ID}, "
+                         "환경변수 GEMINI_LIVE_STT_MODEL, none = 끄고 일괄만)")
+    ap.add_argument("--tts-model", default=TTS_MODEL_ID,
+                    help=f"음성 답변 모델 (기본 {TTS_MODEL_ID}, 환경변수 GEMINI_TTS_MODEL, "
+                         "none = 브라우저 내장 음성으로)")
+    ap.add_argument("--stt-model", default=STT_MODEL_ID,
+                    help=f"Live 를 못 쓸 때의 일괄 받아쓰기 모델 (기본 {STT_MODEL_ID}, 환경변수 GEMINI_STT_MODEL)")
     args = ap.parse_args()
 
     key = load_api_key()
@@ -1305,14 +3312,7 @@ def main() -> None:
               "(이 저장소의 test3.py 가 쓰는 키와 같은 것을 쓰면 된다)")
         return
 
-    api = Api(args.api)
-    state = api.json("/get_state")
-    if not state.get("ok"):
-        print(f"[error] {args.api} 에 연결하지 못했다 - test4.py 를 먼저 실행하세요")
-        return
-    print(f"[api] {args.api} | 로봇 상태: {state.get('label')} ({state.get('state')})")
-    if state.get("state") == "not_calibrated":
-        print("      주의: hand-eye 미보정이라 pick 이 거부된다")
+    api = Api(args.api)       # 연결 확인은 run() 이 한다 - 실패해도 웹 UI 는 뜬다
 
     if args.cli:
         ui = ConsoleUi()
@@ -1320,30 +3320,37 @@ def main() -> None:
         try:
             ui = WebUi(args.port, args.host,
                        state_fn=lambda: api.json("/get_state"),
-                       open_browser=not args.no_browser)
+                       open_browser=not args.no_browser,
+                       https_port=args.port + 1 if args.https_port is None else args.https_port)
         except OSError as e:
             print(f"[error] 웹 UI 포트 {args.port} 를 열지 못했다: {e}")
             print("        --port 로 다른 포트를 주거나, --cli 로 터미널을 쓰세요")
             return
 
-    base = None
-    if not args.no_base:
-        if not args.map_api:          # 팔과 이동 로봇은 같은 파이에서 돈다
-            host = urllib.parse.urlparse(args.api).hostname or "127.0.0.1"
-            args.map_api = f"http://{host}:{MAP_WEB_PORT}"
-        base = MapApi(args.map_api, log=ui.log, status=ui.set_status)
-        if base.alive():
-            print(f"[base] {args.map_api} | 이동 로봇 스킬 사용 (base_state, goto_label, base_move ...)")
-        else:
-            print(f"[base] {args.map_api} 에 연결하지 못했다 - 이동 로봇 스킬 없이 팔만 쓴다")
-            base = None
+    if not args.no_base and not args.map_api:   # 팔과 이동 로봇은 같은 파이에서 돈다
+        host = urllib.parse.urlparse(args.api).hostname or "127.0.0.1"
+        args.map_api = f"http://{host}:{MAP_WEB_PORT}"
 
-    agent = Agent(api, Vlm(key, ui.log), ui, auto=args.auto, base=base)
+    TRACE.add(TRACE.new_job("S"), "시작",
+              f"모델 {MODEL_ID}, 실시간 받아쓰기 {args.live_model}, 일괄 받아쓰기 {args.stt_model}, "
+              f"음성 답변 {args.tts_model}, 팔 {args.api}, "
+              f"이동 로봇 {'없음' if args.no_base else args.map_api}, 로그 {TRACE.path}", end=True)
+    vlm = Vlm(key, ui.log, stt_model=args.stt_model,
+              live_model=None if args.live_model.lower() in ("", "none", "off") else args.live_model,
+              tts_model=None if args.tts_model.lower() in ("", "none", "off") else args.tts_model)
+    agent = Agent(api, vlm, ui)       # 이동 로봇은 Links 가 연결되면 붙인다
+    links = Links(agent, api, ui, args.map_api, use_base=not args.no_base)
     if isinstance(ui, WebUi):
         ui.toggle_fn = agent.set_skills
         ui.skills_fn = agent.skill_groups
+        ui.estop_fn = lambda: agent.base.stop() if agent.base is not None else None
+        ui.quota_fn = vlm.quota_list
+        ui.usage_fn = vlm.usage.summary
+        ui.transcribe_fn = vlm.transcribe
+        ui.live_fn = vlm.live
+        ui.tts_fn = vlm.tts if vlm.tts_model else None
     try:
-        run(agent, api, ui, " ".join(args.order))
+        run(agent, api, ui, links, " ".join(args.order))
     except KeyboardInterrupt:
         print()
     finally:

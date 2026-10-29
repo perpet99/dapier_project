@@ -7,6 +7,8 @@ set -euo pipefail
 # remote_robot_arm.sh) on every start. Runs in tmux session 'llm_client' on the
 # Pi (log ~/llm_client.log), with the Pi's ~/dapier_project/.venv python.
 # Web UI (give orders, see the view / log / robot state): http://<pi>:8770/
+# Voice orders from the laptop: https://<pi>:8771/ (self-signed certificate,
+# made on the Pi on first start; accept the browser warning once).
 #
 # Usage: ./remote_llm_client.sh <command> [options] [llm_client.py args...]
 #   start   [args]   start and print the URL (robot_arm.py must be running)
@@ -63,6 +65,9 @@ print_info() {   # $1 = web port, $2 = 1 if --cli
     echo "terminal mode (--cli): give orders with ./remote_llm_client.sh attach"
   elif curl -s -m 3 -o /dev/null "http://${ROBOT_HOST}:$1/"; then
     echo "web UI : http://${ROBOT_HOST}:$1/"
+    # voice orders need https (browsers only open the mic on https/localhost)
+    curl -sk -m 3 -o /dev/null "https://${ROBOT_HOST}:$(($1 + 1))/" &&
+      echo "voice  : https://${ROBOT_HOST}:$(($1 + 1))/  (self-signed: accept the browser warning once)"
   else
     echo "web UI : not answering on http://${ROBOT_HOST}:$1/"
   fi

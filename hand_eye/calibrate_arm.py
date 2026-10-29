@@ -27,7 +27,9 @@ test4.py 는 여기서 만든 arm_calib.json 을 읽기만 한다. 파일이 없
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import sys
 import time
 from typing import Optional
@@ -389,7 +391,17 @@ def set_mapping(bus: FeetechBus, ranges: dict) -> dict:
 # 같은 모순이 눈에 보인다. 그 모순을 여기서 못 잡으면 hand-eye 캘리브레이션까지
 # 끌고 가서, 카메라 탓을 하며 몇 시간을 버리게 된다.
 
-TABLE_Z_TOL = 0.010     # 테이블에 댔을 때 TCP z 가 0 에서 벗어나도 되는 폭 [m]
+TABLE_Z_TOL = 0.010     # 테이블에 댔을 때 TCP z 가 테이블면에서 벗어나도 되는 폭 [m]
+
+
+def load_table_z() -> float:
+    """테이블면 높이 [m] (로봇 베이스 바닥 = 0). robot_arm.py 와 같은 pick_settings.json 을 쓴다."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pick_settings.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return float(json.load(f).get("table_z_mm", 0.0)) / 1000.0
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0
 
 
 def read_all_counts(bus: FeetechBus) -> dict[str, int]:
@@ -440,7 +452,7 @@ def watch_tcp(bus: FeetechBus, calib: ArmCalibration, note: str = "") -> dict[st
 
 
 def table_check(bus: FeetechBus, calib: ArmCalibration) -> None:
-    """그리퍼 끝을 테이블에 댄 자세에서 TCP z 가 0 인지 본다.
+    """그리퍼 끝을 테이블에 댄 자세에서 TCP z 가 테이블면(table_z_mm) 인지 본다.
 
     팔이 테이블 위에 놓여 있다면 이건 자를 대지 않고도 쓸 수 있는 유일한
     절대 기준이다. 여기서 z 가 0 이 아니면 그만큼 기준자세가 틀린 것이고,
@@ -449,13 +461,15 @@ def table_check(bus: FeetechBus, calib: ArmCalibration) -> None:
     print("\n" + "=" * 66)
     print("4단계: 테이블 접촉 검사 (영점이 실제로 맞는지)")
     print("=" * 66)
-    print("  그리퍼 끝을 테이블면에 살짝 대세요. 팔이 테이블 위에 놓여 있다면")
-    print("  그 순간 TCP z 는 0 근처여야 합니다.")
+    table_z = load_table_z()
+    print("  그리퍼 끝을 테이블면에 살짝 대세요. 그 순간 TCP z 는")
+    print(f"  {table_z*1000:+.0f}mm 근처여야 합니다 (pick_settings.json 의 table_z_mm).")
     counts = watch_tcp(bus, calib, "그리퍼 끝을 테이블에 댄 채로 Enter")
 
     q, p = tcp_of(calib, counts)
     z, r = float(p[2]), math.hypot(p[0], p[1])
     print(f"\n  접촉 지점의 TCP: z = {z*1000:+.1f}mm  (반경 {r*1000:.1f}mm)")
+    z -= table_z                               # 이후는 테이블면 기준 어긋남
     if abs(z) <= TABLE_Z_TOL:
         print(f"  -> 정상. 영점이 맞습니다 (허용 +-{TABLE_Z_TOL*1000:.0f}mm)")
         return

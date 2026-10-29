@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>🤖 AMR 스마트 관제 & 자율주행 대시보드</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@300;400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-glob"></div>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="logo">
+                <span class="pulse-icon">🤖</span>
+                <div>
+                    <h1>AMR Mission Control Center</h1>
+                    <p class="subtitle">실시간 2D 지도 · 자율주행 · 조이스틱 텔레옵 통합 시스템</p>
+                </div>
+            </div>
+            <div class="status-badge" id="statusBadge">
+                <span class="status-dot"></span>
+                <span id="statusText">온라인 연결됨</span>
+            </div>
+        </header>
+
+        <!-- Response & Status Card -->
+        <section class="ai-reply-section card" id="aiReplyCard">
+            <div class="card-header">
+                <h3>📢 실시간 로봇 관제 상태</h3>
+            </div>
+            <p class="ai-reply-text" id="aiReplyText">원하는 목적지나 조작 버튼을 클릭하여 로봇을 이동시키세요.</p>
+        </section>
+
+        <!-- Quick Commands Grid -->
+        <section class="quick-cmds-section">
+            <button class="quick-btn stop-btn" id="quickStopBtn">🛑 긴급 정지</button>
+            <button class="quick-btn" id="quickHomeBtn">🏠 홈 복귀 (2.7, 2.0)</button>
+            <button class="quick-btn" id="quickPointABtn">🅰️ 지점 A (1, 1)</button>
+            <button class="quick-btn" id="quickPointBBtn">🅱️ 지점 B (0, 2)</button>
+            <button class="quick-btn" id="quickPointCBtn">🅲 지점 C (-2, 3.5)</button>
+            <button class="quick-btn" id="quickPatrolBtn">🚨 전체 순찰</button>
+            <button class="quick-btn" id="quickStraightBtn">🏎️ 2초 직진</button>
+            <button class="quick-btn" id="quickRoundTripBtn">🔄 2초 왕복 (직진+회전)</button>
+        </section>
+
+        <!-- Main Workspace Grid (Live Map + Joystick Teleop) -->
+        <div class="grid-main-two-col">
+            <!-- Left: Live 2D Interactive Map -->
+            <section class="card map-card">
+                <div class="card-header map-header">
+                    <h3>🗺️ 실시간 2D 지도 & 자율주행</h3>
+                    <div class="map-tools">
+                        <button class="btn-tool active" id="btnModeNav">🎯 목표 이동</button>
+                        <button class="btn-tool" id="btnModeInit">📍 위치 맞추기</button>
+                        <button class="btn-tool" id="btnRotLeft" title="헤딩 45도 좌회전">↩️ -45°</button>
+                        <button class="btn-tool" id="btnRotRight" title="헤딩 45도 우회전">↪️ +45°</button>
+                        <button class="btn-tool" id="btnRot180" title="헤딩 180도 반전">🔄 180°</button>
+                    </div>
+                </div>
+                <div class="map-wrapper" id="mapWrapper">
+                    <canvas id="mapCanvas"></canvas>
+                    <div class="map-overlay-coords">
+                        <span>X: <b id="lblX">0.00</b>m</span>
+                        <span>Y: <b id="lblY">0.00</b>m</span>
+                        <span>Yaw: <b id="lblYaw">0.0</b>°</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right: Teleop Joystick & Telemetry -->
+            <section class="card joystick-card">
+                <div class="card-header">
+                    <h3>🕹️ 원격 수동 조이스틱 (Teleop)</h3>
+                </div>
+                <div class="teleop-content">
+                    <div class="telemetry-grid">
+                        <div class="telemetry-box">
+                            <span class="t-label">선속도 (Linear)</span>
+                            <span class="t-val" id="dispLinear">0.00 <small>m/s</small></span>
+                        </div>
+                        <div class="telemetry-box">
+                            <span class="t-label">각속도 (Angular)</span>
+                            <span class="t-val" id="dispAngular">0.00 <small>rad/s</small></span>
+                        </div>
+                    </div>
+
+                    <div class="joystick-area" id="joystickArea">
+                        <div class="joystick-ring">
+                            <div class="joystick-nipple" id="joystickNipple"></div>
+                        </div>
+                    </div>
+
+                    <div class="speed-control-box">
+                        <span class="speed-title">최고 속도 제한:</span>
+                        <div class="speed-buttons">
+                            <button class="btn-spd" data-speed="0.12">0.12 m/s</button>
+                            <button class="btn-spd active" data-speed="0.20">0.20 m/s</button>
+                            <button class="btn-spd" data-speed="0.26">0.26 m/s</button>
+                        </div>
+                    </div>
+                    <p class="key-hint">💡 키보드 <b>W, A, S, D</b> 또는 <b>방향키</b>로도 조종할 수 있습니다.</p>
+                </div>
+            </section>
+        </div>
+
+        <!-- Locations & Live Logs Grid -->
+        <div class="grid-two-col">
+            <!-- Location List Card -->
+            <section class="card">
+                <div class="card-header">
+                    <h3>📍 등록된 장소 목록 (클릭하여 이동)</h3>
+                </div>
+                <div class="waypoints-list" id="waypointsList">
+                    <div class="loading-spinner">장소 목록 로딩 중...</div>
+                </div>
+            </section>
+
+            <!-- Mission Activity Log Card -->
+            <section class="card">
+                <div class="card-header">
+                    <h3>📋 실시간 관제 로그</h3>
+                </div>
+                <div class="log-box" id="logBox">
+                    <div class="log-item info">system: 통합 AMR 관제 & 자율주행 시스템 준비 완료</div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

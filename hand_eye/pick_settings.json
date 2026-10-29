@@ -1,0 +1,12 @@
+{
+  "grasp_sink_mm": 40.0,
+  "saved_at": "2026-10-13 14:15:03",
+  "table_z_mm": -51.0,
+  "home_joints_deg": {
+    "shoulder_pan": 0.35,
+    "shoulder_lift": 69.92,
+    "elbow_flex": -44.78,
+    "wrist_flex": -84.11,
+    "wrist_roll": 0.04
+  }
+}
