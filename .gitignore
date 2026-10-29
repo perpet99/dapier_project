@@ -5,3 +5,5 @@ __pycache__/
 .env
 .venv/
 *.dbhand_eye/llm_skills.json
+ros2_ws_src/DynamixelSDK
+ros2_ws_src/gazebosim/gz_ros2_control
