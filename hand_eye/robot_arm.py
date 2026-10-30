@@ -32,6 +32,8 @@ robot_arm.py - Depth 기반 클릭 Pick & Place (SO-101)
     2/2  handeye.json    - 카메라->로봇 변환. 실행 시 다시 잡을지 묻고, 없으면 탁상 위
                            집을 수 있는 위치를 4곳 이상 등록하는 모드로 바로 들어간다.
   $env:SO101_PORT='COM18' 을 설정하면 포트 자동검출을 건너뛴다.
+  CH343 어댑터가 둘 이상이면 매번 포트를 묻는다. 서보가 대답하는 쪽, 없으면
+  지난번 선택(arm_port.json, 어댑터 시리얼 번호)이 Enter 기본값이 된다.
   팔 TCP 만 확인하려면: python calibrate_arm.py --tcp
 
 웹 UI / 원격 제어 (같은 HTTP 서버, 기본 0.0.0.0:8765 - 같은 네트워크에서 접속 가능):
@@ -239,8 +241,9 @@ ORBBEC_VID = "VID_2BC5"
 # 켜면 화면이 컬러가 되고 IR 은 쓰지 않는다. 컬러에서 클릭한 픽셀이 곧 depth
 # 화소라 별도 정렬 작업이 필요 없다. 컬러가 안 들어오면 자동으로 IR 로 되돌아간다.
 DEPTH_ALIGN = os.environ.get("DEPTH_ALIGN", "1").lower() in ("1", "true", "yes", "on")
-# 컬러 렌즈의 초점거리[px, 640 폭 기준]. 등록 워프 스케일 0.9432 에서 역산했다.
-COLOR_FX = float(os.environ.get("COLOR_FX", "615.0"))
+# 컬러 렌즈의 초점거리[px, 640 폭 기준]. Astra(0x0401) 드라이버가 보고하는 FOV
+# 58.59deg 에서 구한 값이다. (Astra Pro 는 등록 워프 스케일 0.9432 에서 역산한 615)
+COLOR_FX = float(os.environ.get("COLOR_FX", "570.0"))
 # 후보 카메라를 하나씩 열어보며 센서와 같은 장면인지 볼지 ($env:COLOR_SCAN='1')
 COLOR_SCAN = os.environ.get("COLOR_SCAN", "").lower() in ("1", "true", "yes", "on")
 # 정렬 모드에서 컬러 첫 프레임을 이만큼 기다린다. 안 오면 정렬을 끄고 IR 로 돌아간다.
@@ -471,9 +474,22 @@ class OpenNI2Source(DepthSource):
 
         self.dev = openni2.Device.open_any()
         self.depth_aligned = False
-        self.color_cam: Optional[ColorCamera] = None
+        self.color_cam: Optional[ColorCamera | OpenNIColorCamera] = None
         self._last_rgb: Optional[np.ndarray] = None    # 컬러가 끊겼을 때 보여줄 직전 프레임
+        # Astra(PID 0x0401) 는 Pro 와 달리 컬러가 별개 UVC 가 아니라 OpenNI 안의
+        # 센서다. 이 경우 /dev/videoN 에는 Astra 컬러가 없어서 번호로 열면 엉뚱한
+        # USB 웹캠이 잡힌다. 그러니 OpenNI 컬러 센서가 있으면 그것을 쓴다.
+        self.oni_color = self.dev.has_sensor(openni2.SENSOR_COLOR)
         self.depth_stream = self.dev.create_depth_stream()
+        if self.oni_color:
+            # 기본 depth 모드는 640x400 이라 640x480 컬러와 격자가 다르다.
+            # 정렬된 depth 를 컬러 화소에 1:1 로 맞추려면 해상도를 같게 둔다.
+            try:
+                self.depth_stream.set_video_mode(c_api.OniVideoMode(
+                    pixelFormat=c_api.OniPixelFormat.ONI_PIXEL_FORMAT_DEPTH_1_MM,
+                    resolutionX=width, resolutionY=height, fps=fps))
+            except Exception as e:
+                print(f"[source] depth {width}x{height} 모드 설정 실패({e}) - 기본 모드로 계속한다")
         self.depth_stream.start()
         self._set_mirror(self.depth_stream, "depth")
 
@@ -490,7 +506,11 @@ class OpenNI2Source(DepthSource):
             # depth 가 컬러 좌표계로 왔으므로 화면도 컬러여야 한다. IR 은 정렬
             # 대상이 아니라서 켜 두면 어긋나고, USB2.0 대역만 잡아먹는다.
             self.ir_stream = None
-            self.color_cam = ColorCamera()
+            if self.oni_color:
+                self.color_cam = OpenNIColorCamera(self.dev, c_api, width, height, fps)
+                print("[source] Astra 내장 컬러(OpenNI) 사용")
+            else:
+                self.color_cam = ColorCamera()
             self.color_cam.start(ref=ref_ir)
             if not self._wait_color(ALIGN_COLOR_TIMEOUT):
                 # 컬러가 안 오면 정렬 모드는 무의미하다. 그대로 두면 화면에
@@ -520,7 +540,7 @@ class OpenNI2Source(DepthSource):
         if self.depth_aligned:
             # 등록을 켜도 드라이버가 FOV 는 depth 렌즈 값 그대로 보고한다. 역투영은
             # 컬러 렌즈 기준으로 해야 하므로 실측한 초점거리를 쓴다.
-            # (등록 워프의 스케일 0.9432 에서 역산: 579.87/0.9432 = 615)
+            # (기본값은 위 COLOR_FX 정의 참고)
             fx, fy = COLOR_FX, COLOR_FX * (fy / fx if fx else 1.0)
             print(f"[source] depth_align: 역투영을 컬러 렌즈 기준으로 한다 "
                   f"(fx={fx:.1f}, COLOR_FX 로 조정 가능)")
@@ -699,6 +719,107 @@ class OpenNI2Source(DepthSource):
                 self.ir_stream.stop()
         finally:
             self._openni2.unload()
+
+
+class OpenNIColorCamera:
+    """OpenNI 안에 컬러 센서가 있는 Astra(PID 0x0401) 용 컬러 카메라.
+
+    ColorCamera 와 같은 인터페이스(start/stop/latest/note/index...)를 맞춰서
+    OpenNI2Source 와 화면 코드가 둘을 구분하지 않아도 되게 한다. 장치가 하나라
+    고를 번호가 없으므로 CAM 버튼은 아무것도 바꾸지 않는다(fixed=True).
+    """
+
+    STALL_SEC = 8.0
+    fixed = True             # CAM 버튼으로 바꿀 카메라가 없다
+    index = "ONI"            # 화면에 'CAM ONI' 로 뜬다
+
+    def __init__(self, dev, c_api, width: int = 640, height: int = 480, fps: int = 30):
+        self._dev = dev
+        self._mode = c_api.OniVideoMode(
+            pixelFormat=c_api.OniPixelFormat.ONI_PIXEL_FORMAT_RGB888,
+            resolutionX=width, resolutionY=height, fps=fps)
+        self._stream = None
+        self.note = ""
+        self.failed = False
+        self.opened = False
+        self._frame: Optional[np.ndarray] = None
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._run = False
+
+    def start(self, ref: Optional[np.ndarray] = None) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self.failed = False
+        self.note = "컬러 카메라 여는 중..."
+        try:
+            if self._stream is None:
+                self._stream = self._dev.create_color_stream()
+                try:
+                    self._stream.set_video_mode(self._mode)
+                except Exception as e:
+                    print(f"[color] OpenNI 컬러 모드 설정 실패({e}) - 기본 모드로 계속한다")
+                OpenNI2Source._set_mirror(self._stream, "color")
+            self._stream.start()
+        except Exception as e:
+            self.failed = True
+            self.note = f"OpenNI 컬러를 열 수 없습니다 ({e})"
+            print(f"[color] {self.note}")
+            return
+        self.opened = True
+        self._run = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        from primesense import openni2
+        last = time.time()
+        while self._run:
+            # read_frame() 은 프레임이 올 때까지 막힌다. 기다리기를 짧게 끊어야
+            # stop() 이 스레드를 바로 거둘 수 있다.
+            if openni2.wait_for_any_stream([self._stream], 0.2) is None:
+                if time.time() - last > self.STALL_SEC:
+                    self.failed = True
+                    self.note = f"컬러 프레임이 {self.STALL_SEC:.0f}초간 오지 않습니다"
+                    print(f"[color] {self.note}")
+                    break
+                continue
+            f = self._stream.read_frame()
+            rgb = np.frombuffer(f.get_buffer_as_uint8(), np.uint8).reshape(f.height, f.width, 3)
+            with self._lock:
+                self._frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            self.note = ""
+            last = time.time()
+
+    def stop(self) -> None:
+        self._run = False
+        t, self._thread = self._thread, None
+        if t is not None:
+            t.join(timeout=1.0)
+        if self._stream is not None and self.opened:
+            try:
+                self._stream.stop()
+            except Exception as e:
+                print(f"[color] OpenNI 컬러 정지 실패: {e}")
+        self.opened = False
+        with self._lock:
+            self._frame = None
+        self.note = ""
+
+    def latest(self, size: tuple[int, int]) -> Optional[np.ndarray]:
+        with self._lock:
+            bgr = None if self._frame is None else self._frame.copy()
+        if bgr is None:
+            return None
+        if (bgr.shape[1], bgr.shape[0]) != size:
+            bgr = cv2.resize(bgr, size, interpolation=cv2.INTER_AREA)
+        return bgr
+
+    def next_index(self) -> str:
+        return self.index
+
+    def close(self) -> None:
+        self.stop()
 
 
 class ObsensorColorSource(DepthSource):
@@ -2159,16 +2280,88 @@ def find_so101_port() -> Optional[str]:
     except ImportError:
         return None
 
-    ports = list(list_ports.comports())
-    for p in ports:                       # CH343 을 VID/PID 로 특정
-        if (p.vid, p.pid) == (0x1A86, 0x55D3):
-            print(f"[arm] SO-101 어댑터 자동 검출: {p.device} ({p.description})")
-            return p.device
-    for p in ports:                       # 같은 제조사의 다른 CH34x
-        if p.vid == 0x1A86:
-            print(f"[arm] CH34x 어댑터 검출: {p.device} ({p.description})")
-            return p.device
-    return None
+    ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    cands = [p for p in ports if (p.vid, p.pid) == (0x1A86, 0x55D3)]   # CH343 을 VID/PID 로 특정
+    if not cands:
+        cands = [p for p in ports if p.vid == 0x1A86]                  # 같은 제조사의 다른 CH34x
+    if not cands:
+        return None
+    if len(cands) == 1:
+        p = cands[0]
+        print(f"[arm] SO-101 어댑터 자동 검출: {p.device} ({p.description})")
+        return p.device
+    return _pick_arm_port(cands)
+
+
+# 같은 CH343 어댑터가 둘 이상일 때(예: 차량 바퀴 서보 보드) 고른 포트를 남긴다.
+# ttyACM 번호는 꽂는 순서로 바뀌므로 어댑터 시리얼 번호로 기억한다.
+ARM_PORT_PATH = os.path.join(_HERE, "arm_port.json")
+ARM_SERVO_IDS = range(1, 7)          # SO-101 관절 서보 ID
+
+
+def _pick_arm_port(cands) -> str:
+    """CH343 이 여럿이면 항상 사용자에게 묻는다.
+
+    서보 응답과 지난번 선택은 기본값(Enter)을 정하는 데만 쓴다.
+    """
+    # 서보 ID 1~6 이 대답하면 팔일 가능성이 높다. ping 은 읽기만 하므로 안전하다.
+    resp: dict[str, Optional[int]] = {}
+    for p in cands:
+        try:
+            bus = FeetechBus(p.device, timeout=0.03)
+            try:
+                resp[p.device] = sum(bus.ping(i) for i in ARM_SERVO_IDS)
+            finally:
+                bus.close()
+        except Exception as e:
+            print(f"[arm]   {p.device}: 열기 실패 ({e})")
+            resp[p.device] = None
+
+    # 기본값: 서보가 유일하게 가장 많이 대답한 쪽 -> 저장된 선택 -> 첫 번째
+    counts = [resp[p.device] or 0 for p in cands]
+    best = max(counts)
+    saved = _load_arm_port_serial()
+    if best > 0 and counts.count(best) == 1:
+        k, why = counts.index(best), "서보 응답"
+    elif saved and any(p.serial_number == saved for p in cands):
+        k, why = next(i for i, p in enumerate(cands) if p.serial_number == saved), "지난번 선택"
+    else:
+        k, why = 0, ""
+
+    print(f"[arm] SO-101 후보 어댑터가 {len(cands)}개입니다. 팔이 연결된 포트를 고르세요:")
+    for i, p in enumerate(cands, 1):
+        n = resp[p.device]
+        st = "열기 실패" if n is None else f"서보 {n}/{len(ARM_SERVO_IDS)} 응답"
+        mark = "  <- 기본" if i - 1 == k else ""
+        print(f"      {i}) {p.device}  SN {p.serial_number}  {p.location or ''}  [{st}]{mark}")
+    try:
+        s = input(f"번호 [1-{len(cands)}] (Enter = {k + 1}"
+                  + (f", {why}" if why else "") + ") > ").strip()
+    except EOFError:
+        s = ""          # 입력할 수 없는 실행이면 기본값
+    if s.isdigit() and 1 <= int(s) <= len(cands):
+        k = int(s) - 1
+    p = cands[k]
+    print(f"[arm] {p.device} 선택")
+    _save_arm_port(p)
+    return p.device
+
+
+def _save_arm_port(p) -> None:
+    try:
+        with open(ARM_PORT_PATH, "w", encoding="utf-8") as f:
+            json.dump({"serial_number": p.serial_number, "device": p.device,
+                       "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+    except OSError as e:
+        print(f"[arm] 포트 선택 저장 실패: {e}")
+
+
+def _load_arm_port_serial() -> Optional[str]:
+    try:
+        with open(ARM_PORT_PATH, encoding="utf-8") as f:
+            return json.load(f).get("serial_number")
+    except (OSError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -3910,6 +4103,9 @@ class App:
         cx, cy, cw, ch = cam_button_rect(cam_w)          # 컬러 카메라 번호 바꾸기
         cam = self.active_color_cam()
         if cam is not None and cx <= x <= cx + cw and cy <= y <= cy + ch:
+            if getattr(cam, "fixed", False):
+                self.st.status = "Astra 내장 컬러(OpenNI)를 쓰는 중이라 바꿀 카메라가 없습니다"
+                return
             n = cam.next_index()
             self.st.status = (f"컬러 카메라 index={n} 로 바꿨습니다 "
                               "(맞는 화면이 나올 때까지 누르세요, 선택은 저장됩니다)")
