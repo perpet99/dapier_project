@@ -22,7 +22,7 @@ set -euo pipefail
 # Environment: ROBOT, REMOTE_WS, ROS_DOMAIN_ID (see remote_common.sh).
 #
 # Refuses to start while the camera or (unless use_car2_driver:=false) the
-# serial port is already in use on the robot -- two drivers on /dev/ttyS0
+# serial port is already in use on the robot -- two drivers on /dev/ttyAMA0
 # corrupt each other's replies, and the depth camera can only be opened once.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

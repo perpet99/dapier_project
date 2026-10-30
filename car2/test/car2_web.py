@@ -2,8 +2,8 @@
 car2 방향키 조종 - 웹 UI + REST API 버전 (car2_arrow.py 의 웹판, 표준 라이브러리만 사용).
 
 사용법:
-    python car2_web.py --port /dev/ttyS0
-    python car2_web.py --port /dev/ttyS0 --speed 1200 --http-port 8766
+    python car2_web.py --port /dev/ttyAMA0
+    python car2_web.py --port /dev/ttyAMA0 --speed 1200 --http-port 8766
     python car2_web.py --dry-run          # 시리얼 없이 명령만 출력 (UI/API 확인용)
 
 브라우저에서 http://<라즈베리파이 IP>:8766/ 접속
@@ -373,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="car2 웹 UI / REST API 조종")
-    parser.add_argument("--port", help="예: /dev/ttyS0, /dev/ttyUSB0")
+    parser.add_argument("--port", help="예: /dev/ttyAMA0, /dev/ttyUSB0")
     parser.add_argument("--dry-run", action="store_true", help="시리얼 없이 명령만 출력")
     parser.add_argument("--speed", type=int, default=800, help=f"시작 속도 (step/s, {MIN_SPEED}~{MAX_SPEED})")
     parser.add_argument("--host", default="0.0.0.0", help="HTTP 바인드 주소")

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 robot_arm.py - Depth 기반 클릭 Pick & Place (SO-101)
 

@@ -2,8 +2,8 @@
 car2 키보드 방향키 조종 테스트 (Linux 터미널 / SSH, curses 사용).
 
 사용법:
-    python car2_arrow.py --port /dev/ttyS0
-    python car2_arrow.py --port /dev/ttyS0 --speed 1200
+    python car2_arrow.py --port /dev/ttyAMA0
+    python car2_arrow.py --port /dev/ttyAMA0 --speed 1200
 
 조작:
     ↑ 전진   ↓ 후진   ← 좌회전(제자리)   → 우회전(제자리)
@@ -117,7 +117,7 @@ def run(stdscr, car, speed):
 
 def main():
     parser = argparse.ArgumentParser(description="car2 방향키 조종 테스트")
-    parser.add_argument("--port", required=True, help="예: /dev/ttyS0, /dev/ttyUSB0")
+    parser.add_argument("--port", required=True, help="예: /dev/ttyAMA0, /dev/ttyUSB0")
     parser.add_argument("--speed", type=int, default=800, help=f"시작 속도 (step/s, {MIN_SPEED}~{MAX_SPEED})")
     args = parser.parse_args()
 

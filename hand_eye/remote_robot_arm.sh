@@ -31,14 +31,14 @@ set -euo pipefail
 #   ./remote_robot_arm.sh start
 #   ./remote_robot_arm.sh start --calib SO101_PORT=/dev/ttyUSB1
 #
-# Environment: ROBOT (default user@192.168.0.31), REMOTE_DIR (default hand_eye_robot),
+# Environment: ROBOT (default user@192.168.0.115), REMOTE_DIR (default hand_eye_robot),
 #              REMOTE_PY (default ~/dapier_project/.venv/bin/python)
 #
 # robot_arm.py opens the Astra Pro (OpenNI2 depth + UVC color) itself, so this
 # refuses to start while the camera is used by ROS (remote_robot_rgbd.sh, or
 # remote_car2_lidar.sh --camera) -- stop that first.
 
-ROBOT="${ROBOT:-user@192.168.0.31}"
+ROBOT="${ROBOT:-user@192.168.0.115}"
 REMOTE_DIR="${REMOTE_DIR:-hand_eye_robot}"
 REMOTE_PY="${REMOTE_PY:-~/dapier_project/.venv/bin/python}"
 SESSION=robot_arm

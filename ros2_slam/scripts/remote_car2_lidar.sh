@@ -25,7 +25,7 @@ set -euo pipefail
 # Environment: ROBOT, REMOTE_WS, ROS_DOMAIN_ID (see remote_common.sh).
 #
 # Refuses to start while the lidar is already being read, or (unless
-# use_car2_driver:=false) while another driver / car2_web.py holds /dev/ttyS0.
+# use_car2_driver:=false) while another driver / car2_web.py holds /dev/ttyAMA0.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=remote_common.sh

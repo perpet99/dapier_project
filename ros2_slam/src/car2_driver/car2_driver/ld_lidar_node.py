@@ -12,7 +12,8 @@ Measured on car2's unit (2026-10-02): ~4000 points/s, 6 Hz rotation
 (~670 points/rev, ~0.54 deg), ranges 0.19 .. 8 m in a room.
 
 Parameters:
-  port               serial device (default: the CP2102 by-id path, stable across reboots)
+  port               serial device (default: the lidar USB socket by-path -- the CP2102 by-id name
+                     is shared with any other CP2102, see robot_lidar.launch.py)
   baud_rate          230400
   frame_id           laser_frame
   angle_resolution_deg 0.5  LaserScan bin size
@@ -73,7 +74,7 @@ class LdLidarNode(Node):
     def __init__(self):
         super().__init__('ld_lidar')
         self.declare_parameter(
-            'port', '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0')
+            'port', '/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0-port0')   # by USB socket (see robot_lidar.launch.py)
         self.declare_parameter('baud_rate', 230400)
         self.declare_parameter('frame_id', 'laser_frame')
         self.declare_parameter('angle_resolution_deg', 0.5)

@@ -907,7 +907,7 @@ class RobotLauncher:
     """
 
     LAUNCH_PATTERN = 'ros2 launch car2_bringup robot_rgbd.launch.py'
-    # Children that hold /dev/ttyS0 or the camera, in case the launch died uncleanly.
+    # Children that hold /dev/ttyAMA0 or the camera, in case the launch died uncleanly.
     CHILD_PATTERNS = ['car2_driver/car2_serial_node', 'openni2_camera_driver',
                       'component_container.*__ns:=/camera', 'usb_cam_node_exe.*__ns:=/camera']
     SESSION = 'robot_rgbd'

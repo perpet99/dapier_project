@@ -74,7 +74,7 @@ pick/place 는 팔이 실제로 움직인다. 묻지 않고 바로 실행하고,
   python hand_eye/llm_client.py "주황색 통을 상자에 넣어"   # 첫 지시만 미리 주기
   python hand_eye/llm_client.py --cli                # 터미널로 지시
   python hand_eye/llm_client.py --api http://192.168.0.10:8765 "..."
-  python hand_eye/llm_client.py --map-api http://192.168.0.31:8081 "책상으로 가서 컵을 집어"
+  python hand_eye/llm_client.py --map-api http://192.168.0.115:8081 "책상으로 가서 컵을 집어"
   python hand_eye/llm_client.py --no-base            # 이동 로봇 스킬 없이 팔만
 """
 
@@ -117,7 +117,7 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
-DEFAULT_API = "http://192.168.0.31:8765"
+DEFAULT_API = "http://192.168.0.115:8765"
 MAP_WEB_PORT = 8081       # ros2_slam/test/map_web.py (이동 로봇). 주소는 --api 의 호스트를 따른다
 BASE_MAX_MOVE = 1.0       # base_move 한 번의 최대 거리 (m)
 BASE_SPEED = 0.08         # base_move 속도 (m/s)

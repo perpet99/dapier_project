@@ -54,8 +54,11 @@
 
 ## 4. 파이썬 테스트
 ### 포트
-- **라즈베리파이 40PIN 헤더에 장착한 경우 (현재 구성)**: GPIO14/15(UART) → `/dev/ttyS0`
-  - Pi 4 기준 `/boot/firmware/config.txt`에 `enable_uart=1` 필요, `cmdline.txt`에 `console=serial0,...`가 없어야 함 (시리얼 콘솔 비활성)
+- **라즈베리파이 40PIN 헤더에 장착한 경우 (현재 구성)**: GPIO14/15(UART) → `/dev/ttyAMA0`
+  - Pi 4 기준 `/boot/firmware/config.txt`에 `enable_uart=1`과 `dtoverlay=disable-bt`가 있다(2026-10-20 추가).
+    `disable-bt`는 블루투스를 끄고 PL011 UART(`ttyAMA0`)를 GPIO14/15에 연결한다. 이 설정에서 `/dev/ttyS0`는 열리지 않는다
+    (`Input/output error`). 이 줄을 지우고 재부팅하면 예전처럼 `/dev/ttyS0`(mini UART)를 쓴다.
+  - `cmdline.txt`에 `console=serial0,...`가 없어야 함 (시리얼 콘솔 비활성)
   - 사용자가 `dialout` 그룹에 있어야 함
   - USB로 연결된 게 아니므로 `lsusb`에는 보이지 않는다.
 - **USB(Type-C, CP2102)로 연결한 경우**: Linux `/dev/ttyUSB0`, Windows `COMx`
@@ -63,10 +66,10 @@
 ```
 pip install pyserial
 cd car2/test
-python car2_test.py --port /dev/ttyS0          # 전체 (ping → stat → wheels → drive → timeout)
-python car2_test.py --port /dev/ttyS0 --test wheels
-python car2_test.py --port /dev/ttyS0 --keyboard
-python car2_arrow.py --port /dev/ttyS0         # 방향키 조종 (↑↓←→ 누르는 동안 이동, Space 정지, +/- 속도, q 종료)
+python car2_test.py --port /dev/ttyAMA0          # 전체 (ping → stat → wheels → drive → timeout)
+python car2_test.py --port /dev/ttyAMA0 --test wheels
+python car2_test.py --port /dev/ttyAMA0 --keyboard
+python car2_arrow.py --port /dev/ttyAMA0         # 방향키 조종 (↑↓←→ 누르는 동안 이동, Space 정지, +/- 속도, q 종료)
 ```
 - `car2_arrow.py`는 curses를 사용하므로 Linux 터미널(SSH 포함)에서 실행한다.
 - **첫 테스트는 차체를 들어 바퀴를 공중에 띄운 상태로.**

@@ -86,7 +86,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('use_car2_driver', default_value='true'),
-        DeclareLaunchArgument('serial_port', default_value='/dev/ttyS0'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/ttyAMA0'),
         # Wheel radius from a 0.87 m straight run vs the lidar (ICP 0.892 m, front wall
         # 0.887 m): actual/odom = 1.027 -> 0.032 * 1.027 = 0.0329 m (2026-10-02).
         DeclareLaunchArgument('wheel_radius_m', default_value='0.0329'),

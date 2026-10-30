@@ -6,7 +6,7 @@ set -euo pipefail
 # running after this script / the ssh connection ends.
 #
 # Usage: ./scripts/remote_car2_driver.sh <command> [serial_port] [extra ROS args...]
-#   start   [port] [args]  start the driver (default port /dev/ttyS0)
+#   start   [port] [args]  start the driver (default port /dev/ttyAMA0)
 #   stop                   stop it (SIGINT -> the driver sends STOP to the car)
 #   restart [port] [args]  stop + start
 #   status                 is it running, last log lines
@@ -15,12 +15,12 @@ set -euo pipefail
 #
 # Examples:
 #   ./scripts/remote_car2_driver.sh start
-#   ./scripts/remote_car2_driver.sh start /dev/ttyS0 -p odom_poll_every_n:=2   # 10Hz odom for RTAB-Map
+#   ./scripts/remote_car2_driver.sh start /dev/ttyAMA0 -p odom_poll_every_n:=2   # 10Hz odom for RTAB-Map
 #
 # Environment: ROBOT, REMOTE_WS, ROS_DOMAIN_ID (see remote_common.sh).
 #
 # Refuses to start while another car2_serial_node holds the robot -- e.g. the
-# one inside run_robot_rgbd.sh -- because two drivers on /dev/ttyS0 corrupt
+# one inside run_robot_rgbd.sh -- because two drivers on /dev/ttyAMA0 corrupt
 # each other's replies (/odom drops out).
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -61,7 +61,7 @@ EOF
 }
 
 do_start() {
-  local port="${1:-/dev/ttyS0}"
+  local port="${1:-/dev/ttyAMA0}"
   shift || true
   local extra=""
   if [[ $# -gt 0 ]]; then extra="$(printf ' %q' "$@")"; fi

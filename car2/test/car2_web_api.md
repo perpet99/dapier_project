@@ -6,14 +6,14 @@
 
 ## 서버 실행
 ```bash
-python car2_web.py --port /dev/ttyS0                  # 기본 http://0.0.0.0:8766
-python car2_web.py --port /dev/ttyS0 --speed 1200 --http-port 8766 --host 0.0.0.0
+python car2_web.py --port /dev/ttyAMA0                  # 기본 http://0.0.0.0:8766
+python car2_web.py --port /dev/ttyAMA0 --speed 1200 --http-port 8766 --host 0.0.0.0
 python car2_web.py --dry-run                           # 시리얼 없이 명령만 출력 (API 개발/테스트용)
 ```
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
-| `--port` | (필수, dry-run 제외) | 시리얼 포트. 예: `/dev/ttyS0`, `/dev/ttyUSB0` |
+| `--port` | (필수, dry-run 제외) | 시리얼 포트. 예: `/dev/ttyAMA0`, `/dev/ttyUSB0` |
 | `--dry-run` | 꺼짐 | 차량 없이 보낼 명령을 콘솔에 출력 |
 | `--speed` | 800 | 시작 기본 속도 (step/s) |
 | `--host` | `0.0.0.0` | HTTP 바인드 주소 |

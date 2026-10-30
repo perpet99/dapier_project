@@ -44,7 +44,7 @@ python hand_eye/test4.py                  # 전체 실행
 
 ### 원격 파이(로봇)에서 실행 — `remote_robot_arm.sh`
 
-노트북에서 파이(`user@192.168.0.31`)의 `robot_arm.py` 를 띄운다. 파이의 tmux 세션 `robot_arm`, 로그 `~/robot_arm.log`, 웹 UI `http://192.168.0.31:8765/`.
+노트북에서 파이(`user@192.168.0.115`)의 `robot_arm.py` 를 띄운다. 파이의 tmux 세션 `robot_arm`, 로그 `~/robot_arm.log`, 웹 UI `http://192.168.0.115:8765/`.
 
 ```bash
 ./hand_eye/remote_robot_arm.sh start                 # 시작 (시작 질문 "다시 잡을까요?" 는 자동으로 '아니오')
@@ -62,7 +62,7 @@ python hand_eye/test4.py                  # 전체 실행
 
 LLM 클라이언트(`llm_client.py`)도 같은 방식으로 파이에서 띄운다 — `robot_arm.py` 가 먼저 떠 있어야 한다.
 ```bash
-./hand_eye/remote_llm_client.sh start                          # 웹 UI http://192.168.0.31:8770/ 에서 지시
+./hand_eye/remote_llm_client.sh start                          # 웹 UI http://192.168.0.115:8770/ 에서 지시
 ./hand_eye/remote_llm_client.sh start --auto "책상 위 물건 하나만 집어봐"   # 첫 지시 + 재시도 안 묻기
 ./hand_eye/remote_llm_client.sh start --cli                    # 터미널 지시 → ./hand_eye/remote_llm_client.sh attach
 ./hand_eye/remote_llm_client.sh start --push-env               # 이 폴더의 .env(GEMINI_API_KEY)로 파이 것을 교체
