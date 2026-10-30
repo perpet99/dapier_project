@@ -6,7 +6,10 @@ __pycache__/
 .venv/
 *.db
 hand_eye/llm_skills.json
+ros2_ws_src/DynamixelSDK
+ros2_ws_src/gazebosim/gz_ros2_control
 hand_eye/llm_tls_*.pem
-hand_eye/llm_trace.jsonl*
+hand_eye/llm_trace.jsonl
 hand_eye/llm_usage.json
-
+ros2_slam/maps/*
+!ros2_slam/maps/.gitkeep

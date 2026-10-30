@@ -7,7 +7,7 @@ set -euo pipefail
 # runs the current code. Runs in tmux session 'car2_web' (log ~/car2_web.log).
 #
 # Usage: ./scripts/remote_car2_web.sh <command> [car2_web.py args...]
-#   start   [args]   start (default args: --port /dev/ttyS0) and print the URL
+#   start   [args]   start (default args: --port /dev/ttyAMA0) and print the URL
 #   stop             stop (Ctrl-C: car2_web.py sends STOP to the car)
 #   restart [args]   stop + start
 #   status           running?, URL, /api/status
@@ -16,12 +16,12 @@ set -euo pipefail
 #
 # Examples:
 #   ./scripts/remote_car2_web.sh start
-#   ./scripts/remote_car2_web.sh start --port /dev/ttyS0 --speed 1200
+#   ./scripts/remote_car2_web.sh start --port /dev/ttyAMA0 --speed 1200
 #   ./scripts/remote_car2_web.sh start --dry-run          # no serial, commands are only printed
 #
 # Environment: ROBOT, REMOTE_WS (see remote_common.sh).
 #
-# car2_web.py talks to /dev/ttyS0 itself, so it refuses to start while a ROS
+# car2_web.py talks to /dev/ttyAMA0 itself, so it refuses to start while a ROS
 # car2 driver (robot_rgbd / remote_car2_driver.sh) holds the port -- unless
 # --dry-run is given.
 
@@ -78,7 +78,7 @@ EOF
 }
 
 do_start() {
-  [[ $# -eq 0 ]] && set -- --port /dev/ttyS0
+  [[ $# -eq 0 ]] && set -- --port /dev/ttyAMA0
   local args="" dry=0 a port
   for a in "$@"; do
     args+=" $(printf '%q' "$a")"

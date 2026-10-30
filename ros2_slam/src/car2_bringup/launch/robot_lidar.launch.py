@@ -1,6 +1,6 @@
 """Robot-side (Raspberry Pi) bringup: car2 4-wheel driver + LD-series 2D lidar.
 
-  car2_serial_node  /cmd_vel -> wheels (/dev/ttyS0), /odom + TF odom->base_link
+  car2_serial_node  /cmd_vel -> wheels (/dev/ttyAMA0), /odom + TF odom->base_link
   ld_lidar_node     LD06/LD19-protocol lidar (CP2102 USB serial) -> /scan (laser_frame)
   static TF         base_link -> laser_frame (lidar mount pose)
   camera (use_camera:=true)  Astra Pro depth + RGB from robot_rgbd.launch.py
@@ -27,7 +27,11 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-LIDAR_PORT = '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0'
+# By USB socket, not by-id: the lidar's CP2102 reports serial '0001' like any other CP2102, so
+# by-id/...CP2102...0001... points at whichever was plugged in last (2026-10-22: a hub with a second
+# CP2102 took it). usb-0:1.2 = the Pi 4 USB socket the lidar is plugged into; moving it changes this
+# (ls -l /dev/serial/by-path/ on the Pi), or pass lidar_port:=...
+LIDAR_PORT = '/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0-port0'
 
 
 def generate_launch_description():
@@ -37,7 +41,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('use_car2_driver', default_value='true'),
-        DeclareLaunchArgument('serial_port', default_value='/dev/ttyS0'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/ttyAMA0'),
         # Wheel radius from a 0.87 m straight run vs the lidar (ICP 0.892 m, front wall
         # 0.887 m): actual/odom = 1.027 -> 0.032 * 1.027 = 0.0329 m (2026-10-02).
         DeclareLaunchArgument('wheel_radius_m', default_value='0.0329'),

@@ -32,14 +32,14 @@ set -euo pipefail
 #   ./remote_robot_arm.sh start && ./remote_llm_client.sh start
 #   ./remote_llm_client.sh start --auto "책상 위 물건 하나만 집어봐"
 #
-# Environment: ROBOT (default user@192.168.0.31), REMOTE_DIR (default hand_eye_robot),
+# Environment: ROBOT (default user@192.168.0.115), REMOTE_DIR (default hand_eye_robot),
 #              REMOTE_PY (default ~/dapier_project/.venv/bin/python), GEMINI_MODEL
 #
 # The API key: the Pi's ~/hand_eye_robot/.env; if missing it is taken from the
 # Pi's git clone (~/dapier_project/hand_eye/.env), else from this folder's .env.
 # The key is never printed. pick/place move the real arm without asking.
 
-ROBOT="${ROBOT:-user@192.168.0.31}"
+ROBOT="${ROBOT:-user@192.168.0.115}"
 REMOTE_DIR="${REMOTE_DIR:-hand_eye_robot}"
 REMOTE_PY="${REMOTE_PY:-~/dapier_project/.venv/bin/python}"
 SESSION=llm_client
