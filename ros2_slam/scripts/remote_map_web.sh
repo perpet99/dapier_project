@@ -84,6 +84,11 @@ tmux has-session -t $SESSION 2>/dev/null && tmux send-keys -t $SESSION C-c
 for i in \$(seq 1 20); do pgrep -f '$PROC_PAT' >/dev/null || break; sleep 0.5; done
 pids=\$(pgrep -f '$PROC_PAT' || true)
 [ -n "\$pids" ] && kill -TERM \$pids 2>/dev/null || true
+for i in \$(seq 1 10); do pgrep -f '$PROC_PAT' >/dev/null || break; sleep 0.5; done
+# still alive -> KILL, and wait so a following start (restart) doesn't see it
+pids=\$(pgrep -f '$PROC_PAT' || true)
+[ -n "\$pids" ] && kill -KILL \$pids 2>/dev/null || true
+for i in \$(seq 1 10); do pgrep -f '$PROC_PAT' >/dev/null || break; sleep 0.2; done
 tmux kill-session -t $SESSION 2>/dev/null || true
 echo "stopped"
 EOF
@@ -107,7 +112,8 @@ EOF
   remote "bash -s" <<EOF
 rm -f $REMOTE_LOG
 tmux new-session -d -s $SESSION "$REMOTE_ROS_ENV; cd ~/$REMOTE_DIR && python3 -u map_web.py$args 2>&1 | tee $REMOTE_LOG"
-for i in \$(seq 1 30); do
+# map_web.py can take >15 s to come up on the Pi (rclpy + numpy imports)
+for i in \$(seq 1 60); do
   curl -s -m 1 http://localhost:$port/api/state >/dev/null 2>&1 && { echo "started (tmux '$SESSION', ROS_DOMAIN_ID=$DOMAIN)"; exit 0; }
   tmux has-session -t $SESSION 2>/dev/null || break
   sleep 0.5

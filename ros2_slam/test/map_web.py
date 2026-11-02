@@ -938,13 +938,18 @@ class GoalTolerance:
 
     def tick(self):
         if self.busy:
-            return                # kick stays set: retried 0.2 s later, not at the next 2 s tick
+            # A call to a controller_server that was shutting down never completes; without this
+            # the tolerance sync stays stuck forever and a restarted Nav2 keeps its yaml values.
+            if time.monotonic() - self.busy_t < 5.0:
+                return            # kick stays set: retried 0.2 s later, not at the next 2 s tick
+            self.node.get_logger().warn('tolerance: Nav2 parameter call got no answer in 5 s, retrying')
+            self.busy = False
         self.kick = False
         if not self.get_cli.service_is_ready():
             self.active = None
             self.message = 'Nav2 꺼짐 — 저장값은 내비게이션을 시작하면 자동 적용됩니다'
             return
-        self.busy = True
+        self.busy, self.busy_t = True, time.monotonic()
         fut = self.get_cli.call_async(GetParameters.Request(names=list(self.names)))
         fut.add_done_callback(self._got)
 
