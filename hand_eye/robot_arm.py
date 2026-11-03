@@ -249,6 +249,10 @@ COLOR_FX = float(os.environ.get("COLOR_FX", "570.0"))
 COLOR_SCAN = os.environ.get("COLOR_SCAN", "").lower() in ("1", "true", "yes", "on")
 # 정렬 모드에서 컬러 첫 프레임을 이만큼 기다린다. 안 오면 정렬을 끄고 IR 로 돌아간다.
 ALIGN_COLOR_TIMEOUT = float(os.environ.get("ALIGN_COLOR_TIMEOUT", "20"))
+# 실행 중 컬러가 끊겼을 때 되살리기. 시도하는 동안 run 루프가 막히므로 짧게 두고,
+# 실패하면 이만큼 쉬었다가 다시 시도한다.
+COLOR_RECOVER_TIMEOUT = float(os.environ.get("COLOR_RECOVER_TIMEOUT", "10"))
+COLOR_RECOVER_RETRY_SEC = float(os.environ.get("COLOR_RECOVER_RETRY_SEC", "30"))
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +588,23 @@ class OpenNI2Source(DepthSource):
                 return False
             time.sleep(0.1)
         return False
+
+    def recover_color(self, timeout: float = COLOR_RECOVER_TIMEOUT) -> bool:
+        """끊긴 컬러를 다시 켠다. depth 를 읽는 스레드(run 루프)에서 불러야 한다.
+
+        컬러 첫 프레임 전에 depth 를 읽으면 컬러가 굶으므로, 처음 열 때와 같은
+        순서로 depth 를 재워 둔 채 첫 프레임을 기다린 뒤에 depth 를 되살린다.
+        """
+        cam = self.color_cam
+        if cam is None:
+            return False
+        self.depth_stream.stop()
+        try:
+            cam.stop()
+            cam.start()
+            return self._wait_color(timeout)
+        finally:
+            self.depth_stream.start()
 
     def _disable_depth_align(self, openni2) -> None:
         """정렬을 끄고 원래(IR 기준) 구성으로 되돌린다."""
@@ -3897,6 +3918,7 @@ class App:
         self.depth_aligned = bool(getattr(source, "depth_aligned", False))
         self.color_cam = ColorCamera()                  # 보기용 별도 컬러 카메라
         self._src_paused = False                        # depth 스트림을 재웠는가
+        self._color_retry_at = 0.0                      # 컬러 되살리기를 다시 시도할 시각
         self.current_job: Optional[str] = None          # 지금 워커가 도는 작업 종류
         self.last_error: Optional[str] = None           # 마지막 실패 사유
         self.last_pick: Optional[dict] = None           # 마지막 pick 판정 (그리퍼 부하)
@@ -4177,6 +4199,32 @@ class App:
             return getattr(self.src, "color_cam", None)
         return self.color_cam if self.st.view == "color" else None
 
+    def color_stalled(self) -> bool:
+        """정렬 모드에서 컬러가 끊겨 화면이 직전 프레임에 멈춰 있는가."""
+        cam = self.active_color_cam() if self.depth_aligned else None
+        return cam is not None and cam.failed
+
+    def _recover_color(self) -> None:
+        """정렬 모드에서 끊긴 컬러를 되살린다.
+
+        그대로 두면 depth 만 새로 오고 화면은 직전 프레임에 멈춘다. 시도하는
+        동안 루프가 막혀 입력을 못 받으므로 팔이 움직일 때는 하지 않는다.
+        """
+        if (not self.color_stalled() or self.st.mode == STATE_BUSY
+                or time.time() < self._color_retry_at):
+            return
+        print("[color] 컬러가 끊겨 다시 켠다")
+        try:
+            ok = self.src.recover_color()
+        except Exception as e:
+            print(f"[color] 컬러 되살리기 실패: {e}")
+            ok = False
+        if ok:
+            print("[color] 컬러 복구됨")
+        else:
+            self._color_retry_at = time.time() + COLOR_RECOVER_RETRY_SEC
+            print(f"[color] 컬러 복구 실패 - {COLOR_RECOVER_RETRY_SEC:.0f}초 뒤 다시 시도한다")
+
     def cycle_view(self) -> None:
         """센서 -> depth 컬러맵 -> 순수 컬러 순환.
 
@@ -4235,6 +4283,9 @@ class App:
             # 컬러 모드에서는 depth 가 멈춰 있다. 낡은 depth 로 집으면 그 사이
             # 물체가 움직였어도 옛 자리로 간다.
             return False, "컬러 모드라 depth 가 멈춰 있습니다 (SENSOR 로 전환하세요)", info
+        if self.color_stalled():
+            # 사용자는 멈춘 화면을 보고 고르는데 depth 는 지금 값이라 서로 어긋난다.
+            return False, "컬러가 끊겨 화면이 멈춰 있습니다 (복구를 기다리세요)", info
 
         # 상태 확인: 놓기는 물고 있어야 한다. 집기는 물고 있어도 받는다 -
         # pick 의 첫 단계가 그리퍼 열기라서 물고 있던 것은 홈 자리에서 놓인다.
@@ -4326,6 +4377,7 @@ class App:
                 "calibrating": self.st.calibrating,
                 "handeye_calibrated": self.he.calibrated,
                 "depth_live": self.st.depth_live,
+                "color_stalled": self.color_stalled(),
                 "view": self.st.view,
                 "status": self.st.status,
                 "last_error": self.last_error,
@@ -4651,6 +4703,7 @@ class App:
                 self._drain_input_events()
                 if not self.running:
                     break
+                self._recover_color()
                 legacy_color = self.st.view == "color" and not self.depth_aligned
                 rgb_now = (self.color_cam.latest((self.src.intr.width,
                                                    self.src.intr.height))
